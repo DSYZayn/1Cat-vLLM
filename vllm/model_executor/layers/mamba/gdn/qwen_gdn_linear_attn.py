@@ -3956,6 +3956,7 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
                 )
         out_buf = core_attn_out[:num_decode_tokens].unsqueeze(1)
         assert non_spec_query_start_loc is not None
+        cu_seqlens = non_spec_query_start_loc[: num_decode_tokens + 1]
         if self._can_use_flashqla_decode(
             mixed_qkv_non_spec,
             state_indices,
@@ -3971,7 +3972,7 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
                 ssm_state=ssm_state,
                 state_indices=state_indices,
                 num_decode_tokens=num_decode_tokens,
-                cu_seqlens=non_spec_query_start_loc,
+                cu_seqlens=cu_seqlens,
                 core_attn_out=core_attn_out,
             )
             _sm70_gdn_graph_buffer_copy("recurrent_out", layer_name, qla_out, "core")
@@ -3983,15 +3984,21 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
                 num_decode_tokens,
             )
             return
-        fused_recurrent_gated_delta_rule_packed_decode(
-            mixed_qkv=mixed_qkv_non_spec,
+        _log_runtime_route_once("SM70 exact mixed-QKV GDN decode route enabled.")
+        fused_sigmoid_gating_delta_rule_update_mixed_qkv_out(
+            A_log=self.A_log,
             a=a,
             b=b,
-            A_log=self.A_log,
             dt_bias=self.dt_bias,
+            mixed_qkv=mixed_qkv_non_spec,
+            num_q_heads=self.num_k_heads // self.tp_size,
+            num_v_heads=self.num_v_heads // self.tp_size,
+            head_k_dim=self.head_k_dim,
+            head_v_dim=self.head_v_dim,
             scale=self.head_k_dim**-0.5,
             initial_state=ssm_state,
             out=out_buf,
+            cu_seqlens=cu_seqlens,
             ssm_state_indices=state_indices,  # type: ignore[arg-type]
             use_qk_l2norm_in_kernel=True,
         )

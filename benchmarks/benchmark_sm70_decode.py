@@ -144,27 +144,30 @@ def _is_fp8_kv_cache_dtype(value: Any) -> bool:
     return isinstance(value, str) and value.startswith("fp8")
 
 
-def _fp8_tune_enabled(fp8_tune_raw: str | None, awq_tune_raw: str | None) -> bool:
+def _fp8_tune_enabled(fp8_tune_raw: str | None) -> bool:
     if fp8_tune_raw is not None:
         return _atoi_nonzero(fp8_tune_raw)
-    if awq_tune_raw is not None:
-        return _atoi_nonzero(awq_tune_raw)
     return True
 
 
 def _sm70_tune_policy() -> dict[str, Any]:
     awq_tune_raw = os.environ.get("VLLM_SM70_AWQ_TUNE_SMALL_SHAPES")
+    awq_preserve_splits_raw = os.environ.get(
+        "VLLM_SM70_AWQ_PRESERVE_DEFAULT_SPLITS"
+    )
     awq_tune0_pinned = awq_tune_raw == "0"
     awq_moe_safe_default_selector = awq_tune_raw is None or awq_tune0_pinned
     fp8_tune_raw = os.environ.get("VLLM_SM70_FP8_TUNE_SMALL_SHAPES")
-    fp8_dynamic_measure_enabled = _fp8_tune_enabled(
-        fp8_tune_raw,
-        awq_tune_raw,
-    )
+    fp8_dynamic_measure_enabled = _fp8_tune_enabled(fp8_tune_raw)
     return {
         "VLLM_SM70_AWQ_TUNE_SMALL_SHAPES": awq_tune_raw,
+        "VLLM_SM70_AWQ_PRESERVE_DEFAULT_SPLITS": awq_preserve_splits_raw,
         "VLLM_SM70_FP8_TUNE_SMALL_SHAPES": fp8_tune_raw,
         "awq_tune0_pinned_effective": awq_tune0_pinned,
+        "awq_preserve_default_splits_effective": (
+            awq_preserve_splits_raw is None
+            or _atoi_nonzero(awq_preserve_splits_raw)
+        ),
         "awq_moe_safe_default_selector_effective": (
             awq_moe_safe_default_selector
         ),
@@ -186,8 +189,10 @@ def _sm70_tune_policy() -> dict[str, Any]:
             "F16 dynamic-measure tuning enabled; AWQ dense/MoE stays "
             "fixed-dispatch unless VLLM_SM70_AWQ_TUNE_SMALL_SHAPES is set "
             "nonzero. FP8 dense defaults to dynamic small-shape selection "
-            "unless VLLM_SM70_FP8_TUNE_SMALL_SHAPES=0, or the legacy AWQ "
-            "tune env explicitly overrides it while the FP8 env is unset. "
+            "unless VLLM_SM70_FP8_TUNE_SMALL_SHAPES=0. "
+            "AWQ dynamic dense tuning preserves the heuristic/default split-K "
+            "count by default so measured kernels do not change fp16 reduction "
+            "order. "
             "Accepted MoE safe-route evidence records these selector fields; "
             "older artifacts still need explicit tune0 pins."
         ),
@@ -200,10 +205,7 @@ def _sm70_turbomind_policy() -> dict[str, Any]:
     awq_tune0_pinned = awq_tune_raw == "0"
     awq_moe_safe_default_selector = awq_tune_raw is None or awq_tune0_pinned
     fp8_tune_raw = os.environ.get("VLLM_SM70_FP8_TUNE_SMALL_SHAPES")
-    fp8_safe_default_selector = not _fp8_tune_enabled(
-        fp8_tune_raw,
-        awq_tune_raw,
-    )
+    fp8_safe_default_selector = not _fp8_tune_enabled(fp8_tune_raw)
     fp8_turbomind = _env_bool("VLLM_SM70_FP8_TURBOMIND", True)
     fp8_dequant_fallback = _env_bool("VLLM_SM70_FP8_DEQUANT_FALLBACK", True)
     fp8_moe_dequant_fallback = _env_bool(
@@ -235,7 +237,7 @@ def _sm70_turbomind_policy() -> dict[str, Any]:
     )
     fp8_moe_legacy_single_token = _env_bool(
         "VLLM_SM70_FP8_MOE_LEGACY_SINGLE_TOKEN_COMPACT",
-        False,
+        True,
     )
     f16_dense = _env_bool("VLLM_SM70_ENABLE_DENSE_F16_FASTPATH", False)
     dense_cudagraph = _env_bool("VLLM_SM70_DENSE_CUDAGRAPH_CAPTURE", False)
@@ -269,7 +271,7 @@ def _sm70_turbomind_policy() -> dict[str, Any]:
         ),
         "awq_warmup_max_m_effective": _env_int(
             "VLLM_SM70_AWQ_WARMUP_MAX_M",
-            8,
+            16,
         ),
         "VLLM_SM70_AWQ_WARMUP_MAX_MOE_TOKENS": os.environ.get(
             "VLLM_SM70_AWQ_WARMUP_MAX_MOE_TOKENS"
@@ -285,6 +287,13 @@ def _sm70_turbomind_policy() -> dict[str, Any]:
         "awq_reuse_imported_cache_effective": _env_bool(
             "VLLM_SM70_AWQ_REUSE_IMPORTED_CACHE",
             False,
+        ),
+        "VLLM_SM70_AWQ_PRESERVE_DEFAULT_SPLITS": os.environ.get(
+            "VLLM_SM70_AWQ_PRESERVE_DEFAULT_SPLITS"
+        ),
+        "awq_preserve_default_splits_effective": _env_bool(
+            "VLLM_SM70_AWQ_PRESERVE_DEFAULT_SPLITS",
+            True,
         ),
         "VLLM_SM70_AWQ_DENSE_TUNE_MAX_M": os.environ.get(
             "VLLM_SM70_AWQ_DENSE_TUNE_MAX_M"
@@ -406,7 +415,7 @@ def _sm70_turbomind_policy() -> dict[str, Any]:
             and not fp8_moe_batched_w13_dispatch
             and not fp8_moe_batched_w2_dispatch
             and fp8_moe_permute_with_scratch
-            and not fp8_moe_legacy_single_token
+            and fp8_moe_legacy_single_token
         ),
         "fp8_moe_diagnostic_per_expert_dense_policy": (
             fp8_turbomind
@@ -436,7 +445,8 @@ def _sm70_turbomind_policy() -> dict[str, Any]:
             "decode-token cap that disables batched MoE during prefill. "
             "Strict indexed/dense-stage variants are diagnostics only; do "
             "not use them as accepted speed baselines. FP8 MoE production "
-            "throughput evidence must use the native batched route and log "
+            "throughput evidence must use the native batched route, keep "
+            "legacy single-token exact-layout compact enabled, and log "
             "`SM70 FP8 MoE TurboMind batched path enabled`; the per-expert "
             "dense-stage native route is a diagnostic fallback. FP8 MoE also "
             "keeps the 0.0.3 fallback lane, which requires "
@@ -444,7 +454,9 @@ def _sm70_turbomind_policy() -> dict[str, Any]:
             "weights plus `Using SM70 0.0.3 unquantized MoE default config`, "
             "and remains separate. FP8 batched W13/W2 per-expert dispatch "
             "flags are stage-local diagnostic lanes and must be recorded "
-            "separately. MoE evidence additionally records fixed-dispatch "
+            "separately. FP8 legacy single-token compact evidence must show "
+            "the exact-layout active source-group route, not the old top-k "
+            "descriptor compact route. MoE evidence additionally records fixed-dispatch "
             "tune policy: either explicit tune0 pins or source-level "
             "unset-env safe-default selector fields."
         ),

@@ -2,55 +2,216 @@ import torch
 import traceback
 import os
 import flash_attn_v100_cuda
+from dataclasses import dataclass
 from typing import Optional, Sequence, Tuple, Union
 
+try:
+    from torch._subclasses.fake_tensor import FakeTensor
+except ImportError:
+    FakeTensor = None
+
 DEFAULT_DECODE_PARTITION_SIZE = 256
-LONG_CONTEXT_DECODE_PARTITION_SIZE = 512
-LONG_CONTEXT_DECODE_PARTITION_THRESHOLD = 20480
 VALID_DECODE_PARTITION_SIZES = (256, 512, 1024)
+_decode_plan_cache = {}
 _decode_workspace_cache = {}
 _turboquant_decode_workspace_cache = {}
+
+@dataclass(frozen=True)
+class _DecodePlan:
+    partition_size: int
+    actual_num_partitions: int
+    launch_num_partitions: int
+    workspace_num_partitions: int
+
+
+@dataclass
+class _DecodeWorkspace:
+    tmp_out: torch.Tensor
+    max_logits: torch.Tensor
+    exp_sums: torch.Tensor
+    active_num_partitions: torch.Tensor
+    max_num_partitions: int
+
 
 def maybe_contiguous(x):
     return x.contiguous() if x is not None and not x.is_contiguous() else x
 
 
-def _get_decode_workspace(
+def _is_fake_tensor(x: torch.Tensor) -> bool:
+    return FakeTensor is not None and isinstance(x, FakeTensor)
+
+
+def _can_cache_workspace(x: torch.Tensor) -> bool:
+    return (
+        not torch.compiler.is_compiling()
+        and not x.is_meta
+        and not _is_fake_tensor(x)
+    )
+
+
+def _workspace_stream_id(device: torch.device) -> int:
+    if device.type != "cuda":
+        return -1
+    if torch.compiler.is_compiling():
+        return 0
+    return int(torch.cuda.current_stream(device).cuda_stream)
+
+
+def _round_decode_partition_capacity(required_num_partitions: int) -> int:
+    if required_num_partitions <= 1:
+        return 1
+    return 1 << (required_num_partitions - 1).bit_length()
+
+
+def _decode_dynamic_partitions_enabled() -> bool:
+    return os.getenv("VLLM_FLASH_V100_DECODE_DYNAMIC_PARTITIONS", "1") != "0"
+
+
+def _allocate_decode_workspace(
+    q: torch.Tensor,
+    *,
+    batch_capacity: int,
+    num_heads: int,
+    head_dim: int,
+    max_num_partitions: int,
+) -> _DecodeWorkspace:
+    return _DecodeWorkspace(
+        tmp_out=torch.empty(
+            (batch_capacity, num_heads, max_num_partitions, head_dim),
+            dtype=torch.float16,
+            device=q.device,
+        ),
+        max_logits=torch.empty(
+            (batch_capacity, num_heads, max_num_partitions),
+            dtype=torch.float32,
+            device=q.device,
+        ),
+        exp_sums=torch.empty(
+            (batch_capacity, num_heads, max_num_partitions),
+            dtype=torch.float32,
+            device=q.device,
+        ),
+        active_num_partitions=torch.empty(
+            (1,),
+            dtype=torch.int32,
+            device=q.device,
+        ),
+        max_num_partitions=max_num_partitions,
+    )
+
+
+def _get_decode_plan(
     q: torch.Tensor,
     k_cache: torch.Tensor,
     block_table: torch.Tensor,
-):
-    batch_capacity = block_table.shape[0]
+    *,
+    max_seq_len_hint: Optional[int] = None,
+    batch_size_hint: Optional[int] = None,
+    workspace_seq_capacity_hint: Optional[int] = None,
+) -> _DecodePlan:
+    batch_capacity = batch_size_hint or block_table.shape[0]
     num_heads = q.shape[1]
     head_dim = q.shape[2]
     max_seq_capacity = block_table.shape[1] * k_cache.shape[1]
-    partition_size = _get_decode_partition_size(max_seq_capacity)
-    max_num_partitions = (max_seq_capacity + partition_size - 1) // partition_size
+    effective_max_seq_len = int(max_seq_len_hint or max_seq_capacity)
+    effective_workspace_seq_capacity = int(
+        workspace_seq_capacity_hint or effective_max_seq_len
+    )
+    effective_max_seq_len = max(1, effective_max_seq_len)
+    effective_workspace_seq_capacity = max(
+        1,
+        effective_workspace_seq_capacity,
+        effective_max_seq_len,
+    )
+    partition_size = _get_decode_partition_size(
+        max_seq_capacity=max_seq_capacity,
+        head_dim=head_dim,
+        num_q_heads=num_heads,
+        num_kv_heads=k_cache.shape[2],
+        max_seq_len_hint=effective_max_seq_len,
+        batch_size_hint=batch_capacity,
+    )
+    runtime_num_partitions = max(
+        1,
+        (effective_max_seq_len + partition_size - 1) // partition_size,
+    )
+    workspace_num_partitions = max(
+        1,
+        (effective_workspace_seq_capacity + partition_size - 1) // partition_size,
+    )
+    plan = _DecodePlan(
+        partition_size=partition_size,
+        actual_num_partitions=runtime_num_partitions,
+        launch_num_partitions=(
+            workspace_num_partitions
+            if workspace_seq_capacity_hint is not None
+            else runtime_num_partitions
+        ),
+        workspace_num_partitions=workspace_num_partitions,
+    )
     device_index = q.device.index if q.device.index is not None else -1
-    key = (device_index, batch_capacity, num_heads, head_dim, max_num_partitions, partition_size)
+    key = (
+        device_index,
+        batch_capacity,
+        num_heads,
+        head_dim,
+        q.dtype,
+        plan.partition_size,
+        plan.actual_num_partitions,
+        plan.launch_num_partitions,
+        plan.workspace_num_partitions,
+    )
+    if _can_cache_workspace(q) and workspace_seq_capacity_hint is None:
+        cached = _decode_plan_cache.get(key)
+        if cached is not None:
+            return cached
+        _decode_plan_cache[key] = plan
+    return plan
 
-    workspace = _decode_workspace_cache.get(key)
-    if workspace is None:
-        workspace = (
-            torch.empty(
-                (batch_capacity, num_heads, max_num_partitions, head_dim),
-                dtype=torch.float16,
-                device=q.device,
-            ),
-            torch.empty(
-                (batch_capacity, num_heads, max_num_partitions),
-                dtype=torch.float32,
-                device=q.device,
-            ),
-            torch.empty(
-                (batch_capacity, num_heads, max_num_partitions),
-                dtype=torch.float32,
-                device=q.device,
+
+def _get_decode_workspace_for_plan(
+    q: torch.Tensor,
+    *,
+    batch_capacity: int,
+    num_heads: int,
+    head_dim: int,
+    plan: _DecodePlan,
+):
+    device_index = q.device.index if q.device.index is not None else -1
+    stream_id = _workspace_stream_id(q.device)
+    key = (
+        device_index,
+        stream_id,
+        batch_capacity,
+        num_heads,
+        head_dim,
+        plan.partition_size,
+    )
+
+    workspace = _decode_workspace_cache.get(key) if _can_cache_workspace(q) else None
+    if (
+        workspace is None
+        or workspace.max_num_partitions < plan.workspace_num_partitions
+    ):
+        workspace = _allocate_decode_workspace(
+            q,
+            batch_capacity=batch_capacity,
+            num_heads=num_heads,
+            head_dim=head_dim,
+            max_num_partitions=_round_decode_partition_capacity(
+                plan.workspace_num_partitions
             ),
         )
-        _decode_workspace_cache[key] = workspace
+        if _can_cache_workspace(q):
+            _decode_workspace_cache[key] = workspace
 
-    return workspace, partition_size
+    workspace.active_num_partitions.fill_(plan.actual_num_partitions)
+    return (
+        workspace.tmp_out[:, :, :workspace.max_num_partitions, :],
+        workspace.max_logits[:, :, :workspace.max_num_partitions],
+        workspace.exp_sums[:, :, :workspace.max_num_partitions],
+        workspace.active_num_partitions,
+    )
 
 
 def _get_turboquant_decode_workspace(
@@ -111,11 +272,19 @@ def _get_turboquant_decode_workspace(
     return workspace, partition_size
 
 
-def _get_decode_partition_size(max_seq_capacity: int) -> int:
+def _get_decode_partition_size(
+    max_seq_capacity: int,
+    head_dim: int,
+    num_q_heads: int,
+    num_kv_heads: int,
+    max_seq_len_hint: Optional[int] = None,
+    batch_size_hint: Optional[int] = None,
+) -> int:
     raw = os.getenv("VLLM_FLASH_V100_DECODE_PARTITION_SIZE")
     if raw is None:
-        if max_seq_capacity > LONG_CONTEXT_DECODE_PARTITION_THRESHOLD:
-            return LONG_CONTEXT_DECODE_PARTITION_SIZE
+        # Keep the default arithmetic order identical to the legacy V100 decode
+        # kernel. Larger partitions reduce launch/reduce work but change the
+        # softmax reduction boundary and can flip greedy tokens.
         return DEFAULT_DECODE_PARTITION_SIZE
     try:
         value = int(raw)
@@ -399,6 +568,8 @@ def flash_attn_decode_paged(
     k_scale: float = 1.0,
     v_scale: float = 1.0,
     window_size: tuple = (-1, -1),
+    max_seq_len_hint: Optional[int] = None,
+    workspace_seq_capacity_hint: Optional[int] = None,
 ):
     if softmax_scale is None:
         softmax_scale = q.shape[-1] ** -0.5
@@ -410,8 +581,28 @@ def flash_attn_decode_paged(
     window_size_left, window_size_right = window_size
     if window_size_left < -1 or window_size_right < -1:
         raise ValueError(f"Invalid window_size={window_size}; values must be >= -1")
-    (tmp_out, max_logits, exp_sums), partition_size = _get_decode_workspace(
-        q, k_cache, block_table
+    batch_capacity = q.shape[0]
+    num_heads = q.shape[1]
+    head_dim = q.shape[2]
+    if not _decode_dynamic_partitions_enabled():
+        max_seq_len_hint = None
+        workspace_seq_capacity_hint = None
+    plan = _get_decode_plan(
+        q,
+        k_cache,
+        block_table,
+        max_seq_len_hint=max_seq_len_hint,
+        batch_size_hint=batch_capacity,
+        workspace_seq_capacity_hint=workspace_seq_capacity_hint,
+    )
+    tmp_out, max_logits, exp_sums, active_num_partitions = (
+        _get_decode_workspace_for_plan(
+            q,
+            batch_capacity=batch_capacity,
+            num_heads=num_heads,
+            head_dim=head_dim,
+            plan=plan,
+        )
     )
 
     return flash_attn_v100_cuda.decode_paged_fwd(
@@ -424,8 +615,10 @@ def flash_attn_decode_paged(
         tmp_out,
         max_logits,
         exp_sums,
+        active_num_partitions,
         softmax_scale,
-        partition_size,
+        plan.partition_size,
+        plan.launch_num_partitions,
         kv_cache_dtype,
         float(k_scale),
         float(v_scale),
@@ -489,7 +682,12 @@ def flash_attn_decode_qk_scores(
     block_table = maybe_contiguous(block_table)
     seq_lens = maybe_contiguous(seq_lens)
     max_seq_capacity = block_table.shape[1] * k_cache.shape[1]
-    partition_size = _get_decode_partition_size(max_seq_capacity)
+    partition_size = _get_decode_partition_size(
+        max_seq_capacity=max_seq_capacity,
+        head_dim=q.shape[2],
+        num_q_heads=q.shape[1],
+        num_kv_heads=k_cache.shape[2],
+    )
     return flash_attn_v100_cuda.decode_qk_scores_fwd(
         q,
         k_cache,

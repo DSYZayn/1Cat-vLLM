@@ -232,6 +232,47 @@ def test_flash_v100_cudagraph_capture_keeps_cpu_metadata(local_flash_v100_model)
     assert attn_metadata.causal is True
 
 
+def test_flash_v100_decode_shape_hints_stay_backend_local(
+    local_flash_v100_model,
+):
+    from tests.v1.attention.utils import (
+        BatchSpec,
+        create_common_attn_metadata,
+        create_standard_kv_cache_spec,
+        create_vllm_config,
+    )
+    from vllm.v1.attention.backends.flash_attn_v100 import (
+        FlashAttnV100MetadataBuilder,
+    )
+
+    vllm_config = create_vllm_config(
+        model_name=local_flash_v100_model(),
+        max_model_len=2048,
+        max_num_seqs=1,
+    )
+    kv_cache_spec = create_standard_kv_cache_spec(vllm_config)
+    builder = FlashAttnV100MetadataBuilder(
+        kv_cache_spec=kv_cache_spec,
+        layer_names=["language_model.model.layers.3.self_attn.attn"],
+        vllm_config=vllm_config,
+        device=torch.device("cpu"),
+    )
+    common = create_common_attn_metadata(
+        BatchSpec(seq_lens=[1025], query_lens=[1]),
+        block_size=16,
+        device=torch.device("cpu"),
+    )
+
+    runtime_metadata = builder.build(0, common)
+    assert runtime_metadata.flash_v100_decode_max_seq_len_hint == 1025
+    assert runtime_metadata.flash_v100_decode_workspace_seq_capacity_hint is None
+
+    capture_metadata = builder.build_for_cudagraph_capture(common)
+    assert capture_metadata.flash_v100_decode_max_seq_len_hint == 1025
+    assert capture_metadata.flash_v100_decode_workspace_seq_capacity_hint == 1025
+    assert capture_metadata.flash_v100_static_decode_seq_hint == 1025
+
+
 def test_flash_v100_smallq_cudagraph_metadata_uses_persistent_buffers(
     monkeypatch,
     local_flash_v100_model,
@@ -502,6 +543,65 @@ def test_flash_v100_smallq_forward_prefers_persistent_decode_metadata():
     assert result is output
     assert captured["block_table"].data_ptr() == persistent_block_table.data_ptr()
     assert captured["seq_lens"].data_ptr() == persistent_seq_lens.data_ptr()
+    assert torch.all(output == 1)
+
+
+def test_flash_v100_decode_forwards_shape_hints():
+    from vllm.v1.attention.backends.flash_attn_v100 import FlashAttnV100Impl
+
+    impl = FlashAttnV100Impl(
+        num_heads=4,
+        head_size=256,
+        scale=1.0,
+        num_kv_heads=1,
+        alibi_slopes=None,
+        sliding_window=None,
+        kv_cache_dtype="auto",
+    )
+
+    captured: dict[str, int | None] = {}
+
+    def fake_decode(
+        query,
+        key_cache,
+        value_cache,
+        block_table,
+        seq_lens,
+        **kwargs,
+    ):
+        captured["max_seq_len_hint"] = kwargs.get("max_seq_len_hint")
+        captured["workspace_seq_capacity_hint"] = kwargs.get(
+            "workspace_seq_capacity_hint"
+        )
+        kwargs["out"].fill_(1)
+
+    impl.flash_attn_decode_paged = fake_decode  # type: ignore[method-assign]
+
+    attn_metadata = SimpleNamespace(
+        num_actual_tokens=1,
+        block_table=torch.tensor([[0]], dtype=torch.int32),
+        seq_lens=torch.tensor([4097], dtype=torch.int32),
+        flash_v100_decode_max_seq_len_hint=4097,
+        flash_v100_decode_workspace_seq_capacity_hint=4097,
+    )
+    layer = SimpleNamespace(_k_scale_float=1.0, _v_scale_float=1.0)
+    query = torch.zeros((1, 4, 256), dtype=torch.float16)
+    output = torch.zeros((1, 4, 256), dtype=torch.float16)
+    kv_cache = torch.zeros((2, 4, 16, 1, 256), dtype=torch.float16)
+
+    result = impl._flash_v100_decode(
+        layer,
+        query,
+        query,
+        query,
+        kv_cache,
+        attn_metadata,
+        output,
+    )
+
+    assert result is output
+    assert captured["max_seq_len_hint"] == 4097
+    assert captured["workspace_seq_capacity_hint"] == 4097
     assert torch.all(output == 1)
 
 

@@ -14,6 +14,7 @@
 #include <atomic>
 #include <cstdlib>
 #include <iterator>
+#include <mutex>
 #include <memory>
 #include <numeric>
 #include <optional>
@@ -59,6 +60,13 @@ bool GemmTraceFilterAllows(const std::string& desc)
 
 const char* ToString(DispatchPolicy policy)
 {
+    if (policy & DispatchPolicy::kPreserveDefaultSplits) {
+        static thread_local std::string text;
+        auto base = static_cast<DispatchPolicy>(
+            (int)policy & ~(int)DispatchPolicy::kPreserveDefaultSplits);
+        text = std::string(ToString(base)) + "|preserve_default_splits";
+        return text.c_str();
+    }
     switch (policy) {
         case DispatchPolicy::kDefault:
             return "default";
@@ -315,6 +323,8 @@ struct Gemm::Impl {
     std::optional<Measurer> measurer_;
 
     DispatchCache cache_;
+
+    std::mutex dispatch_mutex_;
 };
 
 // implementation of GEMM interfaces
@@ -412,11 +422,31 @@ int Gemm::Run(const Operation&    operation,
     LaunchSpec spec{};
 
     const bool measured = operation.dispatch & DispatchPolicy::kMeasure;
-    if (measured) {
-        impl_->Measure(*dispatch_context, workspace.barriers_size, workspace.partials_size, 1, launch, stream);
-    }
+    {
+        std::lock_guard<std::mutex> lock(impl_->dispatch_mutex_);
+        if (measured) {
+            impl_->Measure(*dispatch_context, workspace.barriers_size, workspace.partials_size, 1, launch, stream);
+        }
 
-    spec = impl_->Dispatch(*dispatch_context, operation.dispatch, workspace.barriers_size, workspace.partials_size);
+        spec = impl_->Dispatch(*dispatch_context, operation.dispatch, workspace.barriers_size, workspace.partials_size);
+        if (spec.kernel && (operation.dispatch & DispatchPolicy::kPreserveDefaultSplits)) {
+            auto default_specs = impl_->Find(*dispatch_context, workspace.barriers_size, workspace.partials_size, 1);
+            if (!default_specs.empty()) {
+                const auto default_spec = default_specs.front();
+                spec.kernel = default_spec.kernel;
+                spec.splits = default_spec.splits;
+                const auto& default_desc = dispatch_context->get_desc(*spec.kernel);
+                spec.swizzle = std::min(
+                    spec.swizzle,
+                    spec.kernel->GetMaxSwizzle({
+                        default_desc.m,
+                        default_desc.n,
+                        default_desc.k,
+                        default_desc.num,
+                    }));
+            }
+        }
+    }
     if (spec.kernel && dispatch_context != &context) {
         const auto& actual_desc = context.get_desc(*spec.kernel);
         spec.swizzle =

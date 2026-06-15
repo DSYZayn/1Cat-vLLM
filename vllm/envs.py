@@ -124,10 +124,11 @@ if TYPE_CHECKING:
     VLLM_SM70_AWQ_MOE_COMPARE_DENSE_MAX_REPORTS: int = 128
     VLLM_SM70_AWQ_MOE_LEGACY_SINGLE_TOKEN_COMPACT: bool = True
     VLLM_SM70_AWQ_TUNE_SMALL_SHAPES: bool = False
+    VLLM_SM70_AWQ_PRESERVE_DEFAULT_SPLITS: bool = True
     VLLM_SM70_FP8_TUNE_SMALL_SHAPES: bool = True
     VLLM_SM70_AWQ_REUSE_IMPORTED_CACHE: bool = False
     VLLM_SM70_AWQ_WARMUP: bool = True
-    VLLM_SM70_AWQ_WARMUP_MAX_M: int = 8
+    VLLM_SM70_AWQ_WARMUP_MAX_M: int = 16
     VLLM_SM70_AWQ_WARMUP_MAX_MOE_TOKENS: int = 8
     VLLM_SM70_AUX_KERNEL_WARMUP: bool = True
     VLLM_SM70_GEMM_LUT_PATH: str | None = None
@@ -158,7 +159,7 @@ if TYPE_CHECKING:
     VLLM_SM70_FP8_MOE_BATCHED_W2_PER_EXPERT_DISPATCH: bool = False
     VLLM_SM70_FP8_MOE_COMPACT_STRICT_COMPARE_FAIL: bool = False
     VLLM_SM70_FP8_MOE_PERMUTE_WITH_SCRATCH: bool = True
-    VLLM_SM70_FP8_MOE_LEGACY_SINGLE_TOKEN_COMPACT: bool = False
+    VLLM_SM70_FP8_MOE_LEGACY_SINGLE_TOKEN_COMPACT: bool = True
     VLLM_SM70_FP8_MOE_SINGLE_TOKEN_INDEXED_W2_FASTPATH: bool = True
     VLLM_SM70_MOE_ADD_ALLREDUCE: bool = False
     VLLM_SM70_MOE_SINGLE_TOKEN_FASTPATH: bool = False
@@ -1333,6 +1334,9 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_SM70_AWQ_TUNE_SMALL_SHAPES": lambda: bool(
         int(os.getenv("VLLM_SM70_AWQ_TUNE_SMALL_SHAPES", "0"))
     ),
+    "VLLM_SM70_AWQ_PRESERVE_DEFAULT_SPLITS": lambda: bool(
+        int(os.getenv("VLLM_SM70_AWQ_PRESERVE_DEFAULT_SPLITS", "1"))
+    ),
     "VLLM_SM70_FP8_TUNE_SMALL_SHAPES": lambda: bool(
         int(os.getenv("VLLM_SM70_FP8_TUNE_SMALL_SHAPES", "1"))
     ),
@@ -1346,7 +1350,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
         int(os.getenv("VLLM_SM70_AWQ_WARMUP", "1"))
     ),
     "VLLM_SM70_AWQ_WARMUP_MAX_M": lambda: int(
-        os.getenv("VLLM_SM70_AWQ_WARMUP_MAX_M", "8")
+        os.getenv("VLLM_SM70_AWQ_WARMUP_MAX_M", "16")
     ),
     "VLLM_SM70_AWQ_WARMUP_MAX_MOE_TOKENS": lambda: int(
         os.getenv("VLLM_SM70_AWQ_WARMUP_MAX_MOE_TOKENS", "8")
@@ -1491,12 +1495,12 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_SM70_FP8_MOE_PERMUTE_WITH_SCRATCH": lambda: bool(
         int(os.getenv("VLLM_SM70_FP8_MOE_PERMUTE_WITH_SCRATCH", "1"))
     ),
-    # FP8 equivalent of the AWQ legacy single-token compact decode path. Keep
-    # default-off until the FP8 op-level numeric gate and model-level token gate
-    # pass for 35B-FP8; the Python path is implemented and guarded by op
-    # availability so it can be validated without code churn.
+    # FP8 caller for the generic SM70 TurboMind active-source-group compact
+    # decode path. The backend scheduler keeps source expert group semantics
+    # while skipping inactive experts; this route is default-on after the
+    # compact-vs-reference numeric gate passed for 35B-FP8.
     "VLLM_SM70_FP8_MOE_LEGACY_SINGLE_TOKEN_COMPACT": lambda: bool(
-        int(os.getenv("VLLM_SM70_FP8_MOE_LEGACY_SINGLE_TOKEN_COMPACT", "0"))
+        int(os.getenv("VLLM_SM70_FP8_MOE_LEGACY_SINGLE_TOKEN_COMPACT", "1"))
     ),
     # Experimental shared+routed MoE output fusion. When enabled on an
     # eligible SM70 TP graph path, this uses custom all_reduce_sum2(shared,

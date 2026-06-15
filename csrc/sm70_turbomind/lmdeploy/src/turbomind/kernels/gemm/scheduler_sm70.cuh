@@ -31,6 +31,8 @@ struct SchedulerSm70 {
     int chunk_offset_;
 
     const int* offsets_;
+    const int* active_group_idxs_;
+    int        active_group_count_;
 
     struct Tile {
         Array<int, 3> tile_id;
@@ -80,19 +82,46 @@ struct SchedulerSm70 {
         int chunks    = cdiv(gemm_shape[2], chunk_k);
         split_chunks_ = chunks / splits;
         chunk_offset_ = splits - chunks % splits;
+        active_group_idxs_  = nullptr;
+        active_group_count_ = 0;
     }
 
-    __device__ int2 get_group_offset(int g)
+    __host__ void set_active_groups(const int* group_idxs, int group_count)
+    {
+        if constexpr (group_axis >= 0) {
+            if (group_idxs && group_count > 0 && group_count <= gemm_shape_[3]) {
+                active_group_idxs_  = group_idxs;
+                active_group_count_ = group_count;
+
+                constexpr int i = group_axis;
+
+                Array<int, 2> log_unit{};
+                log_unit[1 - (int)order] = log_tile_;
+
+                // Use the same upper-bound formula as grouped scheduling, but
+                // charge only active source groups to the compact dispatch axis.
+                tiles_[i] = ((gemm_shape_[i] / tile_shape[i] >> log_unit[i]) + group_count) << log_unit[i];
+            }
+        }
+    }
+
+    __device__ int source_group(int logical_group)
+    {
+        return active_group_idxs_ ? __ldg(active_group_idxs_ + logical_group) : logical_group;
+    }
+
+    __device__ void get_group_bounds(int logical_group, int& beg, int& end, int& beg_tile, int& end_tile)
     {
         constexpr int i = group_axis;
 
         Array<int, 2> log_unit{};
         log_unit[1 - (int)order] = log_tile_;
 
-        int offset      = __ldg(offsets_ + g);
-        int tile_offset = ((offset / tile_shape[i] >> log_unit[i]) + g) << log_unit[i];
-
-        return {offset, tile_offset};
+        const int source_g = source_group(logical_group);
+        beg               = __ldg(offsets_ + source_g);
+        end               = __ldg(offsets_ + source_g + 1);
+        beg_tile          = ((beg / tile_shape[i] >> log_unit[i]) + logical_group) << log_unit[i];
+        end_tile          = ((end / tile_shape[i] >> log_unit[i]) + logical_group + 1) << log_unit[i];
     }
 
     __device__ int find_group(Array<int, 3>& tile_id, SharedStorage& storage)
@@ -102,13 +131,14 @@ struct SchedulerSm70 {
         int success = 0;
 
         const int block_dim = blockDim.x;
+        const int group_count = active_group_idxs_ ? active_group_count_ : gemm_shape_[3];
 
-        for (int g = threadIdx.x; g < gemm_shape_[3]; g += block_dim) {
-            auto [beg, beg_tile] = get_group_offset(g);
-            auto [end, end_tile] = get_group_offset(g + 1);
+        for (int g = threadIdx.x; g < group_count; g += block_dim) {
+            int beg, end, beg_tile, end_tile;
+            get_group_bounds(g, beg, end, beg_tile, end_tile);
 
             if (beg_tile <= tile_id[axis] && tile_id[axis] < end_tile) {
-                storage.group_id     = g;
+                storage.group_id     = source_group(g);
                 storage.dynamic_dim  = end - beg;
                 storage.base_tile_id = beg_tile;
                 success              = 1;

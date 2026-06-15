@@ -936,7 +936,10 @@ FP8 MoE route recovery update, 2026-06-13:
   (`78.8095`, `81.3733`). Acceptance length was `3.42` and `3.5517`;
   overall acceptance rate was `0.6050` and `0.6379`. Relative to the existing
   no-MTP ~`46.8-47 tok/s` 27B-FP8 baseline, this is about `1.80x` steady
-  decode speedup. The default-KV route has much lower KV capacity during
+  decode speedup. This formal 512/512 MTP4 run is the route smoke as well; do
+  not spend a separate model load on a standalone smoke or a no-MTP rerun when
+  the current question is MTP4 speed. The default-KV route has much lower KV
+  capacity during
   target+drafter residency (`~20.6k tokens` in this run), so it is a speed
   workaround for MTP4 rather than the final FP8-KV-cache answer.
 
@@ -28940,3 +28943,918 @@ evidence before they can count as accepted/default.
        while preserving probabilistic draft_probs for standard rejection. The
        separate algorithmic lever is MTP2/adaptive-K, because public vLLM uses
        Qwen3.6-27B MTP2 and fixed MTP4 spends work on low-yield tail positions.
+
+386. 2026-06-14 Qwen3.6-27B no-MTP speed root cause: SM70 baseline was
+     disabling upstream packed recurrent GDN decode.
+
+     Source/update status:
+     - Current source was committed locally as
+       `ee0bc6a87 [Core] Add SM70 V100 migration paths`.
+     - Push to `https://github.com/1CatAI/1Cat-vLLM.git` branch
+       `sm70-v100-migration-20260614` was blocked by local GitHub auth:
+       `gh auth status` reports an invalid token and there is no SSH private
+       key in `~/.ssh`. The branch is ready locally but remote update needs
+       refreshed GitHub credentials.
+
+     Investigation:
+     - The 27B-AWQ no-MTP 4k/256 speed line that measured about `54-56 tok/s`
+       was not a sampling issue: artifacts use greedy
+       `temperature=0.0, top_k=-1, top_p=1.0`.
+     - The slow artifacts explicitly recorded
+       `VLLM_ENABLE_FLA_PACKED_RECURRENT_DECODE=0` and
+       `packed_recurrent_decode_effective=false`. Example:
+       `bench_results/quality_pass_speed_20260613/decode_qwen36_27b_awq_default_fast_i4096_o256_tp2_r3_20260613.json`
+       measured steady decode `54.7567 tok/s`.
+     - Upstream/latest `envs.py` defaults
+       `VLLM_ENABLE_FLA_PACKED_RECURRENT_DECODE=1`, and local 27B-FP8 no-MTP
+       short-context artifacts with packed recurrent effective measured about
+       `71-72 tok/s`, while explicit legacy/non-packed fused-sigmoid routes in
+       the same 27B-FP8 family stayed around `54 tok/s`.
+     - The local op timing also supports this direction:
+       `fused_recurrent_gated_delta_rule_packed_decode` averaged
+       `0.15465 ms`, while non-packed `fused_recurrent_gated_delta_rule`
+       averaged `0.23366 ms` on the 27B decode shape.
+
+     Code change:
+     - `vllm/config/vllm.py` now auto-sets
+       `VLLM_ENABLE_FLA_PACKED_RECURRENT_DECODE=1` for the SM70
+       Flash-V100 baseline instead of overriding it to `0`.
+     - This is not model-specific and preserves the upstream default direction;
+       users can still explicitly set the env var to override.
+
+     Output-quality regression:
+     - Compared only this variable: `VLLM_ENABLE_FLA_PACKED_RECURRENT_DECODE=0`
+       vs `1`. Both runs used latest-tree Qwen3.6-27B-AWQ, TP2 on physical
+       GPUs 2/3, Flash-V100 prefill/decode, compile `FULL_AND_PIECEWISE`
+       graph, custom all-reduce, `max_model_len=8192`, `gpu_memory_utilization=0.80`,
+       greedy `temperature=0.0, top_p=1.0, top_k=-1`, `ignore_eos`.
+     - 4k input / 256 output with `logprobs=20`:
+       `bench_results/sm70_migration_20260614/quality_qwen36_27b_awq_nomtp_packed_off_i4096_o256_greedy_outputlogprobs_tp2_20260614.json`
+       vs
+       `bench_results/sm70_migration_20260614/quality_qwen36_27b_awq_nomtp_packed_on_i4096_o256_greedy_outputlogprobs_tp2_20260614.json`.
+       Output tokens and text are identical
+       (`token_hash=ddf9444db073a43ff2475933b4b46bb80f0dac7e24102d9ce9b0defb4216488f`),
+       but strict numeric logprob equality is not met:
+       `output_logprob_max_abs_diff=0.05455470085144043`,
+       `output_top_logprob_max_abs_diff=0.2828378677368164`.
+     - 4k input / 1024 output token-only long regression:
+       `bench_results/sm70_migration_20260614/quality_qwen36_27b_awq_nomtp_packed_off_i4096_o1024_greedy_token_tp2_20260614.json`
+       vs
+       `bench_results/sm70_migration_20260614/quality_qwen36_27b_awq_nomtp_packed_on_i4096_o1024_greedy_token_tp2_20260614.json`.
+       Output tokens and text are identical
+       (`token_hash=1dd50acd81926925ba2e0fa42cbe9b71912ea61d92fdf51c9ecb707616d82e8c`,
+       first token diff `None`). Treat packed recurrent as token-quality
+       accepted for this default speed recovery, not as strict numeric
+       max-diff-zero evidence.
+
+     Validation plan:
+     - Run one formal Qwen3.6-27B-AWQ TP2 no-MTP 4k/256 decode benchmark on
+       physical GPUs 2/3 with Flash-V100, compile/FULL graph, custom
+       all-reduce, and current SM70 defaults. Warmup request is excluded from
+       the score. This formal run also serves as the route smoke.
+
+387. 2026-06-14 Generic SM70 TurboMind active source-group scheduler accepted;
+     FP8 MoE legacy compact is the first production caller.
+
+     Root cause:
+     - The failing FP8 MoE legacy compact fast path was not a router/top-k
+       sorting bug and not an expert pointer copy bug. Same-process compare
+       showed the first nonzero diff appears at W13 when the path changes the
+       TurboMind grouped GEMM descriptor from the source expert layout
+       (`num_experts=256`, source offsets) to a top-k compact descriptor
+       (`num_experts=8`).
+     - The top-k descriptor changes grouped GEMM scheduling/group semantics.
+       Even with correct permutation and correct expert ids, the W13 grouped
+       GEMM no longer matches the source-layout reference exactly.
+     - Two diagnostic variants did not solve the issue and should not be used
+       as production routes:
+       preserving the source dispatch selector while keeping the top-k
+       descriptor, and using indexed expert pointer rows while keeping the
+       top-k descriptor. Both still produced nonzero W13 diffs.
+
+     Backend-level fix:
+     - Added an optional active-group list to the generic SM70 TurboMind
+       `SchedulerSm70`. When unused, scheduler behavior is unchanged.
+     - The active-group path keeps the grouped GEMM source expert id as the
+       real `group_id` for A/D offsets and B/V weight pointer resolution, but
+       enumerates only the active source expert ids when constructing the CTA
+       dispatch axis.
+     - This makes the quality-correct exact-layout descriptor fast: the math
+       and source offsets remain equivalent to the safe reference, while the
+       scheduler no longer pays the 256-expert empty-group overhead for a
+       single-token top-k=8 decode step.
+     - This is a TurboMind grouped-GEMM backend capability, not an FP8-only
+       kernel. The first caller is FP8 legacy compact because that is where the
+       current quality bug was reproduced; AWQ or future SM70 MoE callers can
+       pass the same active source-group list instead of adding another
+       quantization-specific workaround.
+
+     Code change:
+     - `csrc/sm70_turbomind/lmdeploy/src/turbomind/kernels/gemm/types.h`
+       adds `Operation::active_group_count`.
+     - `scheduler_sm70.cuh` adds optional `active_group_idxs_` handling and
+       keeps `storage.group_id` equal to the source expert id.
+     - `kernel_impl.h` wires `Ddesc.group_idxs` plus
+       `operation.active_group_count` into the scheduler.
+     - `fp8_moe_single_token_sm70_out` now passes `sorted_expert_ids` to the
+       exact-layout W13/W2 GEMMs as the active source-group list.
+     - `Fp8SM70MoEMethod` now defaults legacy compact to exact-layout
+       active-group mode. The previous top-k descriptor remains a diagnostic
+       opt-out only via
+       `VLLM_SM70_FP8_MOE_LEGACY_SINGLE_TOKEN_COMPACT_EXACT_LAYOUT=0`.
+     - `VLLM_SM70_FP8_MOE_LEGACY_SINGLE_TOKEN_COMPACT` is default-on. This is
+       the first thin quantization-side hook into the generic scheduler
+       facility, not a separate FP8-only compute implementation.
+
+     Quality evidence:
+     - Eager same-process 35B-FP8 TP2 4k/64 compact-vs-reference compare:
+       `bench_results/fp8_moe_route_recovery_20260613/compact_trace_rational_20260614/exact_layout_active_groups_compare_eager/run.log`.
+     - Command used physical GPUs 0/1, native SM70 FP8 MoE, FP8 KV
+       `fp8_e4m3`, `--enforce-eager`, compact enabled, exact-layout enabled,
+       compare enabled.
+     - Full log scan found `160` `SM70 FP8 compact compare` reports and no
+       nonzero `w13`, `silu`, `w2`, or `out` fields. Both warmup top-k
+       `[0..7]` and real routed expert ids such as
+       `[62, 28, 192, 13, 20, 222, 207, 223]` reported
+       `perm=0 off_eq=True off64_eq=True inv_eq=True w13=0 silu=0 w2=0 out=0`.
+
+     Speed evidence:
+     - Pre-fix strict exact-layout compact runtime artifact:
+       `bench_results/fp8_moe_route_recovery_20260613/exact_layout_compact_runtime_20260614/tokens_i4096_o128_tp2.json`,
+       4k/128 TP2 FP8 KV `fp8_e5m2`, generate seconds `1.857255004`.
+     - Pre-fix top-k descriptor compact runtime artifact:
+       `bench_results/fp8_moe_route_recovery_20260613/topk_descriptor_compact_runtime_20260614/tokens_i4096_o128_tp2.json`,
+       same shape, generate seconds `1.728006386`.
+     - Post-fix active-group exact-layout runtime artifact:
+       `bench_results/fp8_moe_route_recovery_20260613/active_groups_exact_layout_runtime_20260614/tokens_i4096_o128_tp2.json`,
+       same shape with default compile/FULL graph path, generate seconds
+       `1.704113868`.
+     - Runtime logs hit native FP8 MoE, Flash-V100, FP8 KV cache, custom TP
+       all-reduce, and `SM70 FP8 MoE legacy single-token exact-layout compact
+       path enabled`.
+
+     Decision:
+     - The compact quality issue is an `A-bug` in the top-k descriptor grouped
+       GEMM semantics, fixed by preserving source expert group semantics.
+     - Future AWQ, FP8, or other SM70 MoE compact callers should reuse this
+       active source-group scheduler contract instead of adding
+       quantization-specific compact descriptor variants.
+     - The accepted compact implementation is exact-layout plus active
+       source-group scheduling. Do not revive the top-k descriptor as the
+       default unless it is made bitwise equal to source-layout W13/SILU/W2/out.
+
+388. 2026-06-14 FP8 compact production 4K/256 speed accepted, but 1024-token
+     production graph strict-token gate is inconclusive.
+
+     Shape:
+     - Qwen3.6-35B-A3B-FP8, TP2 on GPUs `0,1`, `input_len=4096`,
+       `max_tokens=256` for speed and `max_tokens=1024` for long-output
+       strict-token checks.
+     - `dtype=float16`, `quantization=fp8`, `kv_cache_dtype=fp8_e4m3`,
+       greedy sampling (`temperature=0`, `top_p=1`, `top_k=-1`,
+       `ignore_eos=true`), `max_model_len=8192`, `max_num_seqs=1`.
+     - Default production graph path was used for the accepted speed run;
+       `VLLM_SM70_FP8_MOE_LEGACY_SINGLE_TOKEN_COMPACT` was not set manually.
+
+     Route-hit evidence:
+     - `bench_results/fp8_moe_compact_acceptance_20260614/qwen36_35b_fp8_default_i4096_o256_tp2_speed.log`.
+     - Logs show native FP8 TurboMind MoE, exact-layout compact,
+       Flash-V100 prefill/decode, FP8 KV scalar-paged decode, and custom TP
+       all-reduce:
+       `SM70 FP8 MoE TurboMind batched path enabled`,
+       `SM70 FP8 MoE legacy single-token exact-layout compact path enabled`,
+       `FLASH_ATTN_V100 prefill path active`,
+       `FLASH_ATTN_V100 FP8 KV cache decode path active`, and
+       `Using ['CUSTOM', 'PYNCCL'] all-reduce backends`.
+     - The speed JSON records `accepted_fp8_moe_default_policy=true` and
+       `fp8_moe_legacy_single_token_compact_effective=true`.
+
+     Speed result:
+     - Artifact:
+       `bench_results/fp8_moe_compact_acceptance_20260614/qwen36_35b_fp8_default_i4096_o256_tp2_speed.json`.
+     - `prefill_time=0.4507708940000157`, so prompt prefill throughput is
+       `9086.655892205537 tok/s`.
+     - `decode_time=2.1353043809976953`,
+       `steady_decode_tokens=255`,
+       `steady_decode_tps=119.42091360335912`.
+     - `generate_seconds=2.760173971000768`.
+
+     Long-output strict-token finding:
+     - Compact-off reference A:
+       `bench_results/fp8_moe_compact_acceptance_20260614/qwen36_35b_fp8_compact_off_i4096_o1024_tp2.json`,
+       `steady_decode_tps=108.05517938060268`.
+     - Compact-off reference B:
+       `bench_results/fp8_moe_compact_acceptance_20260614/qwen36_35b_fp8_compact_off_repeat_i4096_o1024_tp2.json`,
+       `steady_decode_tps=108.27490789932493`.
+     - Default compact:
+       `bench_results/fp8_moe_compact_acceptance_20260614/qwen36_35b_fp8_compact_default_i4096_o1024_tp2.json`,
+       `steady_decode_tps=119.06547148324273`.
+     - Token comparisons:
+       compact-off A vs compact-off B first mismatched at output index `44`
+       (`1965` vs `3074`);
+       compact-off A vs default compact also first mismatched at index `44`;
+       compact-off B vs default compact first mismatched at index `86`
+       (`25` vs `328`).
+     - Therefore the production-graph 1024-token equality gate is not a valid
+       compact-specific pass/fail proof yet: the compact-off reference is
+       itself not repeat-stable under this run criterion. This does not overturn
+       the same-process eager compact evidence in item 387, where W13/SILU/W2/out
+       were all zero-diff; it means the full-model production-graph token gate
+       still needs a stable reference or capture-safe logits/hidden-state
+       localization before it can be used to accept or reject compact quality.
+
+     Diagnostic caution:
+     - `VLLM_SM70_FP8_MOE_LEGACY_SINGLE_TOKEN_COMPACT_COMPARE=1` is not safe
+       inside production CUDA graph capture in its current form because its
+       `.item()`/CPU logging invalidates stream capture. Use it only in eager
+       same-process checks or rewrite it to defer/capture-safely buffer compare
+       results after graph replay.
+
+389. 2026-06-14 Qwen3.6-27B-AWQ no-MTP baseline and AWQ small-shape tune
+     quality status.
+
+     Current accepted baseline:
+     - Latest tree, physical GPUs `2,3`, Qwen3.6-27B-AWQ, TP2,
+       `input_len=4096`, `max_tokens=256`, greedy sampling
+       (`temperature=0`, `top_p=1`, `top_k=-1`, `ignore_eos=true`),
+       `max_model_len=8192`, Flash-V100 attention, FlashQLA/GDN schedules,
+       AWQ TurboMind dense, custom TP all-reduce, compile/FULL graph policy.
+     - Artifact:
+       `bench_results/sm70_migration_20260614/quality_qwen36_27b_awq_nomtp_normal_default_current_i4096_o256_greedy_token_tp2_20260614.json`.
+     - `prefill_time=1.9606649830002425` in the formal speed baseline
+       `decode_latest_qwen36_27b_awq_nomtp_postbuild_notune_i4096_o256_w1_r1_tp2_20260614.json`.
+     - Accepted decode baseline remains about `58.46 tok/s` steady decode.
+       The current default 256-token greedy output is stable against the
+       earlier default artifact.
+
+     AWQ small-shape tune candidate:
+     - `VLLM_SM70_AWQ_TUNE_SMALL_SHAPES=1` with
+       `VLLM_SM70_AWQ_PRESERVE_DEFAULT_SPLITS=1` reaches
+       `59.847142371841336 tok/s` in
+       `quality_qwen36_27b_awq_nomtp_awqtune_preserve_i4096_o256_greedy_token_tp2_20260614_after_mutex.json`.
+     - It is not default-eligible: token equality against the current default
+       first fails at output token index `150`. Default window:
+       `[3296, 13, 353, 599, 264, 3296, 13, 353, 599, 264, 5388, 13, 353, 599, 264]`.
+       Tune window:
+       `[3296, 13, 353, 599, 264, 5388, 13, 353, 599, 264, 5388, 13, 353, 599, 264]`.
+     - A `defaultkernel`/preserve variant falls back to about `58.45 tok/s`
+       and still fails at the same token index, so that variant neither
+       recovers speed nor proves quality safety.
+
+     Low-level narrowing:
+     - The checkpoint has `346` AWQ qweight tensors but only `5` unique packed
+       dense shapes: linear-attention qkv, linear-attention z, out/o-proj,
+       MLP down, and MLP gate/up. Existing single-op preserve sweeps cover
+       these shape classes for `m=1/2/4/8/16` and found zero diff for the
+       tested layer instances.
+     - Older non-preserve auto tune can pick split/order choices with fp16 ULP
+       differences, for example `gate_proj` M=1 had
+       `max_diff=0.00048828125`. Preserve-default-splits removes that in the
+       representative single-op cases, but full-model token drift remains.
+
+     Diagnostic dead ends:
+     - Python-level `torch.cuda.synchronize()` after the AWQ custom op cannot
+       be used as a fullgraph diagnostic: Dynamo rejects it during AOT capture
+       with "Attempted to call function marked as skipped".
+     - A no-compile diagnostic run with tune enabled completed:
+       `quality_qwen36_27b_awq_nomtp_awqtune_preserve_compileoff_i4096_o256_greedy_token_tp2_20260614.json`.
+       It differs from the compile/FULL-graph default at token index `66`, so
+       it is not a valid tune-vs-default quality conclusion. A matching
+       no-compile default reference would be required before using this lane
+       for tune root-cause classification.
+
+     Decision:
+     - Keep `VLLM_SM70_AWQ_TUNE_SMALL_SHAPES` non-default.
+     - Continue root cause from the remaining gap: either untested
+       same-shape/different-weight AWQ instances, or a full-model
+       call-order/workspace/graph interaction. Do not accept the tune path
+       until the 4k/256 strict token gate passes on the production
+       compile/FULL-graph route and the speed gain is preserved.
+
+390. 2026-06-14 Qwen3.6-35B-FP8 baseline token drift root-cause narrowing.
+
+     Scope:
+     - Latest tree, physical GPUs `0,1`, Qwen3.6-35B-A3B-FP8, TP2,
+       `input_len=4096`, `max_tokens=64` or `128`, greedy sampling
+       (`temperature=0`, `top_p=1`, `top_k=-1`, `ignore_eos=true`),
+       `dtype=float16`, `kv_cache_dtype=fp8_e4m3`, Flash-V100 attention,
+       FlashQLA/GDN schedules, native FP8 TurboMind dense/MoE.
+     - All root-cause probes in this item set
+       `VLLM_SM70_FP8_MOE_LEGACY_SINGLE_TOKEN_COMPACT=0` and
+       `VLLM_SM70_FP8_TUNE_SMALL_SHAPES=0`, so the drift here is a baseline
+       graph issue, not the FP8 compact path.
+
+     Stable lanes:
+     - Same-engine repeat without logprobs on the production compile graph was
+       token-identical over 64 tokens:
+       `compile_graph_same_engine_i4096_o64_repeat2/result.json`.
+       Both repeats produced token hash
+       `05d34c4314253d93595f83ed0838856622283e57db706fc88d30e60ed352eb1e`
+       with `steady_decode_tps` values `98.2142227018519` and
+       `98.6076641646433`. This shows the production graph is stable after one
+       engine has been compiled/captured; the drift is across engine
+       initialization / graph capture / compile decisions.
+     - Same-engine repeat with logprobs was also token-identical over 128 tokens:
+       `bench_results/baseline_drift_rootcause_20260614/no_compact_same_engine_i4096_o128_logprobs20_tp2.json`.
+       This proves the issue is not per-request random sampling inside an
+       already-created engine. Caveat: logprobs changes the sampler path, so it
+       is diagnostic only.
+     - Eager/no-graph/no-compile with FP8 small-shape dynamic tuning disabled
+       was token-identical across two separate processes over 64 tokens:
+       `eager_tune0_run1/tokens_i4096_o64_tp2.json` and
+       `eager_tune0_run2/tokens_i4096_o64_tp2.json`.
+     - No-compile decode graph (`mode=NONE`,
+       `cudagraph_mode=FULL_DECODE_ONLY`, capture size 1) with full logits was
+       token-identical across two separate processes over 64 tokens:
+       `no_compile_graph_full_logits_run1/tokens_i4096_o64_tp2.json` and
+       `no_compile_graph_full_logits_run2/tokens_i4096_o64_tp2.json`.
+
+     Unstable lanes:
+     - Production `VLLM_COMPILE + FULL_AND_PIECEWISE` with FP8 small-shape
+       dynamic tuning disabled still drifted:
+       `fp8_tune0_run1/tokens_i4096_o128_tp2.json` vs
+       `fp8_tune0_run2/tokens_i4096_o128_tp2.json` first mismatched at output
+       index `52` (`440` vs `364`).
+     - Disabling greedy token fastpath and forcing full logits did not fix the
+       production compile graph drift:
+       `graph_full_logits_run1/tokens_i4096_o64_tp2.json` vs
+       `graph_full_logits_run2/tokens_i4096_o64_tp2.json` first mismatched at
+       output index `59` (`1048` vs `1179`).
+     - Therefore the baseline drift is not caused by the compact MoE route,
+       not solely caused by the FP8 small-shape dynamic selector, and not solely
+       caused by the greedy/local top1 sampler shortcut.
+
+     Decode-only compile graph diagnostic:
+     - `VLLM_SM70_FLASH_V100_0DOT3_DECODE_ONLY_CAPTURE=1` did hit the intended
+       branch and logged `Skipping mixed/piecewise CUDA graph capture ... FULL
+       decode graph capture remains enabled`.
+     - That branch is not currently usable for Qwen3.6-35B-FP8: startup failed
+       during compile warmup with `TypeError: 'NoneType' object is not
+       subscriptable` from `qwen3_next.forward`, after compiling range
+       `(1, 8193)` and capturing/registering `81` graph addresses.
+       Artifact:
+       `compile_decode_only_full_logits_run1/run.log`.
+
+     Current conclusion:
+     - The baseline token drift is localized to the current
+       `VLLM_COMPILE + FULL_AND_PIECEWISE` production graph path. The machine
+       and model are repeat-stable when the same weights run in eager or in
+       no-compile FULL decode graph mode.
+     - The next fix should directly repair the compile/full+piecewise graph
+       path or make the stable no-compile decode graph path recover production
+       speed. Do not use the current production-graph strict token gate to judge
+       FP8 compact quality until this baseline drift is fixed.
+
+391. 2026-06-14 Recent-good baseline comparison: the drift is tied to packed
+     recurrent GDN decode, not a Flash-V100 shared-memory timing regression.
+
+     Correct reference point:
+     - Do not compare this issue against old 0.0.3 records. The nearest known
+       quality-normal node is the post Flash-V100 shared-memory timing fix:
+       `bench_results/fp8_moe_route_recovery_20260613/after_flash_v100_smem_fix_long_20260614/decode_qwen36_35b_fp8_default_long1024_i4096_tp2_r2_20260614.json`
+       and matching `.log`.
+     - That good artifact and the current drift artifacts both used SM70
+       Flash-V100, `VLLM_COMPILE + FULL_AND_PIECEWISE`, capture sizes `(1, 2)`,
+       custom all-reduce, FP8 KV Flash-V100 scalar-paged decode, and native FP8
+       TurboMind dense/MoE. Both registered `243` CUDA graph addresses and graph
+       capture reported `0.54 GiB`.
+
+     Critical difference:
+     - The post-smem-fix good artifact explicitly had
+       `VLLM_ENABLE_FLA_PACKED_RECURRENT_DECODE=0`:
+       `Auto-setting VLLM_ENABLE_FLA_PACKED_RECURRENT_DECODE=0 for the SM70 Flash-V100 baseline`.
+     - Current drift artifacts have
+       `VLLM_ENABLE_FLA_PACKED_RECURRENT_DECODE=1`:
+       `Auto-setting VLLM_ENABLE_FLA_PACKED_RECURRENT_DECODE=1 for the SM70 Flash-V100 baseline`.
+     - Other differences exist (`fp8_e5m2` vs `fp8_e4m3`, compile range
+       `[4096]` vs `[8192]`, trust-remote-code, memory utilization), but the
+       controlled current-code probes below isolate the packed recurrent toggle.
+
+     Controlled current-code evidence on physical GPUs `0,1`:
+     - Current code, current `fp8_e4m3`, current Flash-V100 compile/FULL graph,
+       full logits, FP8 small-shape tuning disabled, and only
+       `VLLM_ENABLE_FLA_PACKED_RECURRENT_DECODE=0` changed:
+       `packed0_current_control/run1/tokens_i4096_o64_tp2.json` vs
+       `packed0_current_control/run2/tokens_i4096_o64_tp2.json`.
+       Result: token-identical over 64 output tokens, hash
+       `66fc46627b870a2aa8b1485b0c83017826a1ad453414e60a1a6fb21dcb76f934`,
+       compare artifact `packed0_current_control/compare_run1_run2.json`.
+     - Current packed recurrent default with FlashQLA decode enabled still
+       differs from the packed-off baseline:
+       `packed0_current_control/compare_packed0_run1_vs_packed1_graph_full_run1.json`
+       first mismatch at output index `52` (`364` vs `440`).
+     - Keeping packed recurrent enabled but disabling only FlashQLA decode
+       (`VLLM_SM70_GDN_DECODE_FLASHQLA=0`) is self-stable across two separate
+       processes:
+       `packed1_no_flashqla_decode/run1/tokens_i4096_o64_tp2.json` vs
+       `packed1_no_flashqla_decode/run2/tokens_i4096_o64_tp2.json`,
+       token hash
+       `9790c0946268b2b5108e461f1e3a3f8221df6fbabb0009440fde8b78b32e87ab`.
+       However it still differs from the packed-off baseline, with first
+       mismatch at output index `44` (`1965` vs `3074`), see
+       `packed1_no_flashqla_decode/compare_packed0_vs_packed1_no_flashqla.json`.
+     - A same-input 64-step single-op sequence check on GPU 0 compared the
+       standard `fused_sigmoid_gating_delta_rule_update` recurrent path against
+       `fused_recurrent_gated_delta_rule_packed_decode`. It showed nonzero SSM
+       state diff from step 0 (`state_max=3.814697265625e-06`) while output
+       stayed numerically equal at that step; by step 63 `state_max` reached
+       `3.0517578125e-05` and `out_max` reached `1.9073486328125e-06`.
+       Repeating with `VLLM_SM70_FLA_RECURRENT_SCHEDULE=0` and
+       `VLLM_SM70_FUSED_SIGMOID_GATING_SCHED=0` produced the same diff, so this
+       is not caused by the SM70 schedule selectors.
+
+     Updated conclusion:
+     - The Flash-V100 shared-memory timing fix has not obviously regressed; the
+       current source and runtime extension are newer than the fix and the
+       nearest good artifact already used Flash-V100 compile/FULL graph.
+     - The baseline drift root is the newer packed recurrent GDN decode default
+       changing the recurrent compute route and writing slightly different SSM
+       state. FlashQLA decode is not the only culprit: disabling FlashQLA makes
+       the packed route self-stable but still token-diverges from the packed-off
+       baseline.
+     - The speed-preserving fix should repair or replace the packed recurrent
+       decode route so it matches the stable GDN recurrent semantics under the
+       production compile/FULL graph. Do not treat packed-off as the final speed
+       fix; use it only as the current strict-quality reference.
+
+392. 2026-06-15 Qwen3.6-27B-AWQ default production graph self-drift recheck:
+     current 27B does hit the GDN/FLA route, but the tested default output is
+     cross-process stable.
+
+     Correction:
+     - Do not infer GDN/FLA route eligibility from the top-level HF config
+       alone. The latest 27B-AWQ load logs show
+       `Using FlashQLA-SM70 GDN prefill kernel`,
+       `SM70 GDN/FLA schedule gates enabled`, and
+       `SM70 FlashQLA GDN decode route enabled`.
+     - The benchmark JSON policy fields also record
+       `packed_recurrent_decode_effective=true` and the GDN schedule gates
+       effective. These are relevant to the 27B-AWQ quality baseline.
+
+     Controlled current-code evidence on physical GPUs `2,3`:
+     - Two independent model starts used latest tree, Qwen3.6-27B-AWQ, TP2,
+       `input_len=4096`, `max_tokens=256`, greedy sampling, AWQ TurboMind,
+       Flash-V100 compile graph, `VLLM_ENABLE_FLA_PACKED_RECURRENT_DECODE=1`,
+       `VLLM_SM70_GDN_DECODE_FLASHQLA=1`, `VLLM_SM70_LM_HEAD_TOP1=0`, no GEMM
+       LUT, and no AWQ small-shape tune env.
+     - Artifacts:
+       `bench_results/baseline_drift_rootcause_20260615/27b_awq_default_run1/tokens_i4096_o256_tp2.json`
+       and
+       `bench_results/baseline_drift_rootcause_20260615/27b_awq_default_run2/tokens_i4096_o256_tp2.json`.
+       Compare artifact:
+       `bench_results/baseline_drift_rootcause_20260615/compare_27b_awq_default_run1_vs_run2_i4096_o256_tp2.json`.
+     - Result: token-identical over all 256 output tokens, first mismatch
+       `None`, hash
+       `ddf9444db073a43ff2475933b4b46bb80f0dac7e24102d9ce9b0defb4216488f`.
+
+     Updated conclusion:
+     - The 35B-FP8 packed recurrent drift in item 391 is real, but it cannot be
+       blindly applied to the current 27B-AWQ no-MTP baseline. For this 4k/256
+       27B-AWQ production-graph口径, the baseline is self-stable despite hitting
+       the GDN/FLA packed recurrent route.
+     - This keeps the 27B-AWQ LUT/tune quality investigation actionable: a
+       candidate that token-diverges from the artifact above should still be
+       treated as candidate-induced unless a new 27B-AWQ self-drift case is
+       reproduced under the same口径.
+
+393. 2026-06-15 Qwen3.6-27B-AWQ no-MTP baseline reset to the 4k/1024 test
+    口径.
+
+     Updated benchmark rule:
+     - Use `input_len=4096` and `output_len=1024` for subsequent 27B speed and
+       token-quality checks unless a narrower diagnostic explicitly states why
+       it uses a shorter output.
+     - Continue to report pure steady decode separately from prefill and
+       overall output TPS. Do not substitute 4k/256 numbers for the 4k/1024
+       baseline.
+
+     Current default baseline:
+     - Artifact:
+       `bench_results/sm70_migration_20260615/decode_latest_qwen36_27b_awq_nomtp_default_i4096_o1024_w1_r1_tp2_20260615.json`
+       and matching `.log`.
+     - Latest tree, physical GPUs `2,3`, Qwen3.6-27B-AWQ, TP2, no MTP/no PP,
+       `max_model_len=8192`, `gpu_memory_utilization=0.8`, greedy sampling,
+       first request as warmup and one measured repeat.
+     - Runtime route: Flash-V100 compile graph enabled, FULL decode graph
+       captured, packed recurrent GDN enabled, FlashQLA GDN decode enabled,
+       AWQ TurboMind enabled, custom all-reduce enabled, no GEMM LUT import,
+       and no AWQ small-shape tune env.
+     - Result: `prefill_time=1.967421892004495s`,
+       `steady_decode_tps=58.28603565310691 tok/s`,
+       `decode_time=17.55137381599343s`,
+       `output_tps=52.455272011441295 tok/s`,
+       `tpot=0.01715676814857618s`, output token hash
+       `4ac00a4b1970e6ce0f22268b6233b17e045fb1c28794ca87de748fb0d28113c1`.
+
+394. 2026-06-15 Flash-V100 decode dynamic-partition migration from the
+     0.0.5 line into latest vLLM.
+
+     Implementation:
+     - Ported the 0.0.5-style decode planner/workspace split into
+       `flash-attention-v100/flash_attn_v100/flash_attn_interface.py`.
+       The latest tree now keeps graph-safe fixed workspace capacity but writes
+       a device `active_num_partitions` scalar so replayed decode kernels skip
+       inactive partitions for the current sequence length.
+     - Updated `flash-attention-v100/kernel/flash_decode_paged.cu` and
+       `flash-attention-v100/include/fused_mha.h` so the partition kernel and
+       reducer consume `active_num_partitions`, while the launch grid can remain
+       static for CUDA graph replay.
+     - The backend-local shape hints are attached only in
+       `vllm/v1/attention/backends/flash_attn_v100.py` as Flash-V100 metadata
+       attributes. The generic attention metadata and upstream backend contract
+       stay unchanged.
+     - Kept default `partition_size=256`. An attempted HD256/GQA long-context
+       promotion to `512/1024` changed the softmax reduction boundary and
+       flipped greedy output tokens, so it is not part of the accepted default.
+
+     Local build/compile compatibility while testing on the Torch 2.9.1 node:
+     - The local `_C_stable_libtorch` and FA2 artifacts were ABI-incompatible
+       with the active Torch install. The SM70 validation run therefore used
+       optional-op fallbacks for missing stable `_C` symbols and rebuilt the
+       ordinary `_C` with the SM70 `silu_and_mul` compatibility schema. These
+       shims are guarded by op-existence checks and should not affect a normal
+       full-extension build.
+
+     Quality evidence:
+     - Direct Flash-V100 decode kernel check on physical GPU `2`, seq_len
+       `4097`, capacity `8192`, `H=8`, `Hkv=1`, `D=256`: runtime workspace vs
+       static graph-style workspace with active partitions was bitwise equal,
+       `max_diff=0.0`.
+     - Diagnostic active-partition A/B on the full model used the same latest
+       code, Qwen3.6-27B-AWQ, physical GPUs `2,3`, TP2, greedy, `4k/1024`,
+       Flash-V100 compile graph, AWQ TurboMind, packed recurrent GDN, and
+       FlashQLA GDN decode.
+       - Dynamic active on artifact:
+         `bench_results/sm70_migration_20260615/decode_latest_qwen36_27b_awq_flashv100_dynpart_p256_i4096_o1024_w1_r1_tp2_20260615.json`.
+       - Dynamic active off artifact:
+         `bench_results/sm70_migration_20260615/decode_latest_qwen36_27b_awq_flashv100_dynpart_off_i4096_o1024_w1_r1_tp2_20260615.json`.
+       - Result: token hash identical in both runs,
+         `aecd9f2efc11e86a491286a6c8a174e6ca346160114e072cea2638ada7a670f2`;
+         first mismatch `None`.
+     - The rejected `512/1024` promotion artifact
+       `decode_latest_qwen36_27b_awq_flashv100_dynpart_i4096_o1024_w1_r1_tp2_20260615.json`
+       diverged from the current p256 output at token index `66`. Do not use
+       larger decode partitions as a quality-safe default without a separate
+       logits/token proof.
+     - The old item-393 baseline hash differs from the current p256 A/B at
+       token index `150`, but the same current-code dynamic-on/off A/B is
+       identical. Treat that as a current-baseline shift outside this
+       dynamic-partition change, not as evidence against active partitions.
+
+     Speed and long-context decode-decay evidence:
+     - Accepted `4k/1024` p256 dynamic artifact:
+       `prefill_time=2.130126100004418s`,
+       `steady_decode_tps=58.5404474626935 tok/s`,
+       `decode_time=17.475097037000523s`,
+       `output_tps=52.225971229894355 tok/s`.
+     - Same-code dynamic-off diagnostic:
+       `steady_decode_tps=58.543065386832545 tok/s`.
+       This proves the accepted p256 dynamic path is quality-equivalent, but it
+       also means this specific 4k/1024 single-request benchmark does not show a
+       measurable speed win from active partition skipping.
+     - One-engine decay sweep artifact:
+       `bench_results/sm70_migration_20260615/decode_latest_qwen36_27b_awq_flashv100_dynpart_decay_i1024_4096_6144_o1024_w1_r1_tp2_20260615.json`.
+       Results:
+       `i1024/o1024 steady_decode_tps=58.490472680364995`,
+       `i4096/o1024 steady_decode_tps=58.479233795408724`,
+       `i6144/o1024 steady_decode_tps=58.51036120023638`.
+       Within this口径, decode throughput does not decay as prompt length grows
+       from 1k to 6k.
+     - 16k/32k/64k long-context sweep artifact:
+       `bench_results/sm70_migration_20260615/decode_latest_qwen36_27b_awq_flashv100_dynpart_decay_i16k_32k_64k_o1024_w1_r1_tp2_20260615.json`.
+       Same latest code, physical GPUs `2,3`, Qwen3.6-27B-AWQ, TP2,
+       `max_model_len=131072`, Flash-V100 compile graph, AWQ TurboMind,
+       packed recurrent/GDN schedules enabled, `VLLM_SM70_LM_HEAD_TOP1=0`,
+       first request as warmup.
+       Results:
+       `i16384/o1024 prefill_time=11.153300586011028s steady_decode_tps=58.46433896539498`,
+       `i32768/o1024 prefill_time=28.04704052300076s steady_decode_tps=58.472360462686474`,
+       `i65536/o1024 prefill_time=78.65450084499025s steady_decode_tps=58.480991960390526`.
+       Pure decode remains flat from 16k to 64k; lower total `output_tps`
+       is from prefill/TTFT growth, not decode slowdown.
+
+     Long-context output sanity notes:
+     - The 16k/32k/64k speed artifact uses the benchmark filler prompt and
+       `ignore_eos` to force 1024 output tokens, so it is only a coarse
+       collapse/乱码 check, not semantic quality proof.
+     - Coarse checks: no single-token collapse (`unique_tokens=349/48/37`);
+       32k and 64k have `replacement_chars=0` and no `<|im_end|>` spam. The
+       16k forced output has `replacement_chars=3` and four visible
+       `<|im_end|>` markers near the tail, so do not mark semantic long-output
+       quality as fully proven from this artificial prompt alone.
+     - Added reusable script
+       `benchmarks/benchmark_sm70_long_quality_suffix.py` for meaningful final
+       suffix-following checks. The first graph-enabled quality-suffix run did
+       not reach generation: worker segfaulted during graph compile/warmup.
+       That is a startup/compile failure of the new quality harness run, not a
+       generated-token quality result.
+
+     Updated conclusion:
+     - The quality-safe migration is the active-partition mechanism with the
+       original 256-token partition size. This is decoupled inside the
+       Flash-V100 package/backend and can stay enabled by default.
+     - Larger partition-size promotion is a real speed idea but currently
+       fails the long-output token gate and must remain rejected until it can be
+       proven logits/token-safe.
+
+     MTP coexistence check:
+     - Question checked: whether Qwen3.6-27B-AWQ MTP4 can coexist with the
+       Flash-V100 long-context dynamic-partition decode path on physical GPUs
+       `2,3`.
+     - Source gap found and fixed: MTP verification reaches Flash-V100 as
+       q>1 prefix prefill, then internally uses paged decode for the tiny
+       verifier rows. The existing decode shape hints were only attached for
+       q=1 decode, so this verifier path was not passing the long-context
+       partition hints into `flash_attn_decode_paged`.
+     - Implementation:
+       `vllm/v1/attention/backends/flash_attn_v100.py` now attaches
+       `smallq_decode_max_seq_len_hint` and
+       `smallq_decode_workspace_seq_capacity_hint` for the small-query
+       verifier metadata and forwards them into the paged decode call. The
+       graph-safe workspace capacity remains fixed while the kernel consumes
+       active runtime partition counts.
+     - Startup compatibility fix:
+       `vllm/v1/spec_decode/llm_base_proposer.py` explicitly supplies
+       `intermediate_tensors=None` to `Qwen3_5MTP`/`Qwen3_5MoeMTP` AOT calls.
+       Without this, the compiled MTP forward failed before reaching
+       generation with
+       `Qwen3_5MTP.forward() missing 1 required positional argument:
+       'intermediate_tensors'`.
+     - Route evidence:
+       16k/32k/64k MTP4 runs all logged target
+       `AttentionBackendEnum.FLASH_ATTN_V100`, drafter
+       `AttentionBackendEnum.TRITON_ATTN`, CUDA graph policy
+       `FULL_AND_PIECEWISE` with capture sizes including q=5, graph capture
+       completion, and
+       `FLASH_ATTN_V100 prefix prefill small-query path active (paged decode
+       verifier, max_query_len<=16)`.
+     - 16k artifact:
+       `bench_results/sm70_migration_20260615/decode_latest_qwen36_27b_awq_mtp4_flashv100_dynpart_i16k_o64_w0_r1_tp2_20260615.json`.
+       Result: `prefill_time=16.53582597800414s`,
+       `steady_decode_tps=87.68842293469842`, acceptance length `5.0`,
+       acceptance rate `1.0`, output token hash
+       `ed415fd155da6dc73bb55123e90f1477f62151435d0e0b412182f7adbf2d3029`.
+     - 32k/64k artifact:
+       `bench_results/sm70_migration_20260615/decode_latest_qwen36_27b_awq_mtp4_flashv100_dynpart_i32k_64k_o64_w0_r1_tp2_20260615.json`;
+       case file
+       `bench_results/sm70_migration_20260615/cases_mtp4_flashv100_dynpart_i32k_64k_o64_20260615.json`.
+       Results:
+       `i32768/o64 prefill_time=36.7372537330084s steady_decode_tps=66.1571923683509 acceptance_length=4.785714285714286 acceptance_rate=0.9464285714285714`;
+       `i65536/o64 prefill_time=96.92244320700411s steady_decode_tps=55.304025192196924 acceptance_length=4.846153846153847 acceptance_rate=0.9615384615384616`.
+     - Interpretation: MTP and the Flash-V100 long-context decode mechanism
+       are functionally compatible: they start, capture graphs, hit the
+       small-query paged decode verifier path, and finish generation at
+       16k/32k/64k. However, this is not yet a proof that MTP preserves the
+       no-MTP flat long-context decode curve. Unlike the no-MTP 16k/32k/64k
+       sweep above, MTP4 decode falls from `87.69` at 16k to `55.30` at 64k.
+       Acceptance remains high at 32k/64k, so the loss is more likely verifier
+       or drafter long-context cost than acceptance collapse.
+     - Open performance follow-up: the current safe small-query verifier keeps
+       graph replay workspace capacity fixed. That proves correctness and graph
+       compatibility, but may still leave capacity-dependent launch overhead.
+       The draft model also remains pinned to `TRITON_ATTN`. A separate speed
+       pass should isolate verifier workspace capacity vs drafter Triton
+       attention before claiming MTP has fully inherited the no-MTP dynamic
+       partition speed behavior.
+
+395. 2026-06-15 Qwen3.6-35B-A3B-FP8 QLA/default speed baseline metric
+     correction.
+
+     Why this item exists:
+     - The vLLM progress-bar `est. speed input` value is prompt tokens divided
+       by end-to-end generation time. It is not pure prefill throughput and must
+       not be used as the reported prefill speed.
+     - For `benchmark_sm70_model_tokens.py`, the accepted prefill/decode speed
+       fields are `records[0].request_metrics.prefill_time` and
+       `records[0].request_metrics.steady_decode_tps`.
+
+     Environment repair before the run:
+     - The active `vllm/_C.abi3.so` had been built against a mismatched Torch
+       ABI and required
+       `c10::cuda::c10_cuda_check_implementation(..., int, bool)`, while the
+       active `vllm-0.0.5-t210` Torch 2.10.0 exports the `unsigned int` ABI.
+     - Backed up that broken binary as
+       `vllm/_C.abi3.so.bad-abi-20260615-083001` and restored the matching
+       `build/lib.linux-x86_64-cpython-312/vllm/_C.abi3.so`.
+
+     Corrected default-fastpath run:
+     - Artifact:
+       `bench_results/qla_baseline_20260615/35b_fp8_i4096_o256_default/tokens.json`
+       and matching `run.log`.
+     - Model/run shape: Qwen3.6-35B-A3B-FP8, physical GPUs `0,1`, TP2,
+       `input_len=4096`, `output_len=256`, greedy, FP8 KV
+       `kv_cache_dtype=fp8_e4m3`, `max_model_len=8192`, `max_num_seqs=1`.
+     - Runtime auto policy hit the normal SM70 baseline: FlashQLA GDN prefill
+       and decode, packed recurrent GDN, Flash-V100 compile graph,
+       FP8 TurboMind dense, native FP8 MoE TurboMind batched path,
+       FP8 MoE legacy single-token exact-layout compact, custom TP all-reduce,
+       and Flash-V100 FP8 KV cache decode.
+     - Important quality caveat: this run left
+       `VLLM_SM70_FP8_TUNE_SMALL_SHAPES` unset, so the artifact records
+       `fp8_dynamic_measure_enabled=true` and
+       `fp8_safe_default_selector_effective=false`. Per items 285-290, the
+       FP8 dense dynamic small-shape selector is still `B-pending` at the
+       full-model quality level. Therefore this item is a default-speed /
+       route-hit correction only, not a quality-accepted FP8 dense tuning
+       baseline. A quality baseline must pin
+       `VLLM_SM70_FP8_TUNE_SMALL_SHAPES=0` unless/until the dynamic selector
+       passes the full model gate.
+     - KV cache capacity: available KV cache memory `11.95 GiB`; GPU KV cache
+       size `1,399,661 tokens`; max concurrency for 8192 tokens/request
+       `170.86x`.
+     - Correct request metrics:
+       `prefill_time=0.48290049300703686s`,
+       `prefill_tps=8482.078729085732 tok/s`,
+       `decode_time=2.159093595997547s`,
+       `steady_decode_tokens=255`,
+       `steady_decode_tps=118.10511618056309 tok/s`,
+       `generate_seconds=2.8431296199996723s`.
+
+     Updated conclusion:
+     - The earlier reported `~374 tok/s` "prefill" was a metric interpretation
+       error from dividing prompt tokens by total generation time on a 1024-token
+       decode run.
+     - The earlier `~97 tok/s` decode number was a non-default diagnostic lane
+       with packed/compact-related fast paths disabled. It is not the current
+       default QLA speed baseline.
+     - Do not treat the `118.105 tok/s` number above as quality-accepted until
+       the same shape is rerun with either
+       `VLLM_SM70_FP8_TUNE_SMALL_SHAPES=0` or with completed full-model quality
+       evidence for the dynamic FP8 dense selector.
+
+396. 2026-06-15 35B-FP8 compact recheck: do not regress the accepted
+     exact-layout compact fix based on cross-engine token drift.
+
+     Scope:
+     - Qwen3.6-35B-A3B-FP8, physical GPUs `0,1`, TP2, `input_len=4096`,
+       `max_tokens=1024`, greedy, FP8 KV `fp8_e4m3`, `max_model_len=8192`,
+       `max_num_seqs=1`, Flash-V100 compile/FULL graph, FlashQLA GDN decode,
+       custom TP all-reduce.
+     - Quality-safe dense selector is pinned with
+       `VLLM_SM70_FP8_TUNE_SMALL_SHAPES=0`.
+     - Packed recurrent GDN stays disabled with
+       `VLLM_ENABLE_FLA_PACKED_RECURRENT_DECODE=0`, because item 391 records
+       35B-FP8 production-graph token drift from the packed recurrent route.
+
+     Diagnostic compact-off reference:
+     - Artifact:
+       `bench_results/qla_baseline_20260615/35b_fp8_i4096_o1024_tp2_r2/tokens.json`.
+     - Env deltas: `VLLM_SM70_FP8_TUNE_SMALL_SHAPES=0`,
+       `VLLM_ENABLE_FLA_PACKED_RECURRENT_DECODE=0`,
+       `VLLM_SM70_FP8_MOE_LEGACY_SINGLE_TOKEN_COMPACT=0`,
+       `VLLM_SM70_GREEDY_TOKEN_FASTPATH=0`.
+     - Result: prefill `0.4441083119963878s`
+       (`9222.975317861908 tok/s`), decode `10.494081825003377s`,
+       steady decode `97.48351662006131 tok/s`.
+     - Output hash:
+       `03f6364e10c818654aeb869cbcfdbe16ccde2d0be79f54ec94ea4815317a40dd`.
+
+     Compact-on diagnostic under the same visible quality pins:
+     - Artifact:
+       `bench_results/qla_baseline_20260615/35b_fp8_i4096_o1024_tp2_tune0_packed0_compact1/tokens.json`
+       and matching `run.log`.
+     - Only intended speed-route difference from the reference is
+       `VLLM_SM70_FP8_MOE_LEGACY_SINGLE_TOKEN_COMPACT=1`.
+       The artifact records `fp8_dynamic_measure_enabled=false`,
+       `fp8_safe_default_selector_effective=true`,
+       `packed_recurrent_decode_effective=false`,
+       `accepted_fp8_moe_default_policy=true`, and
+       `fp8_moe_legacy_single_token_compact_effective=true`.
+     - Runtime route logs hit `SM70 FP8 MoE legacy single-token exact-layout
+       compact path enabled`, FlashQLA, Flash-V100 FP8 KV decode, and custom
+       TP all-reduce.
+     - Result: prefill `0.46306099499634s`
+       (`8845.486975279302 tok/s`), decode `9.78872671299905s`,
+       steady decode `104.50797432535282 tok/s`.
+     - Output hash:
+       `dca0dbc658183be3c68a70979350fe7cb8c1419ebf11a3918746390887e777b1`.
+     - Token compare against the compact-off reference failed at output index
+       `52`: reference token `364`, compact-on token `440`.
+
+     Current conclusion:
+     - `VLLM_SM70_FP8_TUNE_SMALL_SHAPES=1` / unset remains not
+       quality-accepted for FP8 dense full-model output; items 285-290 already
+       record full-model token-hash divergence even though covered dense
+       fixed-vs-dynamic op checks were bitwise exact.
+     - The token mismatch above must not be used as proof that the compact
+       kernel regressed. It repeats the invalid attribution pattern already
+       documented in item 388: production-graph cross-engine long-token
+       equality is not a compact-specific gate unless the compact-off reference
+       is proven repeat-stable under the same code/binary/runtime state.
+     - The accepted compact fix from item 387 still stands at the kernel/path
+       level. Current source still defaults
+       `VLLM_SM70_FP8_MOE_LEGACY_SINGLE_TOKEN_COMPACT_EXACT_LAYOUT=1`, calls
+       `fp8_moe_single_token_sm70_out` with source expert offsets in
+       `exact_per_route`, and passes `sorted_expert_ids` as active source
+       groups to the generic SM70 TurboMind scheduler. The old top-k descriptor
+       compact remains diagnostic-only.
+     - Compact-on remains a real speed candidate (`104.508 tok/s` here;
+       `119.421 tok/s` in item 388 default-speed evidence), but its promotion
+       must use same-engine compact-vs-reference compare/logits or the existing
+       `VLLM_SM70_FP8_MOE_LEGACY_SINGLE_TOKEN_COMPACT_COMPARE=1` reports, not
+       another cross-engine token hash comparison.
+
+397. 2026-06-15 current 35B-FP8 baseline self-stability is blocked by runtime
+     binary overwrite, before any valid token-quality conclusion can be made.
+
+     Scope:
+     - Qwen3.6-35B-A3B-FP8, physical GPUs `0,1`, TP2, `input_len=4096`,
+       `max_tokens=256`, greedy, FP8 KV `fp8_e4m3`, `max_model_len=8192`,
+       `max_num_seqs=1`.
+     - The command intentionally used the normal SM70 default baseline knobs
+       only: `CUDA_VISIBLE_DEVICES=0,1`, cache envs, and `VLLM_USE_V1=1`.
+       Runtime auto-policy enabled packed recurrent GDN, Flash-V100 compile
+       graph, FP8 TurboMind dense, native FP8 MoE TurboMind batched path,
+       FP8 MoE exact-layout compact, custom TP all-reduce, and FP8 KV decode.
+
+     Run1 artifact:
+     - `bench_results/baseline_self_stability_20260615/35b_fp8_default_i4096_o256/run1/tokens.json`
+       and matching `run.log`.
+     - Request metrics:
+       `prefill_time=0.45364746000268497s`,
+       `prefill_tps=9029.038613748893 tok/s`,
+       `decode_time=2.140906579006696s`,
+       `steady_decode_tokens=255`,
+       `steady_decode_tps=119.10842000322633 tok/s`.
+     - Output hash:
+       `3105756702f6d2be96b8492f7f8be53eb685f347b7405333f1d3a7d838d51b92`.
+
+     Run2 did not reach model-token comparison:
+     - Before run2, the local extension was restored and verified:
+       `sha256(vllm/_C.abi3.so)=1adc709a8a34ab475975ff579ac0b8014f237c812ecfa7fb5d3abfc27a12c835`,
+       matching `build/lib.linux-x86_64-cpython-312/vllm/_C.abi3.so`;
+       `import vllm._C` succeeded in the active
+       `/home/ymzx/miniconda3/envs/vllm-0.0.5-t210` environment.
+     - During the LLM worker spawn, `vllm/_C.abi3.so` was overwritten again
+       with the ABI-incompatible CPython-3.13/Torch-mismatched binary:
+       `sha256(vllm/_C.abi3.so)=8c4f3145b743ac7e637f284ee1d9e872bb4925d41e764379dcc27df4ad5d4e1e`.
+       The worker then failed with:
+       `_C.abi3.so: undefined symbol:
+       _ZN3c104cuda29c10_cuda_check_implementationEiPKcS2_ib`.
+     - The CMake install manifest was refreshed at the same time:
+       `build/temp.linux-x86_64-cpython-313/install_local_manifest.txt`
+       contains `/home/ymzx/桌面/1cat-vllm/vllm/vllm/_C.abi3.so` and was
+       updated at `2026-06-15 09:13:40 +0800`.
+       `/tmp/sm70_install_c.log` records:
+       `-- Installing: /home/ymzx/桌面/1cat-vllm/vllm/vllm/_C.abi3.so`.
+
+     Current conclusion:
+     - The current baseline cannot yet be called token-stable or token-unstable
+       from this run. The repeatability test is invalid because the source-tree
+       runtime binary changes between independent process launches.
+     - This is a harder prerequisite than compact/packed/dense attribution:
+       before any full-model quality gate, freeze the active runtime extension
+       to the torch-2.10/cp312-compatible `_C.abi3.so`, stop any concurrent
+       `cmake --install`/editable build that writes to the same source tree, or
+       run from an isolated copy of the tree. Otherwise token drift and import
+       failures can be caused by binary-state pollution rather than the model
+       path being tested.
+
+398. 2026-06-15 FP8 exact-layout compact-only 4K/1024 token gate fails when
+     packed recurrent and FP8 dense dynamic tune are both disabled.
+
+     Scope:
+     - Qwen3.6-35B-A3B-FP8, physical GPUs `0,1`, TP2, `input_len=4096`,
+       `max_tokens=1024`, greedy, `ignore_eos=true`, FP8 KV `fp8_e4m3`,
+       `max_model_len=8192`, `max_num_seqs=1`, production Flash-V100 compile
+       graph, FlashQLA/GDN schedules, native FP8 TurboMind MoE, custom TP
+       all-reduce.
+     - Both compared artifacts pin the two non-compact suspect paths off:
+       `VLLM_ENABLE_FLA_PACKED_RECURRENT_DECODE=0` and
+       `VLLM_SM70_FP8_TUNE_SMALL_SHAPES=0`.
+     - The compact candidate additionally sets
+       `VLLM_SM70_FP8_MOE_LEGACY_SINGLE_TOKEN_COMPACT=1` and records
+       `fp8_moe_legacy_single_token_compact_effective=true`; the reference sets
+       `VLLM_SM70_FP8_MOE_LEGACY_SINGLE_TOKEN_COMPACT=0`.
+
+     Repeat-stable all-off reference:
+     - `bench_results/baseline_drift_rootcause_20260614/packed_exact_mixedqkv_patch_1024/packed_off_ref/tokens_i4096_o1024_tp2.json`
+       vs
+       `bench_results/qla_baseline_20260615/35b_fp8_i4096_o1024_tp2_r2/tokens.json`.
+     - Compare artifact:
+       `bench_results/fp8_compact_only_quality_20260615/compare_alloff_ref_vs_alloff_r2_i4096_o1024_tp2.json`.
+     - Result: `equal=true`, `first_mismatch=null`, output length `1024`.
+
+     Compact-only token gate:
+     - Reference:
+       `bench_results/qla_baseline_20260615/35b_fp8_i4096_o1024_tp2_r2/tokens.json`.
+     - Candidate:
+       `bench_results/qla_baseline_20260615/35b_fp8_i4096_o1024_tp2_tune0_packed0_compact1/tokens.json`.
+     - Compare artifact:
+       `bench_results/fp8_compact_only_quality_20260615/compare_alloff_vs_compact_only_i4096_o1024_tp2.json`.
+     - Result: `equal=false`, `model_quality_gate.label=model-fail`, first
+       output mismatch at index `52`: all-off token `364`, compact-only token
+       `440`.
+
+     Current conclusion:
+     - This supersedes the conservative attribution note in item 396 for this
+       specific 4K/1024/e4m3/tune0/packed0口径: the all-off baseline has a
+       1024-token repeat-stable pair, so the compact-only candidate currently
+       fails the strict token gate under otherwise matching visible runtime
+       knobs.
+     - The failure is not evidence for the old top-k descriptor compact; this
+       candidate is the current exact-layout active source-group compact route.
+     - The next useful debug is not another end-to-end rerun. Instrument the
+       compact-only run with compact compare / layer-local dumps under the same
+       pins (`packed=0`, `fp8_tune=0`) and locate the first layer/step where
+       exact-layout compact diverges from the non-compact MoE output.

@@ -151,15 +151,21 @@ inline std::string to_string(QuantDesc desc)
 
 enum class DispatchPolicy : int
 {
-    kDefault = 0,
-    kMeasure = 1,
-    kReuse   = 2,
-    kAppend  = 3,
+    kDefault               = 0,
+    kMeasure               = 1,
+    kReuse                 = 2,
+    kAppend                = 3,
+    kPreserveDefaultSplits = 4,
 };
 
 constexpr bool operator&(const DispatchPolicy& a, const DispatchPolicy& b)
 {
     return ((int)a & (int)b);
+}
+
+constexpr DispatchPolicy operator|(const DispatchPolicy& a, const DispatchPolicy& b)
+{
+    return static_cast<DispatchPolicy>((int)a | (int)b);
 }
 
 class Kernel;
@@ -184,6 +190,7 @@ struct Operation {
     QuantDesc      quant_b;
     int            batch_dim;
     int            dispatch_num_override;
+    int            active_group_count;
     void*          reserved;
 };
 

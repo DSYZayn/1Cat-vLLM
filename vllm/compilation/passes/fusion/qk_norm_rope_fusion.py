@@ -18,12 +18,12 @@ from vllm.model_executor.layers.rotary_embedding import RotaryEmbedding
 
 from ..inductor_pass import enable_fake_mode
 from ..vllm_inductor_pass import VllmInductorPass, VllmPatternMatcherPass
-from .matcher_utils import MatcherRotaryEmbedding
+from .matcher_utils import MatcherRotaryEmbedding, get_op_overload
 from .rms_quant_fusion import empty_bf16, empty_fp32, empty_i64
 
 logger = init_logger(__name__)
 
-FUSED_QK_ROPE_OP = torch.ops._C.fused_qk_norm_rope.default
+FUSED_QK_ROPE_OP = get_op_overload(torch.ops._C, "fused_qk_norm_rope")
 
 P = ParamSpec("P")
 
@@ -196,6 +196,13 @@ class QKNormRoPEFusionPass(VllmPatternMatcherPass):
         )
 
         dtype = config.model_config.dtype
+        if FUSED_QK_ROPE_OP is None:
+            logger.warning_once(
+                "QK Norm+RoPE fusion not enabled: fused_qk_norm_rope is "
+                "unavailable."
+            )
+            return
+
         if dtype not in (torch.bfloat16, torch.float16):
             logger.warning_once(
                 "QK Norm+RoPE fusion not enabled: unsupported dtype %s", dtype

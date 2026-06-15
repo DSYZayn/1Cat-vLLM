@@ -150,6 +150,21 @@ void maybe_log_sm70_moe_route_once(std::atomic<unsigned>& logged_mask,
 
 }  // namespace
 
+void silu_and_mul(torch::Tensor& out, torch::Tensor& input) {
+  TORCH_CHECK(input.is_cuda() && out.is_cuda(),
+              "silu_and_mul SM70 compatibility op expects CUDA tensors.");
+  TORCH_CHECK(input.scalar_type() == at::ScalarType::Half &&
+                  out.scalar_type() == at::ScalarType::Half,
+              "silu_and_mul SM70 compatibility op only supports float16.");
+  TORCH_CHECK(input.dim() >= 1 && input.size(-1) % 2 == 0,
+              "silu_and_mul expects the last input dimension to be even.");
+  TORCH_CHECK(out.numel() * 2 == input.numel(),
+              "silu_and_mul output shape must be half of input last dim.");
+  const at::cuda::OptionalCUDAGuard device_guard(device_of(input));
+  sm70_silu_and_mul_fp16_out(out, input);
+  C10_CUDA_KERNEL_LAUNCH_CHECK();
+}
+
 namespace turbomind::gemm {
 
 template <class Base>
@@ -530,14 +545,7 @@ bool awq_tune_small_shapes_enabled() {
 
 bool fp8_tune_small_shapes_enabled() {
   const char* raw = std::getenv("VLLM_SM70_FP8_TUNE_SMALL_SHAPES");
-  if (raw != nullptr) {
-    return std::atoi(raw) != 0;
-  }
-  const char* legacy_raw = std::getenv("VLLM_SM70_AWQ_TUNE_SMALL_SHAPES");
-  if (legacy_raw != nullptr) {
-    return std::atoi(legacy_raw) != 0;
-  }
-  return true;
+  return raw == nullptr || std::atoi(raw) != 0;
 }
 
 bool fp8_moe_single_token_per_expert_dispatch_enabled() {
@@ -554,6 +562,24 @@ bool fp8_0dot3_dense_selector_enabled() {
 bool awq_reuse_imported_cache_enabled() {
   const char* raw = std::getenv("VLLM_SM70_AWQ_REUSE_IMPORTED_CACHE");
   return raw != nullptr && std::atoi(raw) != 0;
+}
+
+bool awq_preserve_default_splits_enabled() {
+  const char* raw = std::getenv("VLLM_SM70_AWQ_PRESERVE_DEFAULT_SPLITS");
+  return raw == nullptr || std::atoi(raw) != 0;
+}
+
+inline turbomind::gemm::DispatchPolicy maybe_preserve_default_splits(
+    turbomind::gemm::DispatchPolicy policy) {
+  if (!awq_preserve_default_splits_enabled()) {
+    return policy;
+  }
+  if (policy == turbomind::gemm::DispatchPolicy::kMeasure ||
+      policy == turbomind::gemm::DispatchPolicy::kReuse) {
+    return policy |
+           turbomind::gemm::DispatchPolicy::kPreserveDefaultSplits;
+  }
+  return policy;
 }
 
 std::optional<turbomind::gemm::DispatchPolicy> dispatch_policy_override_from_env(
@@ -580,8 +606,18 @@ std::optional<turbomind::gemm::DispatchPolicy> awq_moe_dispatch_policy_override(
       "VLLM_SM70_AWQ_MOE_DISPATCH_POLICY");
 }
 
-int dense_tune_max_m() {
+int awq_dense_tune_max_m() {
   const char* raw = std::getenv("VLLM_SM70_AWQ_DENSE_TUNE_MAX_M");
+  return raw ? std::max(std::atoi(raw), 0) : 16;
+}
+
+int generic_dense_tune_max_m() {
+  const char* raw = std::getenv("VLLM_SM70_F16_DENSE_TUNE_MAX_M");
+  return raw ? std::max(std::atoi(raw), 0) : 16;
+}
+
+int fp8_dense_tune_max_m() {
+  const char* raw = std::getenv("VLLM_SM70_FP8_DENSE_TUNE_MAX_M");
   return raw ? std::max(std::atoi(raw), 0) : 16;
 }
 
@@ -619,8 +655,9 @@ turbomind::gemm::DispatchPolicy select_dense_dispatch_policy_impl(
     cudaStream_t stream,
     TuneKeyKind kind,
     bool tune_enabled,
-    bool reuse_imported_cache) {
-  if (m > dense_tune_max_m()) {
+    bool reuse_imported_cache,
+    int max_m) {
+  if (m > max_m) {
     return turbomind::gemm::DispatchPolicy::kDefault;
   }
   if (reuse_imported_cache && has_imported_cache(device)) {
@@ -649,14 +686,15 @@ turbomind::gemm::DispatchPolicy select_dense_dispatch_policy(
     int device, int m, int n, int k, int group_size, cudaStream_t stream) {
   return select_dense_dispatch_policy_impl(
       device, m, n, k, group_size, stream, TuneKeyKind::kGenericDense,
-      tune_small_shapes_enabled(), false);
+      tune_small_shapes_enabled(), false, generic_dense_tune_max_m());
 }
 
 turbomind::gemm::DispatchPolicy select_awq_dense_dispatch_policy(
     int device, int m, int n, int k, int group_size, cudaStream_t stream) {
-  return select_dense_dispatch_policy_impl(
+  return maybe_preserve_default_splits(select_dense_dispatch_policy_impl(
       device, m, n, k, group_size, stream, TuneKeyKind::kAwqDense,
-      awq_tune_small_shapes_enabled(), awq_reuse_imported_cache_enabled());
+      awq_tune_small_shapes_enabled(), awq_reuse_imported_cache_enabled(),
+      awq_dense_tune_max_m()));
 }
 
 turbomind::gemm::DispatchPolicy select_fp8_dense_dispatch_policy(
@@ -664,11 +702,11 @@ turbomind::gemm::DispatchPolicy select_fp8_dense_dispatch_policy(
   if (fp8_0dot3_dense_selector_enabled()) {
     return select_dense_dispatch_policy_impl(
         device, m, n, k, group_size, stream, TuneKeyKind::kGenericDense,
-        tune_small_shapes_enabled(), false);
+        tune_small_shapes_enabled(), false, generic_dense_tune_max_m());
   }
   return select_dense_dispatch_policy_impl(
       device, m, n, k, group_size, stream, TuneKeyKind::kFp8Dense,
-      fp8_tune_small_shapes_enabled(), false);
+      fp8_tune_small_shapes_enabled(), false, fp8_dense_tune_max_m());
 }
 
 turbomind::gemm::DispatchPolicy select_moe_dispatch_policy_impl(
@@ -2814,6 +2852,7 @@ __global__ void awq_moe_single_token_exact_layout_prepare_kernel(
     int* expert_offsets,
     int64_t* expert_offsets64,
     int* inv_permuted_idx,
+    int* sorted_expert_ids,
     int top_k,
     int hidden_size,
     int num_experts) {
@@ -2847,6 +2886,9 @@ __global__ void awq_moe_single_token_exact_layout_prepare_kernel(
       const int expert_id = sorted_ids[sorted_pos];
       const int src_idx = sorted_src[sorted_pos];
       inv_permuted_idx[src_idx] = sorted_pos;
+      if (sorted_expert_ids != nullptr) {
+        sorted_expert_ids[sorted_pos] = expert_id;
+      }
       expert_offsets[expert_id + 1] += 1;
     }
     for (int expert = 0; expert < num_experts; ++expert) {
@@ -2932,6 +2974,7 @@ void awq_moe_single_token_exact_layout_prepare(torch::Tensor topk_ids,
             expert_offsets.data_ptr<int32_t>(),
             expert_offsets64.data_ptr<int64_t>(),
             inv_permuted_idx.data_ptr<int32_t>(),
+            nullptr,
             top_k,
             static_cast<int>(x.size(1)),
             static_cast<int>(num_experts));
@@ -2944,6 +2987,7 @@ void awq_moe_single_token_exact_layout_prepare(torch::Tensor topk_ids,
             expert_offsets.data_ptr<int32_t>(),
             expert_offsets64.data_ptr<int64_t>(),
             inv_permuted_idx.data_ptr<int32_t>(),
+            nullptr,
             top_k,
             static_cast<int>(x.size(1)),
             static_cast<int>(num_experts));
@@ -4773,7 +4817,10 @@ void fp8_moe_gemm_sm70_out_impl(
     int64_t a_ld_override = -1,
     torch::Tensor a_indices = torch::Tensor(),
     torch::Tensor b_group_indices = torch::Tensor(),
-    bool per_expert_dispatch = false) {
+    bool per_expert_dispatch = false,
+    int64_t dispatch_num_experts = -1,
+    torch::Tensor active_group_indices = torch::Tensor(),
+    int64_t active_group_count = -1) {
   TORCH_CHECK(sorted_input.is_cuda() && sorted_input.scalar_type() == torch::kFloat16,
               "fp8_moe_gemm_sm70: input must be CUDA float16.");
   TORCH_CHECK(expert_offsets.is_cuda() && expert_offsets.scalar_type() == torch::kInt32,
@@ -4839,6 +4886,22 @@ void fp8_moe_gemm_sm70_out_impl(
     TORCH_CHECK(b_group_indices_flat.numel() >= num_experts,
                 "fp8_moe_gemm_sm70: B group indices size mismatch.");
   }
+  torch::Tensor active_group_indices_flat = active_group_indices;
+  const bool use_active_group_indices =
+      active_group_indices.defined() && active_group_indices.numel() > 0 &&
+      active_group_count > 0;
+  if (use_active_group_indices) {
+    TORCH_CHECK(active_group_indices.is_cuda() &&
+                    active_group_indices.scalar_type() == torch::kInt32,
+                "fp8_moe_gemm_sm70: active group indices must be CUDA int32.");
+    active_group_indices_flat = active_group_indices.contiguous().view({-1});
+    TORCH_CHECK(active_group_indices_flat.numel() >= active_group_count,
+                "fp8_moe_gemm_sm70: active group indices size mismatch.");
+    TORCH_CHECK(active_group_count <= num_experts,
+                "fp8_moe_gemm_sm70: active group count exceeds source experts.");
+  }
+  const int64_t selected_dispatch_num_experts =
+      dispatch_num_experts > 0 ? dispatch_num_experts : num_experts;
   TORCH_CHECK(out.size(0) == total_tokens,
               "fp8_moe_gemm_sm70: output rows must match input rows.");
   TORCH_CHECK(out.stride(1) == 1,
@@ -4949,11 +5012,14 @@ void fp8_moe_gemm_sm70_out_impl(
   };
   desc_D.num = static_cast<int>(num_experts);
   desc_D.offsets = expert_offsets.data_ptr<int>();
+  desc_D.group_idxs =
+      use_active_group_indices ? active_group_indices_flat.data_ptr<int>()
+                               : nullptr;
 
   turbomind::gemm::Operation op{};
   op.dispatch = vllm::awq_sm70::select_fp8_moe_dispatch_policy(
       device, static_cast<int>(total_tokens), static_cast<int>(n),
-      static_cast<int>(k), static_cast<int>(num_experts),
+      static_cast<int>(k), static_cast<int>(selected_dispatch_num_experts),
       static_cast<int>(group_size), stream);
   op.epilogue = gated_silu ? turbomind::gemm::Epilogue::kGatedSilu
                            : turbomind::gemm::Epilogue::kNone;
@@ -4973,6 +5039,8 @@ void fp8_moe_gemm_sm70_out_impl(
   op.quant_b = {turbomind::gemm::QuantType::kK, static_cast<int>(group_size)};
   op.batch_dim = 0;
   op.dispatch_num_override = per_expert_dispatch ? 1 : 0;
+  op.active_group_count =
+      use_active_group_indices ? static_cast<int>(active_group_count) : 0;
 
   auto& workspace_holder = vllm::awq_sm70::get_workspace(device, stream);
   auto& gemm = vllm::awq_sm70::get_gemm(device);
@@ -5800,6 +5868,7 @@ void fp8_moe_single_token_sm70_out(
               expert_offsets.data_ptr<int32_t>(),
               nullptr,
               inv_permuted_idx.data_ptr<int32_t>(),
+              sorted_expert_ids.data_ptr<int32_t>(),
               top_k,
               static_cast<int>(x.size(1)),
               static_cast<int>(source_num_experts));
@@ -5812,6 +5881,7 @@ void fp8_moe_single_token_sm70_out(
               expert_offsets.data_ptr<int32_t>(),
               nullptr,
               inv_permuted_idx.data_ptr<int32_t>(),
+              sorted_expert_ids.data_ptr<int32_t>(),
               top_k,
               static_cast<int>(x.size(1)),
               static_cast<int>(source_num_experts));
@@ -5917,7 +5987,10 @@ void fp8_moe_single_token_sm70_out(
         -1,
         torch::Tensor(),
         torch::Tensor(),
-        false);
+        false,
+        -1,
+        sorted_expert_ids,
+        top_k);
     sm70_silu_and_mul_fp16_out(intermediate, gate_up);
     fp8_moe_gemm_sm70_out_impl(
         sorted_output,
@@ -5937,7 +6010,10 @@ void fp8_moe_single_token_sm70_out(
         -1,
         torch::Tensor(),
         torch::Tensor(),
-        false);
+        false,
+        -1,
+        sorted_expert_ids,
+        top_k);
   } else {
     if (fused_gated_silu) {
       fp8_moe_gemm_sm70_out_impl(
@@ -5958,7 +6034,8 @@ void fp8_moe_single_token_sm70_out(
           w13_a_ld_override,
           w13_input_indices,
           expert_ptr_indices,
-          single_token_per_expert_dispatch);
+          single_token_per_expert_dispatch,
+          -1);
     } else {
       fp8_moe_gemm_sm70_out_impl(
           gate_up,
@@ -5978,7 +6055,8 @@ void fp8_moe_single_token_sm70_out(
           w13_a_ld_override,
           w13_input_indices,
           expert_ptr_indices,
-          single_token_per_expert_dispatch);
+          single_token_per_expert_dispatch,
+          -1);
       sm70_silu_and_mul_fp16_out(intermediate, gate_up);
     }
     if (fused_weighted_reduce) {
@@ -6000,7 +6078,8 @@ void fp8_moe_single_token_sm70_out(
           -1,
           torch::Tensor(),
           expert_ptr_indices,
-          single_token_per_expert_dispatch);
+          single_token_per_expert_dispatch,
+          -1);
       return;
     }
     if (w2_direct_reduce) {
@@ -6038,7 +6117,8 @@ void fp8_moe_single_token_sm70_out(
         -1,
         torch::Tensor(),
         expert_ptr_indices,
-        single_token_per_expert_dispatch);
+        single_token_per_expert_dispatch,
+        -1);
   }
 
   const int hidden_logical_size_i = static_cast<int>(hidden_logical_size);

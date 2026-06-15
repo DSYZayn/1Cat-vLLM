@@ -220,20 +220,25 @@ class Worker(WorkerBase):
             yield
             return
 
+        set_allocator_settings = getattr(torch._C,
+                                         "_accelerator_setAllocatorSettings",
+                                         None)
+        if set_allocator_settings is None:
+            yield
+            return
+
         conf = os.environ.get("PYTORCH_CUDA_ALLOC_CONF", "")
         match = re.search(r"max_split_size_mb:(\d+)", conf)
         original_value = match.group(1) if match else None
 
-        torch._C._accelerator_setAllocatorSettings(
-            f"max_split_size_mb:{max_split_size_mb}"
-        )
+        set_allocator_settings(f"max_split_size_mb:{max_split_size_mb}")
         try:
             yield
         finally:
             # PyTorch defaults to SIZE_MAX (no limit).
             _SIZE_MAX_MB = (2**64 - 1) // (1024 * 1024)
             restore = original_value if original_value else str(_SIZE_MAX_MB)
-            torch._C._accelerator_setAllocatorSettings(f"max_split_size_mb:{restore}")
+            set_allocator_settings(f"max_split_size_mb:{restore}")
 
     @instrument(span_name="Init device")
     def init_device(self):

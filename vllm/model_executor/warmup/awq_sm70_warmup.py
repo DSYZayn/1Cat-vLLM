@@ -78,6 +78,10 @@ def _get_decode_m_values(worker: Worker) -> list[int]:
     spec_query_len = _spec_decode_query_len(worker)
     max_dense_m = max(1, int(envs.VLLM_SM70_AWQ_WARMUP_MAX_M), spec_query_len)
     sizes = {1, 2, 4, 8}
+    pow2 = 16
+    while pow2 <= max_dense_m:
+        sizes.add(pow2)
+        pow2 *= 2
     sizes.add(spec_query_len)
     capture_sizes = worker.vllm_config.compilation_config.cudagraph_capture_sizes
     if capture_sizes is not None:

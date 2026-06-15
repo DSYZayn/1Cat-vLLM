@@ -17,10 +17,22 @@ _ROCM_FLASH_ATTN_AVAILABLE = False
 
 if current_platform.is_cuda():
     from vllm._custom_ops import reshape_and_cache_flash
-    from vllm.vllm_flash_attn import (  # type: ignore[attr-defined]
-        flash_attn_varlen_func,
-        get_scheduler_metadata,
-    )
+    try:
+        from vllm.vllm_flash_attn import (  # type: ignore[attr-defined]
+            flash_attn_varlen_func,
+            get_scheduler_metadata,
+        )
+    except ImportError:
+
+        def flash_attn_varlen_func(*args: Any, **kwargs: Any) -> Any:  # type: ignore[no-redef,misc]
+            raise ImportError(
+                "CUDA FlashAttention backend requires vllm_flash_attn "
+                "extensions. Use FLASH_ATTN_V100 on SM70/V100 builds without "
+                "the upstream FA2/FA3 extension."
+            )
+
+        def get_scheduler_metadata(*args: Any, **kwargs: Any) -> None:  # type: ignore[misc]
+            return None
 
 elif current_platform.is_xpu():
     from vllm import _custom_ops as ops

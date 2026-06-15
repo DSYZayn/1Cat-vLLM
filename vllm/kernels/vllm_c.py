@@ -13,6 +13,11 @@ CUDA_ALIKE = current_platform.is_cuda_alike()
 IS_ROCM = current_platform.is_rocm()
 """ROCm needs shape normalization before calling some vLLM C kernels."""
 
+
+def _has_c_op(name: str) -> bool:
+    return hasattr(torch.ops._C, name)
+
+
 rms_no_var_size = lambda x, weight, epsilon, variance_size=None: (
     variance_size is None and (weight is None or weight.dtype == x.dtype)
 )
@@ -25,6 +30,11 @@ rms_no_var_size = lambda x, weight, epsilon, variance_size=None: (
 def rms_norm(
     x: Tensor, weight: Tensor | None, epsilon: float, variance_size: int | None = None
 ) -> Tensor:
+    if not _has_c_op("rms_norm"):
+        return ir.ops.rms_norm.impls["native"].impl_fn(
+            x, weight, epsilon, variance_size
+        )
+
     if weight is None:
         # Kernel requires weight tensor, pass ones
         weight = torch.ones(x.shape[-1], device=x.device, dtype=x.dtype)
@@ -64,6 +74,14 @@ def fused_add_rms_norm(
     epsilon: float,
     variance_size: int | None = None,
 ) -> tuple[Tensor, Tensor]:
+    if not _has_c_op("fused_add_rms_norm"):
+        output, residual = ir.ops.fused_add_rms_norm.impls["native"].impl_fn(
+            x, x_residual, weight, epsilon, variance_size
+        )
+        x.copy_(output)
+        x_residual.copy_(residual)
+        return x, x_residual
+
     if weight is None:
         # Kernel requires weight tensor, pass ones
         weight = torch.ones(x.shape[-1], device=x.device, dtype=x.dtype)

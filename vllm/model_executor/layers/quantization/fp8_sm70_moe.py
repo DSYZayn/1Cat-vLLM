@@ -125,6 +125,16 @@ class Fp8SM70MoEMethod(FusedMoEMethodBase):
         self.compact_exact_layout = bool(
             int(os.getenv(
                 "VLLM_SM70_FP8_MOE_LEGACY_SINGLE_TOKEN_COMPACT_EXACT_LAYOUT",
+                "1"))
+        )
+        self.compact_native_unpermute = bool(
+            int(os.getenv(
+                "VLLM_SM70_FP8_MOE_LEGACY_SINGLE_TOKEN_COMPACT_NATIVE_UNPERMUTE",
+                "0"))
+        )
+        self.compact_decomposed = bool(
+            int(os.getenv(
+                "VLLM_SM70_FP8_MOE_LEGACY_SINGLE_TOKEN_COMPACT_DECOMPOSED",
                 "0"))
         )
         self.compact_compare_max_reports = int(
@@ -883,9 +893,60 @@ class Fp8SM70MoEMethod(FusedMoEMethodBase):
         )
         reference_tensors = None
         if self.compact_compare_reference:
-            reference_tensors = self._apply_compact_reference_for_compare(
+            reference_tensors = self._apply_batched_reference_for_compare(
                 layer, x, topk_weights, topk_ids_i32, buffers, top_k
             )
+        if self.compact_decomposed:
+            _log_runtime_route_once(
+                "SM70 FP8 MoE legacy single-token exact-layout decomposed "
+                "compact path enabled (top_k=%d, experts=%d).",
+                top_k,
+                layer.sm70_num_experts,
+            )
+            sm70_ops.awq_moe_single_token_exact_layout_prepare(
+                topk_ids_i32,
+                x,
+                buffers["permuted_input"],
+                buffers["expert_offsets"],
+                buffers["expert_offsets64"],
+                buffers["inv_permuted_idx"],
+                layer.sm70_num_experts,
+            )
+            sm70_ops.fp8_moe_gemm_sm70_out(
+                buffers["gate_up"],
+                buffers["permuted_input"],
+                buffers["expert_offsets"],
+                layer.w13_strided_ptrs_w,
+                layer.w13_strided_ptrs_s,
+                layer.sm70_num_experts,
+                layer.sm70_w13_k_dim,
+                layer.sm70_w13_n_dim,
+                self.group_size,
+                False,
+            )
+            torch.ops._C.silu_and_mul(buffers["intermediate"], buffers["gate_up"])
+            sm70_ops.fp8_moe_gemm_sm70_out(
+                buffers["sorted_output"],
+                buffers["intermediate"],
+                buffers["expert_offsets"],
+                layer.w2_strided_ptrs_w,
+                layer.w2_strided_ptrs_s,
+                layer.sm70_num_experts,
+                layer.sm70_w2_k_dim,
+                layer.sm70_w2_n_dim,
+                self.group_size,
+                False,
+            )
+            output.zero_()
+            torch.ops._moe_C.moe_unpermute(
+                buffers["sorted_output"],
+                topk_weights,
+                buffers["inv_permuted_idx"],
+                buffers["expert_offsets64"],
+                top_k,
+                output,
+            )
+            return output
         sm70_ops.fp8_moe_single_token_sm70_out(
             output,
             x,
@@ -925,6 +986,16 @@ class Fp8SM70MoEMethod(FusedMoEMethodBase):
             False,
             exact_layout,
         )
+        if self.compact_native_unpermute:
+            output.zero_()
+            torch.ops._moe_C.moe_unpermute(
+                buffers["sorted_output"],
+                topk_weights,
+                buffers["inv_permuted_idx"],
+                None,
+                top_k,
+                output,
+            )
         if reference_tensors is not None:
             actual_expert_offsets = (
                 buffers["expert_offsets"]

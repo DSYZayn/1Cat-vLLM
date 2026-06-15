@@ -656,9 +656,59 @@ class FlashAttnV100MetadataBuilder(TritonAttentionMetadataBuilder):
         common_attn_metadata,
     ) -> None:
         attn_metadata.query_start_loc_cpu = common_attn_metadata.query_start_loc_cpu
-        attn_metadata.seq_lens_cpu = common_attn_metadata.seq_lens_cpu
+        seq_lens_cpu = getattr(common_attn_metadata, "_seq_lens_cpu", None)
+        attn_metadata.seq_lens_cpu = (
+            seq_lens_cpu
+            if seq_lens_cpu is not None
+            else common_attn_metadata.seq_lens_cpu
+        )
         attn_metadata.causal = common_attn_metadata.causal
         attn_metadata.max_model_len = self.vllm_config.model_config.max_model_len
+
+    def _attach_decode_shape_hints(
+        self,
+        attn_metadata: TritonAttentionMetadata,
+        common_attn_metadata,
+        *,
+        static_decode: bool = False,
+    ) -> None:
+        attn_metadata.flash_v100_decode_max_seq_len_hint = None
+        attn_metadata.flash_v100_decode_workspace_seq_capacity_hint = None
+        attn_metadata.flash_v100_static_decode_seq_hint = None
+
+        max_query_len = int(getattr(common_attn_metadata, "max_query_len", 0) or 0)
+        if max_query_len != 1:
+            return
+
+        seq_lens_cpu = getattr(attn_metadata, "seq_lens_cpu", None)
+        if seq_lens_cpu is not None and seq_lens_cpu.numel() > 0:
+            max_seq_len_hint = int(seq_lens_cpu.max().item())
+        else:
+            max_seq_len_hint = int(
+                getattr(common_attn_metadata, "max_seq_len", 0) or 0
+            )
+        if max_seq_len_hint <= 0:
+            return
+
+        attn_metadata.flash_v100_decode_max_seq_len_hint = max_seq_len_hint
+        if not static_decode:
+            return
+
+        block_table = getattr(common_attn_metadata, "block_table_tensor", None)
+        if block_table is None:
+            block_table = getattr(attn_metadata, "block_table", None)
+        raw_seq_capacity = (
+            int(block_table.shape[1]) * int(self.block_size)
+            if block_table is not None
+            else max_seq_len_hint
+        )
+        workspace_seq_capacity = raw_seq_capacity
+        if raw_seq_capacity > max_seq_len_hint:
+            workspace_seq_capacity = max_seq_len_hint
+            attn_metadata.flash_v100_static_decode_seq_hint = max_seq_len_hint
+        attn_metadata.flash_v100_decode_workspace_seq_capacity_hint = (
+            workspace_seq_capacity
+        )
 
     def _debug_draft_metadata(
         self,
@@ -865,6 +915,8 @@ class FlashAttnV100MetadataBuilder(TritonAttentionMetadataBuilder):
         attn_metadata.smallq_decode_block_table = None
         attn_metadata.smallq_decode_seq_lens = None
         attn_metadata.smallq_query_start_loc = None
+        attn_metadata.smallq_decode_max_seq_len_hint = None
+        attn_metadata.smallq_decode_workspace_seq_capacity_hint = None
 
     def _update_smallq_decode_metadata(
         self,
@@ -1009,6 +1061,16 @@ class FlashAttnV100MetadataBuilder(TritonAttentionMetadataBuilder):
         attn_metadata.smallq_query_start_loc = (
             self._smallq_query_start_loc[: num_reqs + 1]
         )
+        raw_seq_capacity = int(block_table.shape[1]) * int(self.block_size)
+        max_seq_len_hint = int(seq_lens_cpu.max().item())
+        if max_seq_len_hint > 0 and raw_seq_capacity > 0:
+            # MTP verification reaches this backend as q>1 prefix prefill, but
+            # the Flash-V100 long-context optimization still applies because
+            # the actual compute is paged decode over each tiny query row.
+            # Keep graph replay capacity fixed while letting kernels skip
+            # inactive partitions for the current runtime sequence length.
+            attn_metadata.smallq_decode_max_seq_len_hint = max_seq_len_hint
+            attn_metadata.smallq_decode_workspace_seq_capacity_hint = raw_seq_capacity
         if _draft_graph_debug_enabled():
             _graph_metadata_debug_log(
                 "smallq_update",
@@ -1042,8 +1104,15 @@ class FlashAttnV100MetadataBuilder(TritonAttentionMetadataBuilder):
             )
 
     def build_for_cudagraph_capture(self, common_attn_metadata):
+        capture_seq_lens_cpu = getattr(common_attn_metadata, "_seq_lens_cpu", None)
+        capture_seq_lens_cpu = (
+            capture_seq_lens_cpu.clone()
+            if capture_seq_lens_cpu is not None
+            else common_attn_metadata.seq_lens.detach().cpu().clone()
+        )
         attn_metadata = super().build_for_cudagraph_capture(common_attn_metadata)
         self._attach_common_flash_metadata(attn_metadata, common_attn_metadata)
+        attn_metadata.seq_lens_cpu = capture_seq_lens_cpu
 
         # The Triton builder shortens capture seq_lens to 1 so full graph
         # capture stays cheap. That is valid for single-token decode, but the
@@ -1074,6 +1143,11 @@ class FlashAttnV100MetadataBuilder(TritonAttentionMetadataBuilder):
             attn_metadata,
             common_attn_metadata,
         )
+        self._attach_decode_shape_hints(
+            attn_metadata,
+            common_attn_metadata,
+            static_decode=True,
+        )
 
         return attn_metadata
 
@@ -1083,6 +1157,7 @@ class FlashAttnV100MetadataBuilder(TritonAttentionMetadataBuilder):
         )
         self._attach_common_flash_metadata(attn_metadata, common_attn_metadata)
         self._update_smallq_decode_metadata(attn_metadata, common_attn_metadata)
+        self._attach_decode_shape_hints(attn_metadata, common_attn_metadata)
         self._debug_draft_metadata("build", attn_metadata, common_attn_metadata)
         return attn_metadata
 
@@ -1095,6 +1170,7 @@ class FlashAttnV100MetadataBuilder(TritonAttentionMetadataBuilder):
         self._attach_common_flash_metadata(attn_metadata, common_attn_metadata)
         self._stabilize_draft_graph_metadata(attn_metadata, common_attn_metadata)
         self._update_smallq_decode_metadata(attn_metadata, common_attn_metadata)
+        self._attach_decode_shape_hints(attn_metadata, common_attn_metadata)
         self._debug_draft_metadata(
             f"draft{draft_index}",
             attn_metadata,
@@ -2815,6 +2891,16 @@ class FlashAttnV100Impl(TritonAttentionImpl):
             k_scale=float(layer._k_scale_float),
             v_scale=float(layer._v_scale_float),
             window_size=window_size,
+            max_seq_len_hint=getattr(
+                attn_metadata,
+                "flash_v100_decode_max_seq_len_hint",
+                None,
+            ),
+            workspace_seq_capacity_hint=getattr(
+                attn_metadata,
+                "flash_v100_decode_workspace_seq_capacity_hint",
+                None,
+            ),
         )
         return output
 
@@ -2904,6 +2990,16 @@ class FlashAttnV100Impl(TritonAttentionImpl):
                 k_scale=float(layer._k_scale_float),
                 v_scale=float(layer._v_scale_float),
                 window_size=self._flash_v100_window_size(causal=True),
+                max_seq_len_hint=getattr(
+                    attn_metadata,
+                    "smallq_decode_max_seq_len_hint",
+                    None,
+                ),
+                workspace_seq_capacity_hint=getattr(
+                    attn_metadata,
+                    "smallq_decode_workspace_seq_capacity_hint",
+                    None,
+                ),
             )
             return output
 
@@ -3003,6 +3099,14 @@ class FlashAttnV100Impl(TritonAttentionImpl):
             k_scale=float(layer._k_scale_float),
             v_scale=float(layer._v_scale_float),
             window_size=self._flash_v100_window_size(causal=True),
+            max_seq_len_hint=(
+                int(seq_lens.max().item()) if num_seqs > 0 else None
+            ),
+            workspace_seq_capacity_hint=(
+                int(block_table.shape[1]) * int(key_cache.shape[1])
+                if num_seqs > 0
+                else None
+            ),
         )
         return output
 

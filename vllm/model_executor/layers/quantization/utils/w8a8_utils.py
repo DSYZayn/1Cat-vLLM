@@ -8,6 +8,13 @@ from vllm import _custom_ops as ops
 from vllm.platforms import current_platform
 
 
+def _cutlass_capability_probe(name: str, capability: int) -> bool:
+    try:
+        return bool(getattr(ops, name)(capability))
+    except AttributeError:
+        return False
+
+
 def cutlass_fp8_supported() -> bool:
     if not current_platform.is_cuda():
         return False
@@ -15,7 +22,8 @@ def cutlass_fp8_supported() -> bool:
     capability_tuple = current_platform.get_device_capability()
     capability = -1 if capability_tuple is None else capability_tuple.to_int()
 
-    return ops.cutlass_scaled_mm_supports_fp8(capability)
+    return _cutlass_capability_probe("cutlass_scaled_mm_supports_fp8",
+                                     capability)
 
 
 def cutlass_block_fp8_supported() -> bool:
@@ -25,7 +33,8 @@ def cutlass_block_fp8_supported() -> bool:
     capability_tuple = current_platform.get_device_capability()
     capability = -1 if capability_tuple is None else capability_tuple.to_int()
 
-    return ops.cutlass_scaled_mm_supports_block_fp8(capability)
+    return _cutlass_capability_probe("cutlass_scaled_mm_supports_block_fp8",
+                                     capability)
 
 
 def cutlass_group_gemm_supported() -> bool:
@@ -35,7 +44,8 @@ def cutlass_group_gemm_supported() -> bool:
     capability_tuple = current_platform.get_device_capability()
     capability = -1 if capability_tuple is None else capability_tuple.to_int()
 
-    return ops.cutlass_group_gemm_supported(capability)
+    return _cutlass_capability_probe("cutlass_group_gemm_supported",
+                                     capability)
 
 
 CUTLASS_FP8_SUPPORTED = cutlass_fp8_supported()

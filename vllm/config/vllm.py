@@ -1165,7 +1165,7 @@ class VllmConfig:
         )
         if sm70_flash_v100_baseline:
             sm70_baseline_env_defaults = {
-                "VLLM_ENABLE_FLA_PACKED_RECURRENT_DECODE": "0",
+                "VLLM_ENABLE_FLA_PACKED_RECURRENT_DECODE": "1",
                 "VLLM_SM70_GDN_KKT_SCHEDULE": "1",
                 "VLLM_SM70_GDN_DELTA_H_SCHEDULE": "1",
                 "VLLM_SM70_GDN_CHUNK_O_SCHEDULE": "1",

@@ -159,6 +159,7 @@ __global__ void flash_attention_decode_partition_kernel(
     float* __restrict__ exp_sums,
     const int* __restrict__ block_table,
     const int* __restrict__ seq_lens,
+    const int* __restrict__ active_num_partitions,
     const int batch_size,
     const int max_num_blocks,
     const int max_num_partitions,
@@ -186,9 +187,11 @@ __global__ void flash_attention_decode_partition_kernel(
   const int batch_idx = blockIdx.x;
   const int head_idx = blockIdx.y;
   const int partition_idx = blockIdx.z;
+  const int runtime_num_partitions = active_num_partitions[0];
 
   if (batch_idx >= batch_size || head_idx >= num_heads_q ||
-      partition_idx >= max_num_partitions) {
+      partition_idx >= max_num_partitions ||
+      partition_idx >= runtime_num_partitions) {
     return;
   }
 
@@ -319,6 +322,7 @@ __global__ void flash_attention_decode_reduce_kernel(
     const float* __restrict__ max_logits,
     const float* __restrict__ exp_sums,
     const int* __restrict__ seq_lens,
+    const int* __restrict__ active_num_partitions,
     __half* __restrict__ out,
     const int batch_size,
     const int max_num_partitions,
@@ -338,8 +342,10 @@ __global__ void flash_attention_decode_reduce_kernel(
   }
 
   const int seq_len = seq_lens[batch_idx];
+  const int runtime_num_partitions = active_num_partitions[0];
   const int num_partitions =
-      (seq_len + PARTITION_SIZE - 1) / PARTITION_SIZE;
+      min(runtime_num_partitions,
+          (seq_len + PARTITION_SIZE - 1) / PARTITION_SIZE);
 
   if (seq_len <= 0 || num_partitions <= 0) {
     for (int d = threadIdx.x; d < D; d += blockDim.x) {
@@ -494,7 +500,9 @@ void launch_flash_attention_decode_paged(
     at::Tensor& tmp_out,
     at::Tensor& max_logits,
     at::Tensor& exp_sums,
+    const at::Tensor& active_num_partitions,
     const float softmax_scale,
+    const int launch_num_partitions,
     const float k_scale,
     const float v_scale,
     const int window_size_left,
@@ -505,7 +513,7 @@ void launch_flash_attention_decode_paged(
   const int num_heads_kv = k_cache.size(2);
   const int block_size = k_cache.size(1);
   const int max_num_blocks = block_table.size(1);
-  const int max_num_partitions = tmp_out.size(2);
+  const int max_num_partitions = launch_num_partitions;
 
   const dim3 partition_grid(batch_size, num_heads_q, max_num_partitions);
   const dim3 reduce_grid(batch_size, num_heads_q, 1);
@@ -523,6 +531,7 @@ void launch_flash_attention_decode_paged(
       exp_sums.data_ptr<float>(),
       block_table.data_ptr<int>(),
       seq_lens.data_ptr<int>(),
+      active_num_partitions.data_ptr<int>(),
       batch_size,
       max_num_blocks,
       max_num_partitions,
@@ -553,6 +562,7 @@ void launch_flash_attention_decode_paged(
       max_logits.data_ptr<float>(),
       exp_sums.data_ptr<float>(),
       seq_lens.data_ptr<int>(),
+      active_num_partitions.data_ptr<int>(),
       reinterpret_cast<__half*>(out.data_ptr<at::Half>()),
       batch_size,
       max_num_partitions,
@@ -623,8 +633,10 @@ at::Tensor flash_attention_decode_paged(
     at::Tensor& tmp_out,
     at::Tensor& max_logits,
     at::Tensor& exp_sums,
+    const at::Tensor& active_num_partitions,
     const float softmax_scale,
     const int partition_size,
+    const int launch_num_partitions,
     const std::string& kv_cache_dtype,
     const float k_scale,
     const float v_scale,
@@ -635,6 +647,8 @@ at::Tensor flash_attention_decode_paged(
   TORCH_CHECK(block_table.is_cuda() && seq_lens.is_cuda(), "block_table and seq_lens must be on CUDA");
   TORCH_CHECK(tmp_out.is_cuda() && max_logits.is_cuda() && exp_sums.is_cuda(),
               "workspace tensors must be on CUDA");
+  TORCH_CHECK(active_num_partitions.is_cuda(),
+              "active_num_partitions must be on CUDA");
   TORCH_CHECK(q.dtype() == torch::kFloat16, "q must be fp16");
   const int kv_dtype_code = kv_cache_dtype_code_from_string(kv_cache_dtype);
   TORCH_CHECK(kv_dtype_code >= 0, "Unsupported kv_cache_dtype: ", kv_cache_dtype);
@@ -654,6 +668,8 @@ at::Tensor flash_attention_decode_paged(
   TORCH_CHECK(exp_sums.dtype() == torch::kFloat32, "exp_sums must be fp32");
   TORCH_CHECK(block_table.dtype() == torch::kInt32, "block_table must be int32");
   TORCH_CHECK(seq_lens.dtype() == torch::kInt32, "seq_lens must be int32");
+  TORCH_CHECK(active_num_partitions.dtype() == torch::kInt32,
+              "active_num_partitions must be int32");
   TORCH_CHECK(q.dim() == 3, "q must have shape [B, H, D]");
   TORCH_CHECK(k_cache.dim() == 4, "k_cache must have shape [num_blocks, block_size, H_kv, D]");
   TORCH_CHECK(v_cache.dim() == 4, "v_cache must have shape [num_blocks, block_size, H_kv, D]");
@@ -662,6 +678,9 @@ at::Tensor flash_attention_decode_paged(
   TORCH_CHECK(tmp_out.dim() == 4, "tmp_out must have shape [B_cap, H, P, D]");
   TORCH_CHECK(max_logits.dim() == 3, "max_logits must have shape [B_cap, H, P]");
   TORCH_CHECK(exp_sums.dim() == 3, "exp_sums must have shape [B_cap, H, P]");
+  TORCH_CHECK(active_num_partitions.dim() == 1 &&
+                  active_num_partitions.numel() == 1,
+              "active_num_partitions must have shape [1]");
   TORCH_CHECK(q.stride(-1) == 1, "q last dim must be contiguous");
   TORCH_CHECK(k_cache.stride(-1) == 1, "k_cache last dim must be contiguous");
   TORCH_CHECK(v_cache.stride(-1) == 1, "v_cache last dim must be contiguous");
@@ -685,6 +704,9 @@ at::Tensor flash_attention_decode_paged(
   TORCH_CHECK(v_cache.size(3) == head_dim, "v_cache head_dim mismatch");
   TORCH_CHECK(partition_size == 256 || partition_size == 512 || partition_size == 1024,
               "Unsupported decode partition_size: ", partition_size);
+  TORCH_CHECK(launch_num_partitions > 0 &&
+                  launch_num_partitions <= tmp_out.size(2),
+              "launch_num_partitions must be in (0, tmp_out.size(2)]");
   TORCH_CHECK(window_size_left >= -1 && window_size_right >= -1,
               "window sizes must be >= -1");
 
@@ -700,7 +722,8 @@ at::Tensor flash_attention_decode_paged(
   #define LAUNCH_TYPED(HDIM, PARTITION, KV_DTYPE_CODE)                          \
     launch_flash_attention_decode_paged<HDIM, PARTITION, KV_DTYPE_CODE>(        \
         q, k_cache, v_cache, out, block_table, seq_lens, tmp_out, max_logits,   \
-        exp_sums, softmax_scale, k_scale, v_scale, window_size_left,            \
+        exp_sums, active_num_partitions, softmax_scale,                         \
+        launch_num_partitions, k_scale, v_scale, window_size_left,              \
         window_size_right, stream)
 
   #define LAUNCH_BY_KV_DTYPE(HDIM, PARTITION)                                   \

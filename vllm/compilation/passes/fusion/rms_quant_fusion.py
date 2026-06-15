@@ -30,6 +30,7 @@ from ..inductor_pass import enable_fake_mode
 from ..vllm_inductor_pass import VllmInductorPass, VllmPatternMatcherPass
 from .matcher_utils import (
     MatcherQuantFP8,
+    get_op_overload,
 )
 
 logger = init_logger(__name__)
@@ -69,18 +70,27 @@ def empty_i64(*args: Any, **kwargs: Any) -> torch.Tensor:
     return torch.empty(*args, **kwargs, dtype=torch.int64, device="cuda")
 
 
-RMS_ADD_OP = torch.ops._C.fused_add_rms_norm.default
+RMS_ADD_OP = get_op_overload(torch.ops._C, "fused_add_rms_norm")
 
-QUANT_OPS: dict[QuantKey, OpOverload] = {
-    kFp8StaticTensorSym: torch.ops._C.static_scaled_fp8_quant.default,  # noqa: E501
-    kFp8DynamicTensorSym: torch.ops._C.dynamic_scaled_fp8_quant.default,  # noqa: E501
-    kFp8DynamicTokenSym: torch.ops._C.dynamic_per_token_scaled_fp8_quant.default,  # noqa: E501
-}
-if current_platform.is_cuda() and hasattr(torch.ops._C, "scaled_fp4_quant"):
-    QUANT_OPS[kNvfp4Dynamic] = torch.ops._C.scaled_fp4_quant.out
+QUANT_OPS: dict[QuantKey, OpOverload] = {}
+for _key, _op_name in (
+    (kFp8StaticTensorSym, "static_scaled_fp8_quant"),
+    (kFp8DynamicTensorSym, "dynamic_scaled_fp8_quant"),
+    (kFp8DynamicTokenSym, "dynamic_per_token_scaled_fp8_quant"),
+):
+    _op = get_op_overload(torch.ops._C, _op_name)
+    if _op is not None:
+        QUANT_OPS[_key] = _op
+
 if current_platform.is_cuda():
-    QUANT_OPS[kFp8Dynamic128Sym] = torch.ops._C.per_token_group_fp8_quant.default  # noqa: E501
-    QUANT_OPS[kFp8Dynamic64Sym] = torch.ops._C.per_token_group_fp8_quant.default  # noqa: E501
+    _op = get_op_overload(torch.ops._C, "scaled_fp4_quant", "out")
+    if _op is not None:
+        QUANT_OPS[kNvfp4Dynamic] = _op
+
+    _op = get_op_overload(torch.ops._C, "per_token_group_fp8_quant")
+    if _op is not None:
+        QUANT_OPS[kFp8Dynamic128Sym] = _op
+        QUANT_OPS[kFp8Dynamic64Sym] = _op
 
 
 class FusedRMSQuantKey(NamedTuple):
@@ -100,32 +110,30 @@ class FusedRMSQuantKey(NamedTuple):
         )
 
 
-FUSED_OPS: dict[FusedRMSQuantKey, OpOverload] = {
-    FusedRMSQuantKey(
-        kFp8StaticTensorSym, False
-    ): torch.ops._C.rms_norm_static_fp8_quant.default,  # noqa: E501
-    FusedRMSQuantKey(
-        kFp8StaticTensorSym, True
-    ): torch.ops._C.fused_add_rms_norm_static_fp8_quant.default,  # noqa: E501
-    FusedRMSQuantKey(
-        kFp8DynamicTokenSym, False
-    ): torch.ops._C.rms_norm_dynamic_per_token_quant.default,  # noqa: E501
-    FusedRMSQuantKey(
-        kFp8DynamicTokenSym, True
-    ): torch.ops._C.rms_norm_dynamic_per_token_quant.default,  # noqa: E501
-    FusedRMSQuantKey(
-        kFp8Dynamic128Sym, False
-    ): torch.ops._C.rms_norm_per_block_quant.default,  # noqa: E501
-    FusedRMSQuantKey(
-        kFp8Dynamic128Sym, True
-    ): torch.ops._C.rms_norm_per_block_quant.default,  # noqa: E501
-    FusedRMSQuantKey(
-        kFp8Dynamic64Sym, False
-    ): torch.ops._C.rms_norm_per_block_quant.default,  # noqa: E501
-    FusedRMSQuantKey(
-        kFp8Dynamic64Sym, True
-    ): torch.ops._C.rms_norm_per_block_quant.default,  # noqa: E501
-}
+FUSED_OPS: dict[FusedRMSQuantKey, OpOverload] = {}
+
+
+def _register_fused_op(
+    quant_key: QuantKey,
+    fused_add: bool,
+    op_name: str,
+) -> None:
+    op = get_op_overload(torch.ops._C, op_name)
+    if op is not None:
+        FUSED_OPS[FusedRMSQuantKey(quant_key, fused_add)] = op
+
+
+_register_fused_op(kFp8StaticTensorSym, False, "rms_norm_static_fp8_quant")
+_register_fused_op(kFp8StaticTensorSym, True,
+                   "fused_add_rms_norm_static_fp8_quant")
+_register_fused_op(kFp8DynamicTokenSym, False,
+                   "rms_norm_dynamic_per_token_quant")
+_register_fused_op(kFp8DynamicTokenSym, True,
+                   "rms_norm_dynamic_per_token_quant")
+_register_fused_op(kFp8Dynamic128Sym, False, "rms_norm_per_block_quant")
+_register_fused_op(kFp8Dynamic128Sym, True, "rms_norm_per_block_quant")
+_register_fused_op(kFp8Dynamic64Sym, False, "rms_norm_per_block_quant")
+_register_fused_op(kFp8Dynamic64Sym, True, "rms_norm_per_block_quant")
 
 
 class RMSNormQuantPattern:
@@ -618,24 +626,29 @@ class RMSNormQuantFusionPass(VllmPatternMatcherPass):
             pass_name="rmsnorm_quant_fusion_pass"
         )
 
+        def maybe_register(pattern_type: type, *args: Any, **kwargs: Any) -> None:
+            try:
+                pattern = pattern_type(*args, **kwargs)
+            except AssertionError as e:
+                if "unsupported fused rmsnorm+quant op" in str(e):
+                    return
+                raise
+            pattern.register(self.patterns)
+
         # Make sure fused add patterns are before simple rms norm,
         # as the latter is a subset of the former in torch ops
         for epsilon in [1e-5, 1e-6]:
             # Fuse fused_add_rms_norm + static fp8 quant
-            FusedAddRMSNormStaticQuantPattern(epsilon, FP8_DTYPE).register(
-                self.patterns
-            )
+            maybe_register(FusedAddRMSNormStaticQuantPattern, epsilon, FP8_DTYPE)
 
             # Fuse rms_norm + static fp8 quant
-            RMSNormStaticQuantPattern(epsilon, FP8_DTYPE).register(self.patterns)
+            maybe_register(RMSNormStaticQuantPattern, epsilon, FP8_DTYPE)
 
             # Fuse fused_add_rms_norm + dynamic per-token fp8 quant
-            FusedAddRMSNormDynamicQuantPattern(epsilon, FP8_DTYPE).register(
-                self.patterns
-            )
+            maybe_register(FusedAddRMSNormDynamicQuantPattern, epsilon, FP8_DTYPE)
 
             # Fuse rms_norm + dynamic per-token fp8 quant
-            RMSNormDynamicQuantPattern(epsilon, FP8_DTYPE).register(self.patterns)
+            maybe_register(RMSNormDynamicQuantPattern, epsilon, FP8_DTYPE)
 
             # Only register group quant patterns on CUDA where the C++ op exists
             if current_platform.is_cuda():
@@ -644,24 +657,26 @@ class RMSNormQuantFusionPass(VllmPatternMatcherPass):
                         for is_e8m0 in [True, False]:
                             for is_tma_aligned in [False, True]:
                                 # Fuse fused_add_rms_norm + fp8 group quant
-                                FusedAddRMSNormGroupQuantPattern(
+                                maybe_register(
+                                    FusedAddRMSNormGroupQuantPattern,
                                     epsilon,
                                     FP8_DTYPE,
                                     group_shape=group_shape,
                                     is_e8m0=is_e8m0,
                                     has_col_major_scales=has_col_major_scales,
                                     is_tma_aligned=is_tma_aligned,
-                                ).register(self.patterns)
+                                )
 
                                 # Fuse rms_norm + fp8 group quant
-                                RMSNormGroupQuantPattern(
+                                maybe_register(
+                                    RMSNormGroupQuantPattern,
                                     epsilon,
                                     FP8_DTYPE,
                                     group_shape=group_shape,
                                     is_e8m0=is_e8m0,
                                     has_col_major_scales=has_col_major_scales,
                                     is_tma_aligned=is_tma_aligned,
-                                ).register(self.patterns)
+                                )
 
         self.dump_patterns(config, self.patterns)
 

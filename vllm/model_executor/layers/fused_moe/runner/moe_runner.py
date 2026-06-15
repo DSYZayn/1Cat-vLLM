@@ -102,6 +102,17 @@ def _sm70_moe_runner_dump_requested(layer_idx: int, label: str) -> bool:
     return not target_labels or label in target_labels
 
 
+def _sm70_moe_runner_dump_token_count_allowed(tensor: torch.Tensor) -> bool:
+    raw = os.getenv("VLLM_SM70_DUMP_QWEN_LAYER_MAX_TOKENS")
+    if not raw or tensor.ndim == 0:
+        return True
+    try:
+        max_tokens = int(raw)
+    except ValueError:
+        return True
+    return max_tokens <= 0 or int(tensor.shape[0]) <= max_tokens
+
+
 def _sm70_moe_runner_dump_impl(
     tensor: torch.Tensor,
     label: str,
@@ -109,6 +120,8 @@ def _sm70_moe_runner_dump_impl(
 ) -> torch.Tensor:
     dump_dir = os.getenv("VLLM_SM70_DUMP_QWEN_LAYER_DIR")
     if not dump_dir:
+        return tensor
+    if not _sm70_moe_runner_dump_token_count_allowed(tensor):
         return tensor
     graph_buffers = os.getenv("VLLM_SM70_DUMP_QWEN_LAYER_GRAPH_BUFFERS") == "1"
     if graph_buffers and tensor.is_cuda:

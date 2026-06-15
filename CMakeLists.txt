@@ -23,6 +23,9 @@ set(CMAKE_HIP_STANDARD_REQUIRED ON)
 
 # CUDA by default, can be overridden by using -DVLLM_TARGET_DEVICE=... (used by setup.py)
 set(VLLM_TARGET_DEVICE "cuda" CACHE STRING "Target device backend for vLLM")
+option(VLLM_REGISTER_BASIC_ACTIVATION_IN_C
+  "Register basic activation ops in _C when _C_stable_libtorch is unavailable"
+  OFF)
 message(STATUS "Build type: ${CMAKE_BUILD_TYPE}")
 message(STATUS "Target device: ${VLLM_TARGET_DEVICE}")
 
@@ -700,6 +703,9 @@ define_extension_target(
 # driver API. This causes problems when linking with earlier versions of CUDA.
 # Setting this variable sidesteps the issue by calling the driver directly.
 target_compile_definitions(_C PRIVATE CUTLASS_ENABLE_DIRECT_CUDA_DRIVER_CALL=1)
+if(VLLM_REGISTER_BASIC_ACTIVATION_IN_C)
+  target_compile_definitions(_C PRIVATE VLLM_REGISTER_BASIC_ACTIVATION_IN_C=1)
+endif()
 
 if(VLLM_GPU_LANG STREQUAL "CUDA" OR VLLM_GPU_LANG STREQUAL "HIP")
   #

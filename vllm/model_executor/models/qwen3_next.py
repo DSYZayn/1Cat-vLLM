@@ -134,6 +134,17 @@ def _sm70_qwen_layer_dump_requested(layer_idx: int) -> bool:
     return layer_idx in layer_ids
 
 
+def _sm70_qwen_layer_dump_token_count_allowed(tensor: torch.Tensor) -> bool:
+    raw = os.getenv("VLLM_SM70_DUMP_QWEN_LAYER_MAX_TOKENS")
+    if not raw or tensor.ndim == 0:
+        return True
+    try:
+        max_tokens = int(raw)
+    except ValueError:
+        return True
+    return max_tokens <= 0 or int(tensor.shape[0]) <= max_tokens
+
+
 def _sm70_qwen_layer_dump_impl(
     tensor: torch.Tensor,
     label: str,
@@ -148,6 +159,8 @@ def _sm70_qwen_layer_dump_impl(
         if item.strip()
     }
     if target_labels and label not in target_labels:
+        return tensor
+    if not _sm70_qwen_layer_dump_token_count_allowed(tensor):
         return tensor
     if graph_buffers and dump_dir and tensor.is_cuda:
         shape = tuple(tensor.shape)

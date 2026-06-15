@@ -37,6 +37,13 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, ops) {
            &get_cuda_view_from_cpu_tensor);
 
   // Activation ops (quantized only — basic ops moved to _C_stable_libtorch)
+#ifdef VLLM_REGISTER_BASIC_ACTIVATION_IN_C
+  // Compatibility path for local builds where _C_stable_libtorch is not
+  // available. Keep disabled by default to avoid duplicate upstream schemas.
+  ops.def("silu_and_mul(Tensor! result, Tensor input) -> ()");
+  ops.impl("silu_and_mul", torch::kCUDA, &silu_and_mul);
+#endif
+
   ops.def(
       "silu_and_mul_quant(Tensor! result, Tensor input, Tensor scale) -> ()");
   ops.impl("silu_and_mul_quant", torch::kCUDA, &silu_and_mul_quant);

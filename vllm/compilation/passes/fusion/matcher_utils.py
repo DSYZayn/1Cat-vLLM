@@ -29,23 +29,46 @@ from vllm.model_executor.layers.rotary_embedding.deepseek_scaling_rope import (
 )
 from vllm.platforms import current_platform
 
-ROTARY_OP = torch.ops._C.rotary_embedding.default
-FLASHINFER_ROTARY_OP = torch.ops.vllm.flashinfer_rotary_embedding.default
 
-QUANT_OPS: dict[QuantKey, OpOverload] = {
-    kFp8StaticTensorSym: torch.ops._C.static_scaled_fp8_quant.default,  # noqa: E501
-    kFp8DynamicTensorSym: torch.ops._C.dynamic_scaled_fp8_quant.default,  # noqa: E501
-    kFp8DynamicTokenSym: torch.ops._C.dynamic_per_token_scaled_fp8_quant.default,  # noqa: E501
-}
+def get_op_overload(
+    op_namespace: Any,
+    op_name: str,
+    overload: str = "default",
+) -> OpOverload | None:
+    if not hasattr(op_namespace, op_name):
+        return None
+    op_packet = getattr(op_namespace, op_name)
+    if not hasattr(op_packet, overload):
+        return None
+    return getattr(op_packet, overload)
 
-if current_platform.is_cuda() and hasattr(torch.ops._C, "scaled_fp4_quant"):
-    QUANT_OPS[kNvfp4Dynamic] = torch.ops._C.scaled_fp4_quant.out  # noqa: E501
+
+ROTARY_OP = get_op_overload(torch.ops._C, "rotary_embedding")
+FLASHINFER_ROTARY_OP = get_op_overload(torch.ops.vllm,
+                                       "flashinfer_rotary_embedding")
+
+QUANT_OPS: dict[QuantKey, OpOverload] = {}
+
+for _key, _op_name in (
+    (kFp8StaticTensorSym, "static_scaled_fp8_quant"),
+    (kFp8DynamicTensorSym, "dynamic_scaled_fp8_quant"),
+    (kFp8DynamicTokenSym, "dynamic_per_token_scaled_fp8_quant"),
+):
+    _op = get_op_overload(torch.ops._C, _op_name)
+    if _op is not None:
+        QUANT_OPS[_key] = _op
 
 if current_platform.is_cuda():
-    QUANT_OPS[kFp8Dynamic128Sym] = torch.ops._C.per_token_group_fp8_quant.default  # noqa: E501
-    QUANT_OPS[kFp8Dynamic64Sym] = torch.ops._C.per_token_group_fp8_quant.default  # noqa: E501
+    _op = get_op_overload(torch.ops._C, "scaled_fp4_quant", "out")
+    if _op is not None:
+        QUANT_OPS[kNvfp4Dynamic] = _op
 
-SILU_MUL_OP = torch.ops._C.silu_and_mul.default
+    _op = get_op_overload(torch.ops._C, "per_token_group_fp8_quant")
+    if _op is not None:
+        QUANT_OPS[kFp8Dynamic128Sym] = _op
+        QUANT_OPS[kFp8Dynamic64Sym] = _op
+
+SILU_MUL_OP = get_op_overload(torch.ops._C, "silu_and_mul")
 
 
 class MatcherCustomOp(ABC):
@@ -98,6 +121,15 @@ class MatcherRotaryEmbedding(MatcherCustomOp):
         if match_rocm_aiter is None:
             match_rocm_aiter = rocm_aiter_ops.is_triton_rotary_embed_enabled()
 
+        if use_flashinfer:
+            rotary_op = FLASHINFER_ROTARY_OP
+        elif match_rocm_aiter:
+            rotary_op = rocm_aiter_ops.get_triton_rotary_embedding_op()
+        else:
+            rotary_op = ROTARY_OP
+        if rotary_op is None:
+            enabled = False
+
         super().__init__(enabled)
         self.is_neox = is_neox
         self.head_size = head_size
@@ -106,12 +138,7 @@ class MatcherRotaryEmbedding(MatcherCustomOp):
         self.q_size = self.num_heads * self.head_size
         self.kv_size = self.num_kv_heads * self.head_size
         self.rotary_dim = head_size
-        if use_flashinfer:
-            self.rotary_op = FLASHINFER_ROTARY_OP
-        elif match_rocm_aiter:
-            self.rotary_op = rocm_aiter_ops.get_triton_rotary_embedding_op()
-        else:
-            self.rotary_op = ROTARY_OP
+        self.rotary_op = rotary_op
 
     def inputs(self) -> list[torch.Tensor]:
         positions = self.empty_int64(5)
@@ -337,10 +364,12 @@ class MatcherQuantFP8(MatcherCustomOp):
                 self.QUANT_OP = rocm_aiter_ops.get_group_quant_op()
 
         else:
-            assert quant_key in QUANT_OPS, (
-                f"unsupported quantization scheme {quant_key}"
-            )
-            self.QUANT_OP = QUANT_OPS[quant_key]
+            if quant_key not in QUANT_OPS:
+                self.enabled = False
+                self.forward = self.forward_native
+                self.QUANT_OP = None
+            else:
+                self.QUANT_OP = QUANT_OPS[quant_key]
 
             assert quant_key.dtype == current_platform.fp8_dtype(), (
                 "Only QuantFP8 supported by"
@@ -378,6 +407,7 @@ class MatcherQuantFP8(MatcherCustomOp):
     ) -> tuple[torch.Tensor, torch.Tensor]:
         if self.match_rocm_aiter:
             return self.forward_rocm_aiter(input, scale)
+        assert self.QUANT_OP is not None
 
         result = torch.empty(
             input.shape, device=input.device, dtype=self.quant_key.dtype
@@ -458,6 +488,8 @@ class MatcherSiluAndMul(MatcherCustomOp):
     def __init__(self, enabled: bool | None = None) -> None:
         if enabled is None:
             enabled = SiluAndMul.enabled()
+        if SILU_MUL_OP is None:
+            enabled = False
         super().__init__(enabled)
 
     def inputs(self) -> list[torch.Tensor]:
@@ -471,6 +503,7 @@ class MatcherSiluAndMul(MatcherCustomOp):
         d = x.shape[-1] // 2
         output_shape = x.shape[:-1] + (d,)
         out = torch.empty(output_shape, dtype=x.dtype, device=x.device)
+        assert SILU_MUL_OP is not None
         result = auto_functionalized(SILU_MUL_OP, result=out, input=x)
         return result[1]
 

@@ -20,10 +20,28 @@ import torch
 
 
 _LAYER_DUMP_RE = re.compile(
-    r"step(?P<step>\d+)_layer(?P<layer>-?\d+)_"
-    r"(?P<layer_type>.+?)_(?P<label>.+?)_shape(?P<shape>[^/]+)\.pt$"
+    r"pid(?P<pid>\d+)_step(?P<step>\d+)_layer(?P<layer>-?\d+)_"
+    r"(?P<tail>.+?)_shape(?P<shape>[^/]+)\.pt$"
 )
-_SAMPLE_DUMP_RE = re.compile(r"sample_tensors_pid\d+_step(?P<step>\d+)\.pt$")
+_PID_RE = re.compile(r"pid(?P<pid>\d+)_")
+_SAMPLE_DUMP_RE = re.compile(
+    r"sample_tensors_pid(?P<pid>\d+)_step(?P<step>\d+)\.pt$"
+)
+
+
+def _json_safe(value: Any) -> Any:
+    if isinstance(value, torch.Tensor):
+        if value.numel() == 1:
+            return value.item()
+        return {
+            "dtype": str(value.dtype),
+            "shape": list(value.shape),
+        }
+    if isinstance(value, dict):
+        return {str(key): _json_safe(item) for key, item in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_json_safe(item) for item in value]
+    return value
 
 
 def _load_json(path: Path | None) -> Any | None:
@@ -222,20 +240,45 @@ def _safe_load_tensor_payload(path: Path) -> dict[str, Any] | None:
         return {"load_error": str(exc)}
 
 
-def _index_layer_dumps(path: Path | None) -> dict[tuple[int, int, str, str, str], Path]:
+def _pid_ordinals(files: list[Path]) -> dict[int, int]:
+    pids: set[int] = set()
+    for file in files:
+        match = _PID_RE.search(file.name)
+        if match:
+            pids.add(int(match.group("pid")))
+    return {pid: index for index, pid in enumerate(sorted(pids))}
+
+
+def _index_layer_dumps(
+    path: Path | None,
+) -> dict[tuple[int, int, int, str, str, str], Path]:
     if path is None or not path.exists():
         return {}
-    result: dict[tuple[int, int, str, str, str], Path] = {}
-    for file in sorted(path.glob("*.pt")):
+    files = sorted(path.glob("*.pt"))
+    pid_to_worker = _pid_ordinals(files)
+    result: dict[tuple[int, int, int, str, str, str], Path] = {}
+    for file in files:
         match = _LAYER_DUMP_RE.search(file.name)
         if not match:
             continue
+        payload = _safe_load_tensor_payload(file)
+        if not payload or "load_error" in payload:
+            continue
+        pid = int(payload.get("pid", match.group("pid")))
+        shape = payload.get("shape")
+        if isinstance(shape, tuple):
+            shape_key = "x".join(str(dim) for dim in shape)
+        elif isinstance(shape, list):
+            shape_key = "x".join(str(dim) for dim in shape)
+        else:
+            shape_key = match.group("shape")
         key = (
+            pid_to_worker.get(pid, -1),
             int(match.group("step")),
-            int(match.group("layer")),
-            match.group("layer_type"),
-            match.group("label"),
-            match.group("shape"),
+            int(payload.get("layer_idx", match.group("layer"))),
+            str(payload.get("layer_type", match.group("tail"))),
+            str(payload.get("label", match.group("tail"))),
+            shape_key,
         )
         result.setdefault(key, file)
     return result
@@ -272,8 +315,9 @@ def _compare_layer_dumps(
             }
         else:
             stats = _tensor_stats(left_payload["tensor"], right_payload["tensor"])
-        step, layer, layer_type, label, shape = key
+        worker, step, layer, layer_type, label, shape = key
         record = {
+            "worker": worker,
             "step": step,
             "layer": layer,
             "layer_type": layer_type,
@@ -293,6 +337,7 @@ def _compare_layer_dumps(
         if len(rows) < max_rows or max_diff > 0:
             rows.append(record)
     rows.sort(key=lambda item: (
+        item["worker"],
         item["step"],
         item["layer"],
         item["layer_type"],
@@ -315,14 +360,18 @@ def _compare_layer_dumps(
     }
 
 
-def _index_sample_dumps(path: Path | None) -> dict[int, Path]:
+def _index_sample_dumps(path: Path | None) -> dict[tuple[int, int], Path]:
     if path is None or not path.exists():
         return {}
-    result: dict[int, Path] = {}
-    for file in sorted(path.glob("*.pt")):
+    files = sorted(path.glob("*.pt"))
+    pid_to_worker = _pid_ordinals(files)
+    result: dict[tuple[int, int], Path] = {}
+    for file in files:
         match = _SAMPLE_DUMP_RE.search(file.name)
         if match:
-            result.setdefault(int(match.group("step")), file)
+            pid = int(match.group("pid"))
+            key = (pid_to_worker.get(pid, -1), int(match.group("step")))
+            result.setdefault(key, file)
     return result
 
 
@@ -339,9 +388,10 @@ def _compare_sample_dumps(
     max_hidden = 0.0
     max_logits = 0.0
     first_nonzero = None
-    for step in sorted(set(left) & set(right)):
-        left_payload = _safe_load_tensor_payload(left[step])
-        right_payload = _safe_load_tensor_payload(right[step])
+    for worker, step in sorted(set(left) & set(right)):
+        key = (worker, step)
+        left_payload = _safe_load_tensor_payload(left[key])
+        right_payload = _safe_load_tensor_payload(right[key])
         if not left_payload or not right_payload:
             continue
         hidden_stats = _tensor_stats(
@@ -356,11 +406,12 @@ def _compare_sample_dumps(
         max_hidden = max(max_hidden, hidden_diff)
         max_logits = max(max_logits, logits_diff)
         record = {
+            "worker": worker,
             "step": step,
             "hidden": hidden_stats,
             "logits": logits_stats,
-            "left_metadata": left_payload.get("metadata", {}),
-            "right_metadata": right_payload.get("metadata", {}),
+            "left_metadata": _json_safe(left_payload.get("metadata", {})),
+            "right_metadata": _json_safe(right_payload.get("metadata", {})),
         }
         if first_nonzero is None and (hidden_diff > 0 or logits_diff > 0):
             first_nonzero = record

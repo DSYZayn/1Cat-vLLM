@@ -148,6 +148,7 @@ public:
 
         Sched sched{{m, n, k, l}, swizzle, std::min(splits, max_splits)};
         sched.offsets_ = Ddesc.offsets;
+        sched.set_active_groups(Ddesc.group_idxs, operation.active_group_count);
 
         using Ta = typename Gemm::Ta;
         using Tb = typename Gemm::Tb;

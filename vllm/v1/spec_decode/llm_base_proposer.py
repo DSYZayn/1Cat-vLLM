@@ -465,6 +465,14 @@ class SpecDecodeBaseProposer:
             logits = self.model.compute_logits(hidden_states)
         return self._sample_from_logits(logits, sampling_metadata)
 
+    def _prepare_model_kwargs_for_aot(
+        self,
+        model_kwargs: dict[str, Any],
+    ) -> dict[str, Any]:
+        if self.model.__class__.__name__ in ("Qwen3_5MTP", "Qwen3_5MoeMTP"):
+            model_kwargs.setdefault("intermediate_tensors", None)
+        return model_kwargs
+
     def _sm70_mtp_profile_enabled(self) -> bool:
         return (
             self.method == "mtp"
@@ -1028,6 +1036,7 @@ class SpecDecodeBaseProposer:
             }
             if self.pass_hidden_states_to_model:
                 model_kwargs["hidden_states"] = self.hidden_states[:input_batch_size]
+            model_kwargs = self._prepare_model_kwargs_for_aot(model_kwargs)
 
             if profile_events is not None:
                 metadata_name = f"loop{token_index}_metadata_cpu"
@@ -1300,6 +1309,7 @@ class SpecDecodeBaseProposer:
         }
         if self.pass_hidden_states_to_model:
             model_kwargs["hidden_states"] = self.hidden_states[:num_input_tokens]
+        model_kwargs = self._prepare_model_kwargs_for_aot(model_kwargs)
 
         return model_kwargs, num_input_tokens
 
@@ -1947,6 +1957,7 @@ class SpecDecodeBaseProposer:
                 )
                 if self.pass_hidden_states_to_model:
                     kwargs["hidden_states"] = self.hidden_states[:num_input_tokens]
+                kwargs = self._prepare_model_kwargs_for_aot(kwargs)
                 self.model(**kwargs)
 
     def _get_eagle3_use_aux_hidden_state_from_config(self) -> bool:
