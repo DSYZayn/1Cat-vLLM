@@ -57,7 +57,7 @@ Typical model placement:
 - `Qwen3.5-27B-AWQ`: TP1/TP2/TP4 supported; TP4 is the public reference.
 - `Qwen3.6-27B-AWQ`: TP4 public MTP profile; TP2 memory-constrained profile.
 - `Qwen3.6-35B-A3B-AWQ`: TP4 recommended.
-- `Qwen3.5-122B-A10B-AWQ`: TP4 only in the public examples.
+- `Qwen3.5-122B-A10B-AWQ`: TP4 supported for larger deployments.
 
 ## Validated Stack
 
@@ -68,28 +68,6 @@ The public wheel path is validated on:
 - CUDA toolkit: 12.8
 - PyTorch: CUDA 12.8 runtime wheels
 - GPU: Tesla V100 32 GB
-
-## Runtime Notes
-
-- The **first real request is not representative** of steady-state speed. On
-  V100, the first request may spend 1 to 3 minutes compiling kernels, building
-  graphs, and warming up execution paths.
-- Public launch commands are text-generation profiles. Vision and multimodal
-  workloads should be tuned separately.
-- `FLASH_ATTN_V100` is the recommended attention backend for V100.
-- Public serving examples default to 256K context with
-  `--max-model-len 262144`.
-- Keep `--max-num-seqs 1` for baseline serving until your workload has been
-  profiled locally. The 27B MTP + prefix-cache profile intentionally uses
-  `max_num_seqs=4` on TP4.
-- `--gpu-memory-utilization` is an upper bound for model executor memory.
-  1Cat-vLLM trims the final KV cache allocation for long-context single-user
-  serving instead of always preallocating for many full-length requests.
-- `VLLM_SM70_ENABLE_DENSE_F16_FASTPATH=1` is experimental. Keep it disabled for
-  public 35B/122B MoE serving unless you are benchmarking that path directly.
-- Direct paged prefill can be forced with
-  `VLLM_FLASH_V100_ENABLE_PAGED_PREFILL=1`, but it is not the quality-safe
-  public default.
 
 ## Quick Start
 
@@ -173,28 +151,6 @@ print("vllm", vllm.__version__)
 print("flash_attn_v100", "ok")
 PY
 ```
-
-## Public Runtime Defaults
-
-| Host | Model | TP | `max_model_len` | `max_num_seqs` | `max_num_batched_tokens` | Use case |
-| --- | --- | ---: | ---: | ---: | ---: | --- |
-| 4-card 32 GB V100 | `Qwen3.5-27B-AWQ` | 4 | `262144` | `1` | `16384` | stable public default |
-| 4-card 32 GB V100 | `Qwen3.6-27B-AWQ` + MTP | 4 | `262144` | `4` | `8192` | MTP + prefix-cache API serving |
-| 2-card 32 GB V100 | `Qwen3.6-27B-AWQ` + MTP | 2 | `262144` | `1` | `8192` | memory-constrained MTP serving |
-| 4-card 32 GB V100 | `Qwen3.6-35B-A3B-AWQ` | 4 | `262144` | `1` | `8192` | stable public default for MoE |
-| 4-card 32 GB V100 | `Qwen3.5-122B-A10B-AWQ` | 4 | `262144` | `1` | `8096` | long-context large-model default |
-
-Important defaults:
-
-- Public baseline launch commands default to 256K context.
-- Keep `max_num_seqs=1` for baseline public commands until your workload is
-  profiled locally.
-- On V100, Qwen3.6/Qwen3.5 AWQ checkpoints with bundled MTP layers can use the
-  public MTP4 server profile unless the related flags are overridden.
-- On 2 x 32 GB V100, keep the 27B MTP profile at `max_num_seqs=1`.
-- Do not pass `--disable-custom-all-reduce` for the 27B TP4 decode baseline.
-- `122B` uses a smaller prefill chunk budget to leave room for SM70 MoE
-  temporary workspace during long-context serving.
 
 ## Recommended Launch Commands
 
