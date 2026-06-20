@@ -8,6 +8,7 @@ from torch.nn.parameter import Parameter
 from vllm import envs
 from vllm.logger import init_logger
 from vllm.model_executor.kernels.linear import init_nvfp4_linear_kernel
+from vllm.model_executor.layers.quantization import sm70_turbomind as sm70_tm
 from vllm.model_executor.layers.quantization.compressed_tensors.schemes import (
     CompressedTensorsScheme,
 )
@@ -41,11 +42,18 @@ def _explicit_nvfp4_emulation_requested() -> bool:
 
 class CompressedTensorsW4A4Fp4(CompressedTensorsScheme):
     def __init__(self):
-        self.kernel = init_nvfp4_linear_kernel()
+        self.kernel = None
+        if not sm70_tm.use_turbomind(envs.VLLM_SM70_NVFP4_TURBOMIND):
+            self.kernel = init_nvfp4_linear_kernel()
         self.group_size = 16
 
     @classmethod
     def get_min_capability(cls) -> int:
+        if (
+            sm70_tm.use_turbomind(envs.VLLM_SM70_NVFP4_TURBOMIND)
+            or sm70_tm.forces_marlin()
+        ):
+            return 70
         if _explicit_nvfp4_emulation_requested():
             return 70
         return 75
@@ -139,8 +147,32 @@ class CompressedTensorsW4A4Fp4(CompressedTensorsScheme):
             layer.input_global_scale * layer.weight_global_scale, requires_grad=False
         )
 
+        if sm70_tm.should_prepare_turbomind_or_marlin(
+            layer.weight, envs.VLLM_SM70_NVFP4_TURBOMIND
+        ):
+            logger.info_once(
+                "SM70 compressed-tensors NVFP4 TurboMind W4A16 dense path enabled."
+            )
+            sm70_tm.prepare_nvfp4_linear(layer)
+            layer.weight = Parameter(
+                torch.empty(0, dtype=torch.uint8, device=layer.weight.device),
+                requires_grad=False,
+            )
+            layer.weight_scale = Parameter(
+                torch.empty(
+                    0, dtype=torch.float8_e4m3fn, device=layer.weight_scale.device
+                ),
+                requires_grad=False,
+            )
+            return
+
         # Convert layer to NVFP4 linear kernel format
-        self.kernel.process_weights_after_loading(layer)
+        self._fallback_kernel().process_weights_after_loading(layer)
+
+    def _fallback_kernel(self):
+        if self.kernel is None:
+            self.kernel = init_nvfp4_linear_kernel()
+        return self.kernel
 
     def apply_weights(
         self,
@@ -148,4 +180,6 @@ class CompressedTensorsW4A4Fp4(CompressedTensorsScheme):
         x: torch.Tensor,
         bias: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        return self.kernel.apply_weights(layer=layer, x=x, bias=bias)
+        if sm70_tm.has_prepared_linear(layer):
+            return sm70_tm.apply_prepared_linear(layer, x, bias)
+        return self._fallback_kernel().apply_weights(layer=layer, x=x, bias=bias)

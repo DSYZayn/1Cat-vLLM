@@ -44,6 +44,7 @@ from vllm.model_executor.layers.linear import (
     UnquantizedLinearMethod,
 )
 from vllm.model_executor.layers.quantization import QuantizationMethods
+from vllm.model_executor.layers.quantization import sm70_turbomind as sm70_tm
 from vllm.model_executor.layers.quantization.base_config import (
     QuantizationConfig,
     QuantizeMethodBase,
@@ -151,7 +152,11 @@ class Fp8Config(QuantizationConfig):
             current_platform.is_cuda()
             and current_platform.has_device_capability(70)
             and not current_platform.has_device_capability(75)
-            and envs.VLLM_SM70_FP8_DEQUANT_FALLBACK
+            and (
+                envs.VLLM_SM70_FP8_DEQUANT_FALLBACK
+                or sm70_tm.forces_marlin()
+                or sm70_tm.use_turbomind(envs.VLLM_SM70_FP8_TURBOMIND)
+            )
         ):
             return 70
         return 75
@@ -213,6 +218,8 @@ class Fp8Config(QuantizationConfig):
                 and current_platform.has_device_capability(70)
                 and not current_platform.has_device_capability(75)
                 and envs.VLLM_SM70_FP8_MOE_DEQUANT_FALLBACK
+                and not sm70_tm.use_turbomind(envs.VLLM_SM70_FP8_TURBOMIND)
+                and not sm70_tm.forces_marlin()
             ):
                 return Fp8MoEMethod(self, layer)
             if (
@@ -220,7 +227,7 @@ class Fp8Config(QuantizationConfig):
                 and current_platform.is_cuda()
                 and current_platform.has_device_capability(70)
                 and not current_platform.has_device_capability(75)
-                and envs.VLLM_SM70_FP8_TURBOMIND
+                and sm70_tm.use_turbomind(envs.VLLM_SM70_FP8_TURBOMIND)
             ):
                 from vllm.model_executor.layers.quantization.fp8_sm70_moe import (
                     Fp8SM70MoEMethod,
@@ -320,15 +327,20 @@ class Fp8LinearMethod(LinearMethodBase):
         self.weight_block_size = self.quant_config.weight_block_size
         self.block_quant = self.weight_block_size is not None
         self.act_q_static = self.quant_config.activation_scheme == "static"
-        self.use_sm70_dequant_fallback = (
+        self._sm70_without_fp8_hw = (
             current_platform.is_cuda()
             and current_platform.has_device_capability(70)
             and not current_platform.has_device_capability(75)
+        )
+        self.use_sm70_dequant_fallback = (
+            self._sm70_without_fp8_hw
             and envs.VLLM_SM70_FP8_DEQUANT_FALLBACK
+            and not sm70_tm.use_turbomind(envs.VLLM_SM70_FP8_TURBOMIND)
+            and not sm70_tm.forces_marlin()
         )
         self.use_sm70_fp8_turbomind = (
-            self.use_sm70_dequant_fallback
-            and envs.VLLM_SM70_FP8_TURBOMIND
+            self._sm70_without_fp8_hw
+            and sm70_tm.use_turbomind(envs.VLLM_SM70_FP8_TURBOMIND)
             and self.block_quant
             and self.weight_block_size == [128, 128]
         )
@@ -469,35 +481,30 @@ class Fp8LinearMethod(LinearMethodBase):
             )
             if weight_scale_inv.dtype != torch.float32:
                 weight_scale_inv = weight_scale_inv.to(torch.float32)
-            use_gated_silu = self._is_sm70_gated_silu_layer(layer)
-            tm_weight, tm_scales, meta = sm70_ops.fp8_sm70_prepare(
-                weight, weight_scale_inv, self.weight_block_size[0], False
+            is_gated_silu_layer = self._is_sm70_gated_silu_layer(layer)
+            use_gated_silu = (
+                is_gated_silu_layer and envs.VLLM_SM70_FP8_DENSE_GATED_SILU
             )
+            tm_weight, tm_scales, meta = sm70_ops.fp8_sm70_prepare(
+                weight,
+                weight_scale_inv,
+                self.weight_block_size[0],
+                use_gated_silu,
+            )
+            if is_gated_silu_layer and not use_gated_silu:
+                logger.info_once(
+                    "SM70 FP8 dense gated-SiLU layout disabled; skipping "
+                    "the extra gate_up_proj TurboMind copy. Set "
+                    "VLLM_SM70_FP8_DENSE_GATED_SILU=1 to enable it."
+                )
             if use_gated_silu:
-                gated_weight, gated_scales, gated_meta = sm70_ops.fp8_sm70_prepare(
-                    weight,
-                    weight_scale_inv,
-                    self.weight_block_size[0],
-                    True,
-                )
-                layer.register_buffer(
-                    "sm70_fp8_gated_silu_weight",
-                    gated_weight,
-                    persistent=False,
-                )
-                layer.register_buffer(
-                    "sm70_fp8_gated_silu_scales",
-                    gated_scales,
-                    persistent=False,
-                )
-                layer.register_buffer(
-                    "sm70_fp8_gated_silu_meta",
-                    gated_meta,
-                    persistent=False,
-                )
                 layer.sm70_fp8_gated_silu = True
-                layer.sm70_fp8_gated_silu_k_ld = int(gated_meta[0].item())
-                layer.sm70_fp8_gated_silu_q_ld = int(gated_meta[1].item())
+                layer.sm70_fp8_gated_silu_primary = True
+                layer.sm70_fp8_gated_silu_k_ld = int(meta[0].item())
+                layer.sm70_fp8_gated_silu_q_ld = int(meta[1].item())
+                logger.info_once(
+                    "SM70 FP8 dense gated-SiLU single-layout path enabled."
+                )
             replace_parameter(layer, "weight", tm_weight)
             replace_parameter(layer, "weight_scale_inv", tm_scales)
             layer.input_scale = None
@@ -639,6 +646,13 @@ class Fp8LinearMethod(LinearMethodBase):
                 layer.sm70_fp8_q_ld,
                 False,
             )
+            if getattr(layer, "sm70_fp8_gated_silu_primary", False):
+                out_features = layer.output_size_per_partition // 2
+                out_2d = (
+                    out_2d.reshape(x_2d.shape[0], out_features, 2)
+                    .transpose(1, 2)
+                    .reshape(x_2d.shape[0], layer.output_size_per_partition)
+                )
             out = out_2d.reshape(out_shape)
             if bias is not None:
                 out.add_(bias)
@@ -708,14 +722,24 @@ class Fp8LinearMethod(LinearMethodBase):
             device=x.device,
             dtype=x.dtype,
         )
+        if getattr(layer, "sm70_fp8_gated_silu_primary", False):
+            weight = layer.weight
+            scales = layer.weight_scale_inv
+            k_ld = int(layer.sm70_fp8_k_ld)
+            q_ld = int(layer.sm70_fp8_q_ld)
+        else:
+            weight = layer.sm70_fp8_gated_silu_weight
+            scales = layer.sm70_fp8_gated_silu_scales
+            k_ld = int(layer.sm70_fp8_gated_silu_k_ld)
+            q_ld = int(layer.sm70_fp8_gated_silu_q_ld)
         sm70_ops.fp8_gemm_sm70_out(
             out_2d,
             x_2d,
-            layer.sm70_fp8_gated_silu_weight,
-            layer.sm70_fp8_gated_silu_scales,
+            weight,
+            scales,
             128,
-            layer.sm70_fp8_gated_silu_k_ld,
-            layer.sm70_fp8_gated_silu_q_ld,
+            k_ld,
+            q_ld,
             True,
         )
         return out_2d.reshape(*x.shape[:-1], out_features)
@@ -828,6 +852,8 @@ class Fp8MoEMethod(FusedMoEMethodBase):
             and not current_platform.has_device_capability(75)
             and envs.VLLM_SM70_FP8_DEQUANT_FALLBACK
             and envs.VLLM_SM70_FP8_MOE_DEQUANT_FALLBACK
+            and not sm70_tm.use_turbomind(envs.VLLM_SM70_FP8_TURBOMIND)
+            and not sm70_tm.forces_marlin()
         )
         self._fallback_unquantized_method: UnquantizedFusedMoEMethod | None = None
 

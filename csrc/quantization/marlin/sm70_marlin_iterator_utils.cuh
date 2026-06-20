@@ -65,13 +65,13 @@ CUTLASS_DEVICE uint32_t qword_from_vector(uint2 const& words, int c) {
   return words_ptr[c];
 }
 
-template <int CtaN>
-CUTLASS_DEVICE int u4_cta_n_qweight_offset_from_logical(int size_n,
-                                                        int logical_k,
-                                                        int logical_n) {
-  static_assert(CtaN == 64 || CtaN == 128 || CtaN == 256,
-                "SM70 Marlin CTA_N must be 64, 128, or 256.");
-  constexpr int kGroupTiles = CtaN / kQuantTileN;
+template <int PackedMacroN>
+CUTLASS_DEVICE int u4_packed_macro_n_qweight_offset_from_logical(
+    int size_n, int logical_k, int logical_n) {
+  static_assert(PackedMacroN == 64 || PackedMacroN == 128 ||
+                    PackedMacroN == 256,
+                "SM70 Marlin packed macro-N must be 64, 128, or 256.");
+  constexpr int kGroupTiles = PackedMacroN / kQuantTileN;
   int const k_tile = logical_k / kQuantTileK;
   int const local_k = logical_k - k_tile * kQuantTileK;
   int const n_tile = logical_n / kQuantTileN;
@@ -86,13 +86,13 @@ CUTLASS_DEVICE int u4_cta_n_qweight_offset_from_logical(int size_n,
          local_word * kGroupTiles + subtile;
 }
 
-template <int CtaN>
-CUTLASS_DEVICE int u8_cta_n_qweight_offset_from_logical(int size_n,
-                                                        int logical_k,
-                                                        int logical_n) {
-  static_assert(CtaN == 64 || CtaN == 128 || CtaN == 256,
-                "SM70 Marlin CTA_N must be 64, 128, or 256.");
-  constexpr int kGroupTiles = CtaN / kQuantTileN;
+template <int PackedMacroN>
+CUTLASS_DEVICE int u8_packed_macro_n_qweight_offset_from_logical(
+    int size_n, int logical_k, int logical_n) {
+  static_assert(PackedMacroN == 64 || PackedMacroN == 128 ||
+                    PackedMacroN == 256,
+                "SM70 Marlin packed macro-N must be 64, 128, or 256.");
+  constexpr int kGroupTiles = PackedMacroN / kQuantTileN;
   int const k_tile = logical_k / kQuantTileK;
   int const local_k = logical_k - k_tile * kQuantTileK;
   int const n_tile = logical_n / kQuantTileN;
@@ -107,11 +107,12 @@ CUTLASS_DEVICE int u8_cta_n_qweight_offset_from_logical(int size_n,
          local_word * kGroupTiles + subtile;
 }
 
-template <int CtaN>
-CUTLASS_DEVICE int u8_cta_n_qweight_word_stride_from_logical() {
-  static_assert(CtaN == 64 || CtaN == 128 || CtaN == 256,
-                "SM70 Marlin CTA_N must be 64, 128, or 256.");
-  return CtaN / kQuantTileN;
+template <int PackedMacroN>
+CUTLASS_DEVICE int u8_packed_macro_n_qweight_word_stride() {
+  static_assert(PackedMacroN == 64 || PackedMacroN == 128 ||
+                    PackedMacroN == 256,
+                "SM70 Marlin packed macro-N must be 64, 128, or 256.");
+  return PackedMacroN / kQuantTileN;
 }
 
 }  // namespace marlin::sm70

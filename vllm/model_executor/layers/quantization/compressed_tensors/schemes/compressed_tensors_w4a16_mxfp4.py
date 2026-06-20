@@ -5,26 +5,27 @@ from collections.abc import Callable
 import torch
 from torch.nn.parameter import Parameter
 
-from vllm import envs
-from vllm.logger import init_logger
-from vllm.model_executor.kernels.linear import init_mxfp4_linear_kernel
-from vllm.model_executor.layers.quantization import sm70_turbomind as sm70_tm
 from vllm.model_executor.layers.quantization.compressed_tensors.schemes import (
     CompressedTensorsScheme,
+)
+from vllm.model_executor.layers.quantization.utils.marlin_utils import (
+    marlin_make_workspace_new,
+)
+from vllm.model_executor.layers.quantization.utils.marlin_utils_fp4 import (
+    apply_fp4_marlin_linear,
+    prepare_fp4_layer_for_marlin,
 )
 from vllm.model_executor.parameter import (
     GroupQuantScaleParameter,
     ModelWeightParameter,
 )
 
-__all__ = ["CompressedTensorsW4A4Mxfp4"]
-
-logger = init_logger(__name__)
+__all__ = ["CompressedTensorsW4A16Mxfp4"]
 
 
-class CompressedTensorsW4A4Mxfp4(CompressedTensorsScheme):
+class CompressedTensorsW4A16Mxfp4(CompressedTensorsScheme):
     """
-    Compressed tensors scheme for MXFP4.
+    Compressed tensors scheme for MXFP4 weight-only quantization.
 
     Supports models quantized with the compressed-tensors mxfp4-pack-quantized
     format.
@@ -33,25 +34,14 @@ class CompressedTensorsW4A4Mxfp4(CompressedTensorsScheme):
     - 4-bit float weights (E2M1) packed into uint8
     - Per-group E8M0 scales with group_size=32
     - No global scale (unlike NVFP4)
-
-    On SM100+ with FlashInfer: true W4A4 (activations dynamically quantized).
-    Otherwise: W4A16 weight-only via Marlin.
     """
 
     def __init__(self):
         self.group_size = 32
-        self.kernel = None
-        if not sm70_tm.use_turbomind(envs.VLLM_SM70_MXFP4_TURBOMIND):
-            self.kernel = init_mxfp4_linear_kernel()
 
     @classmethod
     def get_min_capability(cls) -> int:
-        if (
-            sm70_tm.use_turbomind(envs.VLLM_SM70_MXFP4_TURBOMIND)
-            or sm70_tm.forces_marlin()
-        ):
-            return 70
-        return 80
+        return 70
 
     def create_weights(
         self,
@@ -94,36 +84,12 @@ class CompressedTensorsW4A4Mxfp4(CompressedTensorsScheme):
         )
         layer.register_parameter("weight_scale", weight_scale)
 
-    def _fallback_kernel(self):
-        if self.kernel is None:
-            self.kernel = init_mxfp4_linear_kernel()
-        return self.kernel
-
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
-        if sm70_tm.should_prepare_turbomind(
-            layer.weight_packed, envs.VLLM_SM70_MXFP4_TURBOMIND
-        ):
-            logger.info_once(
-                "SM70 compressed-tensors MXFP4 TurboMind dense path enabled."
-            )
-            sm70_tm.prepare_mxfp4_linear(layer)
-            layer.weight_packed = Parameter(
-                torch.empty(
-                    0, dtype=torch.uint8, device=layer.weight_packed.device
-                ),
-                requires_grad=False,
-            )
-            layer.weight_scale = Parameter(
-                torch.empty(
-                    0, dtype=torch.uint8, device=layer.weight_scale.device
-                ),
-                requires_grad=False,
-            )
-            return
-
+        # Rename weight_packed to weight that marlin expects
         layer.weight = Parameter(layer.weight_packed.data, requires_grad=False)
         del layer.weight_packed
-        self._fallback_kernel().process_weights_after_loading(layer)
+
+        prepare_fp4_layer_for_marlin(layer)
 
     def apply_weights(
         self,
@@ -131,6 +97,21 @@ class CompressedTensorsW4A4Mxfp4(CompressedTensorsScheme):
         x: torch.Tensor,
         bias: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        if sm70_tm.has_prepared_linear(layer):
-            return sm70_tm.apply_prepared_linear(layer, x, bias)
-        return self._fallback_kernel().apply_weights(layer, x, bias)
+        workspace = getattr(layer, "workspace", None)
+        if (
+            workspace is None
+            or workspace.device != x.device
+            or workspace.dtype != torch.int
+            or not workspace.is_contiguous()
+        ):
+            layer.workspace = marlin_make_workspace_new(x.device)
+        return apply_fp4_marlin_linear(
+            input=x,
+            weight=layer.weight,
+            weight_scale=layer.weight_scale,
+            weight_global_scale=None,
+            workspace=layer.workspace,
+            size_n=layer.output_size_per_partition,
+            size_k=layer.input_size_per_partition,
+            bias=bias,
+        )

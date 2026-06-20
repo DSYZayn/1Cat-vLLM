@@ -77,6 +77,17 @@ void Registry::sm70_884_4()
         Add<C::Type<  8, 128,  64, 1, 4, 1, D, S, 2, true, 1, 32>>();
         // clang-format on
     }
+
+    if constexpr (1) {
+        // clang-format off
+        using C = Config_NVF4<kColMajor, 0>;
+        Add<C::Type<128, 128,  16, 2, 2, 1, D, D, 2, true, 1, 16,  64, 128>>();
+        Add<C::Type< 64, 128,  32, 1, 4, 1, D, S, 2, true, 1, 16,  32, 128>>();
+        Add<C::Type< 32, 128,  32, 1, 4, 1, D, S, 2, true, 1, 16>>();
+        Add<C::Type< 16, 128,  32, 1, 4, 1, D, S, 2, true, 1, 16>>();
+        Add<C::Type<  8, 128,  64, 1, 4, 1, D, S, 2, true, 1, 16>>();
+        // clang-format on
+    }
 }
 
 }  // namespace turbomind::gemm

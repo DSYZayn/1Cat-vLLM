@@ -24,6 +24,7 @@ from vllm.model_executor.layers.quantization.base_config import (
     QuantizationConfig,
     QuantizeMethodBase,
 )
+from vllm.model_executor.layers.quantization import sm70_turbomind as sm70_tm
 from vllm.model_executor.layers.quantization.utils.quant_utils import is_layer_skipped
 from vllm.model_executor.parameter import GroupQuantScaleParameter, PackedvLLMParameter
 from vllm.platforms import current_platform
@@ -78,7 +79,10 @@ class AWQConfig(QuantizationConfig):
 
     @classmethod
     def get_min_capability(cls) -> int:
-        if envs.VLLM_SM70_AWQ_TURBOMIND:
+        if (
+            sm70_tm.use_turbomind(envs.VLLM_SM70_AWQ_TURBOMIND)
+            or sm70_tm.forces_marlin()
+        ):
             return 70
         # The default AWQ kernel only supports Turing or newer GPUs.
         return 75
@@ -112,6 +116,32 @@ class AWQConfig(QuantizationConfig):
                 skip_with_substr=True,
             ):
                 return UnquantizedLinearMethod()
+            if (
+                sm70_tm.forces_marlin()
+                and current_platform.is_cuda()
+                and current_platform.has_device_capability(70)
+                and not current_platform.has_device_capability(75)
+            ):
+                from .awq_marlin import AWQMarlinConfig
+                from .utils.marlin_utils import check_marlin_supports_layer
+
+                if check_marlin_supports_layer(layer, self.group_size):
+                    marlin_config = {
+                        "quant_method": "awq",
+                        "bits": self.weight_bits,
+                        "group_size": self.group_size,
+                        "zero_point": self.zero_point,
+                        "lm_head": False,
+                        "modules_to_not_convert": self.modules_to_not_convert,
+                    }
+                    return AWQMarlinConfig.from_config(marlin_config).get_quant_method(
+                        layer, prefix
+                    )
+                logger.warning_once(
+                    "Layer '%s' is not supported by AWQMarlin requested by "
+                    "VLLM_SM70_QUANT_BACKEND=marlin. Falling back to AWQ.",
+                    prefix,
+                )
             return AWQLinearMethod(self)
         elif isinstance(layer, RoutedExperts):
             if is_layer_skipped(
@@ -125,7 +155,7 @@ class AWQConfig(QuantizationConfig):
                 current_platform.is_cuda()
                 and current_platform.has_device_capability(70)
                 and not current_platform.has_device_capability(75)
-                and envs.VLLM_SM70_AWQ_TURBOMIND
+                and sm70_tm.use_turbomind(envs.VLLM_SM70_AWQ_TURBOMIND)
             ):
                 if envs.VLLM_SM70_AWQ_MOE_DISABLE:
                     logger.warning_once(
@@ -313,7 +343,10 @@ class AWQLinearMethod(LinearMethodBase):
         layer.qzeros = torch.nn.Parameter(layer.qzeros.data, requires_grad=False)
         layer.scales = torch.nn.Parameter(layer.scales.data, requires_grad=False)
 
-        if not envs.VLLM_SM70_AWQ_TURBOMIND or not layer.qweight.is_cuda:
+        if (
+            not sm70_tm.use_turbomind(envs.VLLM_SM70_AWQ_TURBOMIND)
+            or not layer.qweight.is_cuda
+        ):
             return
 
         cap = torch.cuda.get_device_capability(layer.qweight.device)

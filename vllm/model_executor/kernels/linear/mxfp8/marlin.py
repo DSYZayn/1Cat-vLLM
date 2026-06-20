@@ -3,6 +3,8 @@
 
 import torch
 
+from vllm.platforms import current_platform
+
 from .Mxfp8LinearKernel import Mxfp8LinearKernel, Mxfp8LinearLayerConfig
 
 
@@ -13,13 +15,9 @@ class MarlinMxfp8LinearKernel(Mxfp8LinearKernel):
     def is_supported(
         cls, compute_capability: int | None = None
     ) -> tuple[bool, str | None]:
-        from vllm.model_executor.layers.quantization.utils.marlin_utils_fp8 import (
-            is_fp8_marlin_supported,
-        )
-
-        if is_fp8_marlin_supported():
+        if current_platform.is_cuda() and current_platform.has_device_capability(75):
             return True, None
-        return False, "Marlin FP8 not available"
+        return False, "MXFP8 Marlin requires compute capability 7.5 or higher"
 
     @classmethod
     def can_implement(cls, c: Mxfp8LinearLayerConfig) -> tuple[bool, str | None]:

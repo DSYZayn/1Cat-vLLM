@@ -13640,6 +13640,112 @@ evidence before they can count as accepted/default.
      - No CUDA/C++ compile, model load, GPU benchmark, or route-hit run was
        executed for this checkpoint.
 
+200. Qwen3.6-27B-FP8 TP2 dense gate-up gated-SiLU uses one runtime layout,
+     2026-06-20.
+
+     Reason:
+     - The SM70 FP8 dense TurboMind path correctly replaces the loaded FP8
+       `layer.weight` / `layer.weight_scale_inv` tensors with one prepared
+       TurboMind layout, so it is not retaining the original checkpoint weight
+       plus the main runtime layout.
+     - However, `gate_up_proj` also prepared a second interleaved FP8
+       TurboMind layout for the fused gated-SiLU epilogue. For Qwen3.6-27B-FP8
+       TP2 this costs about `5.40 GiB/rank`:
+       `64 layers * (5120 * 17408 uint8 + 40 * 17408 fp16)`.
+     - This matches the observed per-rank FP8 memory excess and directly
+       reduces KV-cache headroom.
+
+     Source change:
+     - Added `VLLM_SM70_FP8_DENSE_GATED_SILU`, default `1`.
+     - When enabled, `gate_up_proj` prepares a single interleaved primary
+       TurboMind layout and `apply_fused_silu_and_mul()` uses that primary
+       layout directly. The previous normal-layout plus extra gated-layout
+       duplicate is no longer allocated.
+     - If the fused hook is unexpectedly bypassed, the regular FP8 dense apply
+       path deinterleaves the primary layout output back to logical
+       `[gate..., up...]` order before `SiluAndMul`, preserving fallback
+       semantics without retaining a second resident layout.
+     - SM70 benchmark JSON now records this env and its effective value.
+
+     Expected effect:
+     - Recover about `5.4 GiB` KV-cache headroom per rank on Qwen3.6-27B-FP8
+       TP2 while preserving both the main FP8 TurboMind dense route and the
+       fused `gate_up_proj + SiluAndMul` epilogue.
+     - Fused math semantics match the previously active fused path; this change
+       removes the duplicate resident layout rather than switching execution
+       back to ordinary `gate_up_proj(x)` plus standalone `silu_and_mul`.
+
+     Route/profile evidence:
+     - Final short TP2 profile:
+       `CUDA_VISIBLE_DEVICES=2,3 VLLM_SM70_FP8_TURBOMIND=1
+       VLLM_USE_AOT_COMPILE=0
+       benchmarks/benchmark_sm70_decode.py --model
+       /home/ymzx/models/Qwen3.6-27B-FP8 --tensor-parallel-size 2
+       --quantization fp8 --max-model-len 8192 --gpu-memory-utilization 0.88
+       --input-len 16 --output-len 1 --warmup 0 --repeat 1`.
+     - Artifact:
+       `bench_results/sm70_migration_20260620/qwen36_27b_fp8_tp2_i16_o1_gated_silu_single_layout_profile.json`.
+     - Route logs hit `SM70 FP8 TurboMind W8A16 dense path enabled` and
+       `SM70 FP8 dense gated-SiLU single-layout path enabled`.
+     - Runtime profile reported model loading `14.28 GiB`, available KV cache
+       memory `13.86 GiB`, GPU KV cache size `338,212 tokens`, and CUDA graph
+       capture memory `0.18 GiB`.
+     - The artifact records `fp8_turbomind_effective=true` and
+       `fp8_dense_gated_silu_effective=true`.
+     - The earlier diagnostic
+       `qwen36_27b_fp8_tp2_i16_o1_gated_silu_off_profile.json` proved that
+       disabling fused gated-SiLU also recovers the same model/KV memory, but
+       it is not the final production policy because it gives up a fused
+       epilogue speed path.
+     - End-to-end FP8 no-MTP baseline check, same single-layout code path,
+       Qwen3.6-27B-FP8 TP2 on GPUs `2,3`, default KV cache, input 512,
+       output 512, greedy, `max_num_batched_tokens=1024`:
+       `bench_results/sm70_migration_20260620/qwen36_27b_fp8_tp2_i512_o512_gated_silu_single_layout_e2e_r2.json`.
+       Result: steady decode `44.70990 tok/s`, output `43.67883 tok/s`,
+       prefill `0.28999 s`. This is the current FP8 no-MTP speed baseline
+       for this criterion.
+     - Separate FP8-KV official-sampling diagnostic, Qwen3.6-27B-FP8 TP2 on
+       GPUs `2,3`, FP8 KV cache, input 512, output 512, official sampling
+       (`temperature=1.0`, `top_k=20`, `top_p=0.95`),
+       `max_num_batched_tokens=2048`:
+       `bench_results/sm70_migration_20260620/qwen36_27b_fp8_tp2_i512_o512_nomtp_single_layout_fp8kv_official_r2.json`.
+       Result: steady decode `39.54299 tok/s`, output `38.72703 tok/s`,
+       prefill `0.29557 s`. Do not use this as the default-KV no-MTP speed
+       baseline or as the AWQ `~53 tok/s` gate.
+     - AWQ no-MTP release-baseline cross-check, Qwen3.6-27B-AWQ TP2 on GPUs
+       `0,1`, input 1024, output 256, greedy, `max_num_batched_tokens=1024`:
+       `bench_results/sm70_migration_20260620/qwen36_27b_awq_tp2_i1024_o256_nomtp_current_baseline_r3.json`.
+       Result: steady decode `53.30625 tok/s`, output `48.40781 tok/s`.
+       This confirms the AWQ no-MTP `~53 tok/s` baseline is still intact.
+     - FP8 MTP4 speed/quality smoke with the same single-layout fused gate-up
+       path, Qwen3.6-27B-FP8 TP2 on GPUs `2,3`, default KV cache, input 512,
+       output 512, greedy, MTP4:
+       `bench_results/sm70_migration_20260620/qwen36_27b_fp8_tp2_i512_o512_mtp4_gated_silu_single_layout_e2e_r2.json`.
+       Result: steady decode `101.09592 tok/s`, output `94.66433 tok/s`,
+       prefill `0.31411 s`, acceptance length `4.45217`, overall acceptance
+       rate `0.86304`, max same-token run `2`, repeated 20-grams `0`. This
+       confirms the resident-layout memory recovery does not disable the FP8
+       MTP fused speed path.
+
+     Checks:
+     - `python -m py_compile vllm/envs.py
+       vllm/model_executor/layers/quantization/fp8.py
+       vllm/model_executor/warmup/awq_sm70_warmup.py
+       benchmarks/benchmark_sm70_decode.py
+       benchmarks/benchmark_sm70_model_tokens.py` passed.
+     - `git diff --check -- vllm/envs.py
+       vllm/model_executor/layers/quantization/fp8.py
+       vllm/model_executor/warmup/awq_sm70_warmup.py
+       benchmarks/benchmark_sm70_decode.py
+       benchmarks/benchmark_sm70_model_tokens.py` passed.
+     - Runtime env parse check passed: unset
+       `VLLM_SM70_FP8_DENSE_GATED_SILU=True`, explicit
+       `VLLM_SM70_FP8_DENSE_GATED_SILU=0` gives `False`.
+     - `python -m ruff check ...` was not clean because of pre-existing
+       unrelated issues in touched files:
+       `benchmarks/benchmark_sm70_decode.py:604` E501 and `vllm/envs.py:716`
+       SIM103.
+
 198. Old Qwen3.5/Qwen3.6 SM70 server-default profile is not restored as a
      default policy, 2026-06-02.
 
@@ -32067,6 +32173,96 @@ evidence before they can count as accepted/default.
        style-only findings (`E501`, `E731`); they were not changed in this
        diagnostic patch.
 
+433.1. 2026-06-19 Qwen GDN `spec_commit` graph-visible metadata recovery.
+
+     Root-cause refinement:
+     - The earlier "missing spec metadata parameters" diagnosis was real but
+       incomplete. Metadata builder/state-table dumps showed correct active
+       MTP tensors, but the split `qwen_gdn_attention_core_spec_commit` custom
+       op still received empty graph arguments under AOT/FULL graph replay:
+       `spec_query_start_loc_shape=(0,)`,
+       `spec_state_indices_tensor_shape=(0,)`,
+       `num_accepted_tokens_shape=(0,)` with
+       `num_spec_decodes=1` and `num_spec_decode_tokens=5`.
+     - This proves the broken boundary was not simply the builder failing to
+       compute state indices. The builder had the right tensors; the compiled
+       Python helper/late registry path was being frozen to empty op arguments.
+
+     Implementation change:
+     - `qwen_gdn_attention_core_spec_commit` now keeps the explicit metadata
+       argument path, but has a diagnostic bridge that can repopulate missing
+       tensors from the current `GDNAttentionMetadata` inside the custom op.
+       This bridge is not the final contract; it exists to verify whether the
+       recurrent kernel/op is viable when fed the correct tensors.
+     - The no-active fallback from `spec_commit` to
+       `qwen_gdn_attention_core_standard` now clears placeholder spec fields
+       when `num_spec_decodes <= 0`, avoiding the mixed-spec `_forward_core`
+       branch reading `non_spec_token_indx=None`.
+     - `GDNAttentionMetadataBuilder.__init__` now registers its persistent
+       spec metadata buffers immediately, initialized as
+       `PAD_SLOT_ID` / false masks / accepted count `1`. This gives the AOT
+       helper non-empty stable tensor objects before any real active-spec build
+       updates their contents.
+     - Core dumps label the diagnostic bridge as
+       `core_spec_commit_metadata_fallback`; normal explicit-argument runs stay
+       labeled `core_spec_commit`.
+
+     Short route evidence:
+     - `bench_results/spec_route_after_op_internal_metadata_fallback_g23_20260619_005827`
+       proved the op can hit `core_spec_commit` when correct metadata is
+       recovered inside the op, but exposed the no-active placeholder fallback
+       bug described above.
+     - After clearing placeholder spec fields on no-active fallback,
+       `bench_results/spec_route_after_noactive_fallback_patch_g23_20260619_010534`
+       completed cleanly. It still returned `rc=2` only because the diagnostic
+       quality length was `16` tokens and the matrix marks `<64` output tokens
+       as `too_few_output_tokens`.
+     - After early-registering builder buffers,
+       `bench_results/spec_route_after_early_register_g23_20260619_011411`
+       completed the same short route with dump source counts
+       `core_spec_commit: 16`, `core_standard: 72`, and no
+       `core_spec_commit_metadata_fallback`. With
+       `VLLM_SM70_QWEN_GDN_ASSERT_NO_ACTIVE_SPEC_STANDARD=1`, no active-spec
+       standard fallback was observed.
+     - The same run reported normal speculative acceptance, not the known bad
+       all-position plateau: mean acceptance length `3.38`, per-position
+       acceptance `0.850, 0.642, 0.492, 0.392`.
+     - A no-dump 512-token `code_macos` smoke,
+       `bench_results/spec_commit_early_register_macos512_g23_20260619_012034`,
+       reached real generation and logged normal speculative acceptance before
+       failing later: mean acceptance length `3.31`, per-position acceptance
+       `0.819, 0.648, 0.500, 0.338`, with a progress-bar decode estimate of
+       `78.63 tok/s` on the completed 512-token request. The run did not
+       produce a valid matrix JSON because a later request died at
+       `num_output_tokens=261`. Kernel logs show both TP workers hit
+       `trap invalid opcode` in `python3.12` at `2026-06-19 01:24:43`; this is
+       a native/JIT/extension crash, not the earlier empty-metadata exception
+       or the no-active `index_select(None)` bug.
+
+     Scope and next proof:
+     - This is a route/metadata-boundary proof, not a 6000-token quality pass.
+       `VLLM_SM70_QWEN_GDN_SPEC_CORE_OP=1` should still be treated as an
+       experimental split path until a real `code_macos` official-sampling
+       long-output run shows no sustained all-position `1.000` acceptance
+       plateau.
+     - The next useful model test is a no-dump 512-token coding smoke for
+       native crash localization with core dumps or faulthandler enabled,
+       followed by the 6000-token `code_macos` quality gate only after the
+       512-token smoke exits cleanly.
+
+     Verification:
+     - `/home/ymzx/miniconda3/envs/vllm-0.0.5-t210/bin/python -m py_compile
+       vllm/v1/attention/backends/gdn_attn.py
+       vllm/model_executor/layers/mamba/gdn/qwen_gdn_linear_attn.py
+       vllm/v1/worker/gpu_model_runner.py` passed.
+     - `/home/ymzx/miniconda3/bin/ruff check --select F
+       vllm/v1/attention/backends/gdn_attn.py
+       vllm/model_executor/layers/mamba/gdn/qwen_gdn_linear_attn.py
+       vllm/v1/worker/gpu_model_runner.py` passed.
+     - `/home/ymzx/miniconda3/envs/vllm-0.0.5-t210/bin/python -m pytest -q
+       tests/v1/attention/test_gdn_metadata_builder.py` passed:
+       `21 passed`.
+
 434. 2026-06-18 Flash-V100 D=256 low-shared-memory paged-prefill experiment.
 
      Source change:
@@ -32213,35 +32409,75 @@ evidence before they can count as accepted/default.
        block `528` `229.160 ms -> 201.790 ms` (`+13.6%`), and 35B TP2 block
        `1056` `443.294 ms -> 397.343 ms` (`+11.6%`), all with `maxdiff=0.0`.
 
-     9B AWQ end-to-end check, 2026-06-18:
+     9B AWQ end-to-end / attribution check, 2026-06-18:
      - Artifact:
        `bench_results/flash_v100_9b_awq_e2e_low_smem_20260618_gpu1.json`.
        Ran Qwen3.5-9B-AWQ TP1 on one V100 with `FLASH_ATTN_V100`,
        `enforce_eager=True`, `kv_cache_dtype=auto`, `max_model_len=262144`,
-       `max_num_batched_tokens=8192`, `max_tokens=1`, and one model load.
-       Baseline and `VLLM_FLASH_V100_PREFILL_D256_LOW_SMEM=1` were alternated
-       inside the same engine. Shutdown route summary confirmed the target
-       paths: `prefill_no_prefix_dense_flash=160` and
-       `prefill_prefix_flash=1296`.
-     - Median TTFT / prefill throughput:
+       `max_num_batched_tokens=8192`, `max_tokens=1`, and one model load. The
+       shutdown route summary confirmed the target paths:
+       `prefill_no_prefix_dense_flash=160` and `prefill_prefix_flash=1296`.
+     - Important correction: the earlier all-in-one baseline/low-smem
+       comparison is not valid speed evidence. The vLLM `EngineCore` process
+       inherits its environment at startup, so toggling
+       `VLLM_FLASH_V100_PREFILL_D256_LOW_SMEM` in the parent process after the
+       engine is already running does not reliably switch the child worker's
+       CUDA launcher. Accepted end-to-end low-smem evidence must use a baseline
+       engine started without the env and a second low-smem engine started with
+       the env, while each engine runs all lengths to avoid per-length reloads.
+     - Baseline median TTFT / prefill throughput from the artifact:
 
-       | input tokens | baseline | low-smem | speed delta | prefill tok/s |
+       | input tokens | baseline TTFT | baseline prefill tok/s |
+       | --- | ---: | ---: |
+       | 8192 | `2.833570 s` | `2891.8` |
+       | 32768 | `16.385335 s` | `2000.1` |
+       | 65536 | `49.075133 s` | `1335.8` |
+       | 131072 | `160.736387 s` | `815.5` |
+       | 261120 | `550.088976 s` | `474.7` |
+
+     - Attention-core attribution artifact:
+       `bench_results/flash_v100_9b_awq_attention_kernel_breakdown_20260618.json`.
+       This is kernel-only Flash-V100 chunked prefill with the real 9B local
+       shape (`heads_q=16`, `heads_kv=4`, `head_dim=256`, `block_size=528`,
+       `chunk_size=8192`) scaled by the model's 8 full-attention layers.
+
+       | input tokens | full-attention core | share of baseline TTFT |
+       | --- | ---: | ---: |
+       | 8192 | `0.913 s` | `32.2%` |
+       | 32768 | `7.772 s` | `47.4%` |
+       | 65536 | `30.453 s` | `62.1%` |
+       | 131072 | `120.884 s` | `75.2%` |
+       | 261120 | `480.778 s` | `87.4%` |
+
+     - Correctly separated CUDA-graph end-to-end check, capped at 64K:
+       artifacts
+       `bench_results/flash_v100_9b_awq_e2e_baseline_8k_64k_graph_20260618_gpu0.json`
+       and
+       `bench_results/flash_v100_9b_awq_e2e_low_smem_8k_64k_graph_20260618_gpu0.json`.
+       Both runs used separate engine startups, `enforce_eager=False`,
+       `max_model_len=66000`, `max_num_batched_tokens=8192`, `max_tokens=1`,
+       and the SM70 compile CUDA graph policy
+       `mode=VLLM_COMPILE, cudagraph_mode=FULL_AND_PIECEWISE`. Route summaries
+       matched in both runs:
+       `prefill_no_prefix_dense_flash=56`, `prefill_prefix_flash=160`,
+       `decode_scalar_paged=24`. Output hashes matched for every corresponding
+       prompt/repeat.
+
+       | input tokens | baseline TTFT | low-smem TTFT | speed delta | prefill tok/s |
        | --- | ---: | ---: | ---: | ---: |
-       | 8192 | `2.833570 s` | `2.874240 s` | `-1.42%` | `2891.8 -> 2851.5` |
-       | 32768 | `16.385335 s` | `16.539327 s` | `-0.93%` | `2000.1 -> 1981.4` |
-       | 65536 | `49.075133 s` | `49.628700 s` | `-1.12%` | `1335.8 -> 1320.7` |
-       | 131072 | `160.736387 s` | `159.734137 s` | `+0.63%` | `815.5 -> 820.6` |
-       | 261120 | `550.088976 s` | `549.194828 s` | `+0.16%` | `474.7 -> 475.5` |
+       | 8192 | `2.664855 s` | `2.677866 s` | `-0.49%` | `3074.1 -> 3059.2` |
+       | 32768 | `15.424991 s` | `14.803540 s` | `+4.20%` | `2124.3 -> 2213.5` |
+       | 65536 | `45.807018 s` | `42.903593 s` | `+6.77%` | `1430.7 -> 1527.5` |
 
-     - Interpretation: the 9B AWQ whole-model route hits the paged-prefix
-       kernel, but the kernel-only `+12%` does not survive as a material
-       end-to-end 9B TTFT gain. For this model, only 8 layers are full
-       attention; dense first chunk, GDN/linear-attention layers, AWQ GEMMs,
-       scheduler/runtime overhead, and sampling dilute the paged-prefix kernel
-       win. This result is not default-enable evidence for low-smem. It does
-       show the real route is wired correctly and that future acceptance should
-       focus on 27B/35B long-context shapes or a narrower per-layer/full-attn
-       attribution run.
+     - Interpretation: the real route is wired correctly, and long-context
+       baseline TTFT is now dominated by the full-attention core even in 9B.
+       At 8K, non-attention costs still dominate. By 256K, the Flash-V100
+       full-attention core alone is about `87%` of TTFT, so accepted
+       low-smem/attention-kernel gains should be visible in a correctly
+       separated end-to-end run. The 64K CUDA-graph result confirms this:
+       the measured `+6.77%` end-to-end speedup is consistent with the
+       attention-core share and the kernel-only low-smem gain. At 8K the first
+       dense chunk dominates and low-smem is not expected to help.
 
      Interpretation:
      - The original `96.5 KB/CTA` shared-memory footprint is a real occupancy
@@ -32269,3 +32505,2698 @@ evidence before they can count as accepted/default.
      - Keep this path opt-in until a whole-model 35B long-context prefill run
        confirms the kernel-only gain survives scheduler, graph, and model
        overheads.
+
+435. 2026-06-18 Flash-V100 kernel-block-size=16 E2E wiring attempt.
+
+     Source change:
+     - Added `VLLM_FLASH_V100_KERNEL_BLOCK_SIZE16=1`. When set,
+       `FlashAttnV100Backend.get_supported_kernel_block_sizes()` returns
+       `[16]`, letting vLLM split real manager block sizes such as
+       `528/784/1056` into 16-token kernel blocks via the existing block-table
+       expansion path. With the env unset, the backend keeps the inherited
+       `MultipleOf(16)` behavior and selects the real manager block size.
+     - `flash-attention-v100/kernel/fused_mha_forward_paged.cu` now launches
+       the low-smem contiguous specialization automatically when
+       `page_block_size == 16`. The generalized real-hybrid contiguous probe
+       remains controlled by `VLLM_FLASH_V100_PREFILL_CONTIG_FAST`.
+     - `benchmarks/benchmark_flash_v100_9b_awq_e2e.py` records the Flash-V100
+       env snapshot and accepts a `kbs16` variant for model-level experiments.
+
+     Validation:
+     - Static compile passed for `vllm/envs.py`,
+       `vllm/v1/attention/backends/flash_attn_v100.py`, and
+       `benchmarks/benchmark_flash_v100_9b_awq_e2e.py`.
+     - Rebuilt `flash-attention-v100` with `TORCH_CUDA_ARCH_LIST=7.0`.
+     - Kernel exactness check on physical GPU0/V100 compared the same
+       contiguous logical KV cache as block `528` versus a reshaped
+       block `16` view at `B=1,M=512,N=4224,Hq=16,Hkv=4,D=256`.
+       Result: `maxdiff=0.0`, nonzero elements `0`.
+     - vLLM block-size selection with the env set returned
+       `{528: 16, 784: 16, 1056: 16}`; with the env unset it returned
+       `{528: 528, 784: 784, 1056: 1056}`.
+
+     Performance result:
+     - qwen35-tp1 kernel spot check, physical GPU0, `M=16324,N=65296`,
+       `heads_q=16`, `heads_kv=2`, `D=256`, low-smem enabled:
+       real block `528` median `1456.632 ms`; forced block `16` median
+       `1506.882 ms` (`-3.3%`). Legacy `block=16` with low-smem disabled was
+       `1619.514 ms`, so low-smem still helps the 16-token path, but the
+       forced split does not beat the real 528-token path.
+     - Enabling `VLLM_FLASH_V100_PREFILL_CONTIG_FAST=1` on real block `528`
+       measured `1507.834 ms`, also slower than the default real-block path.
+
+     Status:
+     - Keep `VLLM_FLASH_V100_KERNEL_BLOCK_SIZE16` experimental and default-off.
+       It is correctness-clean for the tested Type A layout transform, but it
+       is not accepted as a default E2E acceleration path. The earlier
+       synthetic 4-page gains should not be projected onto real
+       `528/784/1056` manager blocks without a positive whole-model or
+       real-shape kernel result.
+
+436. 2026-06-18 Flash-V100 dense D=256 first-chunk low-smem path.
+
+     Source change:
+     - Added `VLLM_FLASH_V100_DENSE_D256_LOW_SMEM=1` for the dense raw-QKV
+       no-prefix Flash-V100 prefill kernel in
+       `flash-attention-v100/kernel/fused_mha_forward.cu`.
+     - The opt-in D=256 variant uses `BM16/BN32/WARPS16`. It keeps staged K/V,
+       scalar fp32 QK, and `P_SUB_TILE=32`, so the per-row softmax update order
+       matches the legacy dense D=256 path. Shared memory drops from the legacy
+       ~96KB/CTA class to the ~40KB/CTA class, allowing two CTAs per V100 SM.
+     - `benchmarks/benchmark_flash_v100_9b_awq_e2e.py` now records the dense
+       env and has `dense_low_smem` / `all_low_smem` variants. The kernel-only
+       prefill decay reproducer also records the dense env in its run header.
+
+     Correctness:
+     - Legacy dense versus dense-low-smem exactness passed with
+       `torch.equal=True`, `maxdiff=0.0`, and nonzero count `0` for 9B-like
+       `Hq=16,Hkv=4,D=256` at `M=128,512,1024,4096,8192`.
+     - The 35B-like `Hq=16,Hkv=2,D=256` shape also passed at
+       `M=1024,4096,8192` with `maxdiff=0.0`.
+     - Non-causal dense smoke for `Hq=16,Hkv=4,D=256` passed at
+       `M=512,1024` with `maxdiff=0.0`.
+     - This is a Type A layout/tile optimization against the existing dense
+       Flash-V100 output, not a dense-vs-paged arithmetic-order change.
+
+     Kernel-only speed:
+     - 9B-like dense first chunk, `Hq=16,Hkv=4,D=256,layers=8`:
+       `M=8192` improved `99.436 ms -> 90.505 ms` (`+9.9%`);
+       `M=16384` improved `372.878 ms -> 356.726 ms` (`+4.5%`).
+     - 35B TP1-like dense first chunk, `Hq=16,Hkv=2,D=256,layers=40`:
+       `M=8192` improved `94.055 ms -> 90.610 ms` (`+3.8%`);
+       `M=16384` improved `373.279 ms -> 357.101 ms` (`+4.5%`).
+
+     Interpretation:
+     - This path addresses the first dense chunk only. It stacks with the
+       paged-prefix low-smem path via `all_low_smem`, but it does not change
+       the later prefix chunks where long-context TTFT is dominated by
+       quadratic paged attention.
+     - Expected end-to-end gain is largest for short/no-prefix or first-chunk
+       heavy prompts. For 64K+ prompts, this is a small additive win on top of
+       the paged-prefix optimization, not the main long-context fix.
+
+437. 2026-06-18 Dense-vs-paged no-prefix investigation.
+
+     Question:
+     - The existing paged low-smem kernel is much faster than the dense D=256
+       kernel for `M == N`, but direct dense-to-paged substitution produced
+       `maxdiff=0.0009765625`. The goal was to determine whether this is a
+       layout/indexing bug, a solvable exactness issue, or an unacceptable
+       arithmetic-order tradeoff.
+
+     Findings:
+     - KV layout is not the source. A diagnostic rebuilt contiguous K/V from
+       the paged cache and verified raw K/V equality, dense output equality,
+       and dense QK-score equality:
+       `kv_equal=True`, dense raw-vs-reconstructed `maxdiff=0.0`, and dense
+       QK raw-vs-reconstructed `maxdiff=0.0`.
+     - Default paged low-smem still differed from dense by
+       `maxdiff=0.0009765625` across `M=512,1024,4096`.
+     - Added explicit `VLLM_FLASH_V100_PREFILL_D256_SCALAR_QK=1` for D=256
+       FP16 paged-prefill low-smem. This compiles a scalar-fp32 QK variant
+       for the paged kernel instead of the default WMMA QK path.
+     - First scalar-QK prototype loaded K directly from global memory for every
+       score. It proved the root cause by making paged output bitwise equal to
+       dense, but was far too slow.
+     - The retained scalar-QK prototype stages the current K tile in shared
+       memory and uses `BM16/BN32`, `KV_STAGE_N=32`, and the same scalar-fp32
+       QK arithmetic as dense. Page ids/offsets were moved out of the `sK`
+       scratch area into dedicated shared-memory fields so K staging cannot
+       overwrite them.
+
+     Correctness:
+     - Dense versus paged scalar-QK exactness passed for
+       `Hq=16,Hkv=4,D=256,block=528` at `M=512,1024,4096,8192`:
+       `torch.equal=True`, `maxdiff=0.0`, nonzero count `0`.
+     - This proves the dense-vs-paged mismatch is the paged WMMA-QK path, not
+       KV cache layout, block-table expansion, causal masking, softmax, or PV.
+
+     Kernel-only speed, 9B-like `Hq=16,Hkv=4,D=256,layers=8`:
+     - Dense legacy: `8192 = 99.408 ms`, `16384 = 372.830 ms`.
+     - Dense low-smem from item 436: `8192 = 90.524 ms`,
+       `16384 = 356.653 ms`.
+     - Paged low-smem default WMMA-QK: `8192 = 54.323 ms`,
+       `16384 = 214.135 ms`, but it is not Type-A exact versus dense.
+     - Paged low-smem scalar-QK exact: `8192 = 92.497 ms`,
+       `16384 = 364.271 ms`.
+
+     Status:
+     - Dense-vs-paged is a valid research direction, and the large speed
+       potential comes specifically from the paged WMMA-QK path. However, the
+       exact scalar-QK paged variant does not beat the simpler dense-low-smem
+       path, so it is not a default candidate.
+     - Keep `VLLM_FLASH_V100_PREFILL_D256_SCALAR_QK` experimental/diagnostic.
+       It is useful for proving dense-vs-paged root cause and for future
+       arithmetic-order experiments, but it should not be used for long-prefix
+       whole-model speed runs because the env affects all D=256 paged-prefill
+       calls, not only the no-prefix first chunk.
+     - Next work on this branch should focus on classifying or eliminating the
+       WMMA-QK diff. If WMMA-QK remains Type A nonzero, the safe path is item
+       436 dense-low-smem; if a tiled reference proves the diff is acceptable
+       Type B and model-level quality is stable, the fast paged WMMA no-prefix
+       path can be revisited.
+
+438. 2026-06-18 Dense D=256 WMMA-QK candidate for the 1.7x first-chunk win.
+
+     Source change:
+     - Added `VLLM_FLASH_V100_DENSE_D256_WMMA_QK=1` as an explicit diagnostic
+       and fast-candidate switch in
+       `flash-attention-v100/kernel/fused_mha_forward.cu`.
+     - The switch keeps the dense raw-QKV storage path but forces the D=256
+       QK phase through the same WMMA arithmetic used by the fast paged
+       low-smem kernel. D=256 WMMA-QK uses `softmax_scale` with the existing
+       D=256 `expf/logf` softmax path; the previous non-D=256 `log2` scaling
+       remains unchanged.
+
+     Classification evidence:
+     - Dense-WMMA and paged-WMMA matched bitwise for contiguous logical K/V
+       represented both as raw dense K/V and as paged cache. Tested
+       `Hq=16,Hkv=4,D=256,block=528` at `M=512,1024,4096,8192`:
+       dense-WMMA versus paged-WMMA `maxdiff=0.0`, `torch.equal=True`.
+     - Dense-WMMA versus legacy dense-scalar shows the same bounded difference
+       as paged-WMMA versus dense-scalar:
+       `maxdiff=0.0009765625`.
+     - Length/seed sweep for dense-WMMA versus dense-scalar over
+       `M=512,1024,2048,4096,8192,16384` and five seeds showed
+       `maxdiff_max=0.0009765625` for every length, with mean diff not growing
+       with sequence length (`~8.9e-7` at 1K, `~5.0e-7` at 16K).
+
+     Kernel-only speed, 9B-like `Hq=16,Hkv=4,D=256,layers=8`:
+     - Legacy dense-scalar: `8192 = 95.242 ms`, `16384 = 372.998 ms`.
+     - Exact dense-low-smem scalar path: `8192 = 90.599 ms`,
+       `16384 = 356.787 ms`.
+     - Dense-WMMA candidate: `8192 = 49.508 ms`, `16384 = 197.916 ms`.
+     - Paged-WMMA comparison: `8192 = 55.003 ms`, `16384 = 213.422 ms`.
+
+     Status and required gate:
+     - Dense-WMMA is the cleaner way to target the observed `~1.7x` no-prefix
+       first-chunk speedup because it avoids forcing no-prefix prefill through
+       paged KV cache while matching the paged-WMMA arithmetic exactly.
+     - It is not Type-A exact versus legacy dense-scalar. Treat it as a
+       Type-B candidate only after model-level quality passes: deterministic
+       token comparison where appropriate, plus bounded logprob/logit or
+       perplexity evidence for low-margin cases. Until then, keep
+       `VLLM_FLASH_V100_DENSE_D256_WMMA_QK` default-off.
+
+     9B-AWQ model-level gate, CUDA graph on, TP1, one V100, Qwen3.5-9B-AWQ,
+     `max_model_len=20000`, `max_num_batched_tokens=16384`,
+     `gpu_memory_utilization=0.70`, Flash-V100:
+     - First-token gate, `max_tokens=1`, `logprobs=5`, lengths
+       `4096/8192/16384`, repeat `3`:
+       - Artifacts:
+         `bench_results/flash_v100_9b_awq_dense_wmma_quality_baseline_4k_16k_r3_20260618_gpu0.json`
+         and
+         `bench_results/flash_v100_9b_awq_dense_wmma_quality_candidate_4k_16k_r3_20260618_gpu0.json`.
+       - Route evidence: both runs reported
+         `prefill_no_prefix_dense_flash=80`; the candidate env set
+         `VLLM_FLASH_V100_DENSE_D256_WMMA_QK=1`.
+       - Token result: `9/9` first tokens matched exactly.
+       - Median TTFT speedups: 4K `+10.48%`, 8K `+17.23%`, 16K `+26.01%`.
+       - Shared top-5 logprob max diff: `0.0077929497`; minimum observed
+         top1/top2 margin was `0.0078125`, so this remains numerically close
+         to a possible tie and is not a default-safe gate by itself.
+     - Multi-token gate, `max_tokens=16`, `logprobs=5`, lengths
+       `4096/8192/16384`, repeat `2`:
+       - Artifacts:
+         `bench_results/flash_v100_9b_awq_dense_wmma_quality_baseline_4k_16k_t16_r2_20260618_gpu0.json`
+         and
+         `bench_results/flash_v100_9b_awq_dense_wmma_quality_candidate_4k_16k_t16_r2_20260618_gpu0.json`.
+       - Token result: `6/6` greedy 16-token sequences matched exactly.
+       - Median TTFT speedups: 4K `+8.53%`, 8K `+15.28%`, 16K `+25.75%`.
+       - Shared top-5 logprob max diff: `0.0234375`.
+     - Interpretation: the dense-WMMA route gives real end-to-end long-prefill
+       speed on the actual dense first-chunk model path, but it is not bitwise
+       or near-zero equivalent to scalar-QK. The nonzero diff is the expected
+       Tensor Core QK arithmetic difference; the exact fallback remains
+       dense scalar-QK / dense-low-smem with smaller speed gain. Keep the
+       WMMA switch opt-in until a broader quality/perplexity gate passes.
+     - Extended no-prefix dense gate, `max_tokens=1`, `logprobs=5`,
+       lengths `16384/65536`, `max_model_len=66000`,
+       `max_num_batched_tokens=65536`, `gpu_memory_utilization=0.90`:
+       - Artifacts:
+         `bench_results/flash_v100_9b_awq_dense_wmma_quality_baseline_16k_64k_t1_r1_mem90_20260618_gpu0.json`
+         and
+         `bench_results/flash_v100_9b_awq_dense_wmma_quality_candidate_16k_64k_t1_r1_mem90_20260618_gpu0.json`.
+       - Startup note: the same run failed at `gpu_memory_utilization=0.70`
+         because the 64K compile/profile path left negative KV cache memory;
+         `0.90` left `4.16 GiB` KV cache and `133,031` cache tokens.
+       - Route evidence: both runs reported
+         `prefill_no_prefix_dense_flash=24`; the candidate env set
+         `VLLM_FLASH_V100_DENSE_D256_WMMA_QK=1`.
+       - Token result: `2/2` first tokens matched exactly.
+       - TTFT: 16K `6.807310 s -> 5.374926 s` (`+26.65%`,
+         `-21.04%` time); 64K `62.962264 s -> 40.735164 s` (`+54.56%`,
+         `-35.30%` time).
+       - Shared top-5 logprob max diff: 16K `0.0037989616`, 64K
+         `0.0071949959`.
+     - Interpretation: when the whole 64K prompt is allowed to hit the
+       no-prefix dense Flash-V100 path in one scheduling chunk, the WMMA-QK
+       benefit grows materially with context length. This is the desired
+       long-context prefill direction, but it remains Type-B because the
+       scalar-QK logprob diff is nonzero.
+     - 27B-AWQ TP2 extended gate, Qwen3.6-27B-AWQ, one request, CUDA graph on,
+       `max_tokens=1`, `logprobs=5`, lengths `16384/65536`,
+       `max_model_len=65700`, `max_num_batched_tokens=65536`,
+       `gpu_memory_utilization=0.78`, GPUs `0,1`:
+       - Artifacts:
+         `bench_results/flash_v100_27b_awq_dense_wmma_quality_baseline_16k_64k_t1_r1_tp2_mem78_20260618_gpu01.json`
+         and
+         `bench_results/flash_v100_27b_awq_dense_wmma_quality_candidate_16k_64k_t1_r1_tp2_mem78_20260618_gpu01.json`.
+       - Startup note: TP2 full-64K failed at
+         `gpu_memory_utilization=0.90` because rank1 saw only
+         `25.37 GiB` free while the requested reservation was `28.56 GiB`.
+         At `0.78`, the run started and reported `2.84 GiB` KV cache memory,
+         `89,110` cache tokens, and `1.36x` max concurrency for `65,700`
+         tokens.
+       - Route evidence: both ranks logged Flash-V100 no-prefix dense prefill
+         active; attention block size was `784` tokens for this model.
+       - Token result: `2/2` first tokens matched exactly.
+       - TTFT: 16K `12.549053 s -> 10.395000 s` (`+20.72%`,
+         `-17.17%` time); 64K `116.201140 s -> 74.928338 s` (`+55.08%`,
+         `-35.52%` time).
+       - Shared top-5 logprob max diff: 16K `0.0035352707`, 64K
+         `0.0040655136`.
+     - Interpretation: the same dense-WMMA direction transfers to the real
+       27B TP2 shape and gives essentially the same 64K time reduction as
+       9B, but remains Type-B because the scalar-QK diff is nonzero.
+     - 27B-AWQ TP2 chunked-service check, same model/TP/GPU/settings as above
+       except `max_num_batched_tokens=16384`:
+       - Artifacts:
+         `bench_results/flash_v100_27b_awq_dense_wmma_quality_baseline_16k_64k_t1_r1_tp2_mnbt16k_mem78_20260618_gpu01.json`
+         and
+         `bench_results/flash_v100_27b_awq_dense_wmma_quality_candidate_16k_64k_t1_r1_tp2_mnbt16k_mem78_20260618_gpu01.json`.
+       - Route evidence: the 16K request hit no-prefix dense prefill; the 64K
+         request first hit no-prefix dense prefill, then logged
+         `prefix/chunked via direct paged prefill kernel` for later chunks.
+       - Token result: `2/2` first tokens matched exactly.
+       - Dense-WMMA within this chunked config: 16K
+         `12.570870 s -> 10.330271 s` (`+21.69%`, `-17.82%` time);
+         64K `75.834497 s -> 74.182994 s` (`+2.23%`, `-2.18%` time).
+       - Shared top-5 logprob max diff: 16K `0.0026998520`, 64K
+         `0.0041494370`.
+       - Compared with the previous `max_num_batched_tokens=65536` run,
+         chunking is neutral at 16K but much faster for baseline 64K:
+         `116.201140 s -> 75.834497 s` (`+53.23%`, `-34.74%` time).
+         For dense-WMMA 64K, chunking is nearly neutral:
+         `74.928338 s -> 74.182994 s` (`+1.00%`, `-0.99%` time).
+       - Interpretation: for realistic 27B serving, `max_num_batched_tokens`
+         should stay around 16K rather than forcing a single 64K prefill
+         chunk. Dense-WMMA still matters for the first no-prefix chunk and
+         for 16K prompts, but the 64K chunked path is dominated by subsequent
+         direct paged-prefix chunks, so the next 64K optimization target is
+         paged-prefix prefill rather than dense first-chunk QK.
+
+439. 2026-06-19 27B-AWQ chunked paged-prefix low-smem E2E check.
+
+     Question:
+     - Test whether the D=256 paged-prefix low-smem kernel from item 434
+       improves the real 27B chunked-service path where 64K requests split into
+       one no-prefix dense chunk plus later direct paged-prefix chunks.
+
+     Configuration:
+     - Model: Qwen3.6-27B-AWQ, TP2 on GPUs `0,1`, Flash-V100, CUDA graph on.
+     - Runtime: `max_model_len=65700`, `max_num_batched_tokens=16384`,
+       `gpu_memory_utilization=0.78`, `max_tokens=1`, `logprobs=5`.
+     - Candidate env: `VLLM_FLASH_V100_PREFILL_D256_LOW_SMEM=1`.
+     - Artifact:
+       `bench_results/flash_v100_27b_awq_paged_lowsmem_16k_64k_t1_r1_tp2_mnbt16k_mem78_20260619_gpu01.json`.
+
+     Result:
+     - Baseline from item 438, same chunked config:
+       16K `12.570870 s`, 64K `75.834497 s`.
+     - Paged low-smem:
+       16K `12.861110 s`, 64K `75.376260 s`.
+     - Delta: 16K regressed by about `2.3%`; 64K improved only about `0.6%`.
+       First-token ids matched for both lengths (`248046` and `13349`).
+
+     Interpretation:
+     - The low-smem paged-prefix kernel is wired into the relevant real-model
+       path, but it does not materially reduce 27B 64K TTFT in the practical
+       `max_num_batched_tokens=16384` service shape.
+     - This confirms the dense-WMMA first-chunk work and the paged-prefix
+       low-smem work do not yet solve the long-context decay: 27B still drops
+       from about `1303 tok/s` at 16K baseline to about `864 tok/s` at 64K,
+       and the best current chunked candidate is only about `883 tok/s` at 64K.
+     - The old `VLLM_TRITON_ATTN_SM70_QHEAD_SPLIT` route is not this path; it
+       was a Triton/decode q-head split diagnostic. The current prefill split
+       is scheduler chunking plus direct paged-prefix Flash-V100, and the next
+       useful work is per-chunk/paged-prefix profiling and a new paged-prefix
+       kernel strategy rather than reusing the old q-head split evidence.
+
+440. 2026-06-19 Dense D=256 WMMA-QK default-on decision.
+
+     Source change:
+     - `flash-attention-v100/kernel/fused_mha_forward.cu` now enables
+       `VLLM_FLASH_V100_DENSE_D256_WMMA_QK` by default for D=256 dense
+       no-prefix Flash-V100 prefill.
+     - Set `VLLM_FLASH_V100_DENSE_D256_WMMA_QK=0` to force the legacy
+       scalar-QK path for rollback or A/B validation.
+     - `vllm/envs.py` now reports the same default-on policy.
+     - `benchmarks/benchmark_flash_v100_9b_awq_e2e.py` keeps its `baseline`,
+       `low_smem`, `dense_low_smem`, `all_low_smem`, and `kbs16` variants
+       explicitly scalar-QK by setting the env to `0`; `dense_wmma` and
+       `all_wmma` keep setting it to `1`. This preserves reproducible
+       legacy-vs-candidate comparisons after the runtime default changes.
+
+     Acceptance basis:
+     - This is not Type-A exact versus legacy scalar-QK. The op-level residual
+       remains the Tensor Core QK arithmetic difference, with representative
+       dense-WMMA versus dense-scalar `maxdiff=0.0009765625`.
+     - Dense-WMMA is bitwise equal to the paged-WMMA arithmetic for the same
+       logical K/V, so the residual is not a block-table, layout, or mask bug.
+     - Model-level gates from item 438 matched first-token or greedy-token ids
+       across the tested 9B and 27B AWQ cases. Shared top-5 logprob differences
+       were nonzero but bounded in the recorded gates.
+
+     Expected effect:
+     - Large no-prefix dense prompts hit the accelerated path directly:
+       9B TP1 64K `62.962264 s -> 40.735164 s`; 27B TP2 64K
+       `116.201140 s -> 74.928338 s`.
+     - In realistic `max_num_batched_tokens=16384` chunked 64K service, this
+       only accelerates the first dense chunk. The measured 27B TP2 64K delta
+       is `75.834497 s -> 74.182994 s`, so the remaining long-context decay is
+       still in later direct paged-prefix chunks.
+
+     Current rule:
+     - Keep dense D=256 WMMA-QK default-on for Flash-V100 no-prefix prefill.
+     - Do not use this default-on change to claim the paged-prefix long-context
+       decay is solved. Continue profiling and optimizing `prefill_prefix_flash`
+       separately.
+
+441. 2026-06-19 vLLM built-in FA2 vs FlashInfer kernel comparison on 4060Ti.
+
+     Purpose:
+     - Compare upstream-style vLLM attention kernels on hardware where both
+       backends can run, using real Qwen-like head shapes and long-prefix
+       prefill shapes. This is guidance for design direction only; it is not a
+       V100 result because FlashInfer does not support SM70 in this tree and
+       supports page sizes `[16,32,64]` rather than the V100 hybrid
+       `528/784/1056` block sizes.
+
+     Environment:
+     - GPU: NVIDIA GeForce RTX 4060 Ti, SM89.
+     - Conda env: `vllm`; Torch `2.11.0+cu130`.
+     - vLLM built-in FA selected FA2 for `head_dim=256`.
+     - vLLM built-in FlashInfer version: `0.6.8.post1`.
+     - Timings use CUDA events around kernel run only. FlashInfer `plan()`
+       time is recorded separately because vLLM normally plans once per
+       attention batch, not once per layer.
+
+     Paged-prefix results, common page size 16 unless noted:
+
+     | case | FA2 | FlashInfer | winner |
+     | --- | ---: | ---: | ---: |
+     | 9B TP1 shape, `M=8192,N=32768,Hq=16,Hkv=4,D=256` | `102.50 ms` | `94.04 ms` | FlashInfer `1.09x` |
+     | 27B TP2 shape, `M=8192,N=32768,Hq=12,Hkv=2,D=256` | `77.47 ms` | `71.17 ms` | FlashInfer `1.09x` |
+     | 35B TP2 shape, `M=8192,N=32768,Hq=8,Hkv=1,D=256` | `52.71 ms` | `47.80 ms` | FlashInfer `1.10x` |
+     | 27B TP2 shape, same but page size 64 | `77.06 ms` | `71.32 ms` | FlashInfer `1.08x` |
+     | 27B TP2 long chunk, `M=16384,N=65536,Hq=12,Hkv=2,D=256` | `308.89 ms` | `286.32 ms` | FlashInfer `1.08x` |
+
+     Dense/ragged no-prefix results:
+
+     | case | FA2 | FlashInfer | winner |
+     | --- | ---: | ---: | ---: |
+     | 9B TP1 dense `L=8192,Hq=16,Hkv=4,D=256` | `14.77 ms` | `13.63 ms` | FlashInfer `1.08x` |
+     | 27B TP2 dense `L=8192,Hq=12,Hkv=2,D=256` | `10.43 ms` | `10.37 ms` | near tie |
+     | 35B TP2 dense `L=8192,Hq=8,Hkv=1,D=256` | `7.17 ms` | `7.26 ms` | near tie, FA2 `1.01x` |
+     | 27B TP2 dense `L=16384,Hq=12,Hkv=2,D=256` | `40.60 ms` | `40.71 ms` | near tie, FA2 `1.00x` |
+
+     Correctness:
+     - Paged-prefix FA2 vs FlashInfer produced `maxdiff=3.05e-05` and mean
+       diff about `2.6e-06` to `3.0e-06` in the timed cases.
+     - Dense/ragged FA2 vs FlashInfer produced `maxdiff=0.001953125`; this is
+       an implementation/arithmetic-order difference, not used as Type-A
+       evidence.
+
+     Interpretation:
+     - On Ada/SM89, FlashInfer is modestly stronger for paged-prefix prefill:
+       about `+8%` to `+10%` across the Qwen-like D=256 cases tested.
+     - For no-prefix dense prefill, FlashInfer and FA2 are basically tied
+       except the 9B-like 8K point, where FlashInfer was about `+8%`.
+     - This does not justify porting FlashInfer as the V100 production path:
+       SM70 support and real hybrid block sizes remain blockers. It does
+       justify using FlashInfer as an algorithmic reference for paged-prefix
+       planning and metadata layout, while continuing the local Flash-V100
+       prefix optimization.
+
+## 2026-06-18 Compressed-Tensors FP4 Status
+
+### NVFP4 SM70 TurboMind W4A16 dense path
+
+Status: `validation-needed`
+
+Implementation summary:
+
+- Added an explicit `VLLM_SM70_NVFP4_TURBOMIND=1` gate. The default remains
+  off.
+- SM70 exact-device route now mirrors the AWQ/FP8/MXFP4 pattern: prepare the
+  packed FP4 weight and block scales into TurboMind layout, store them under
+  `_sm70_turbomind_linear`, clear the original checkpoint `weight` and
+  `weight_scale` parameters, and call a C++ TurboMind GEMM op at runtime.
+- This is intentionally W4A16 on V100. It does not claim native W4A4/NVFP4
+  activation quantization on SM70.
+- The previous full-weight fp16 pre-dequant/emulation route is not acceptable
+  as SM70 NVFP4 evidence because it expands memory and does not match the AWQ
+  or FP8 TurboMind route shape.
+
+Touched implementation anchors:
+
+- `vllm/model_executor/layers/quantization/compressed_tensors/schemes/compressed_tensors_w4a4_nvfp4.py`
+- `vllm/model_executor/layers/quantization/sm70_turbomind.py`
+- `vllm/_sm70_ops.py`
+- `vllm/envs.py`
+- `csrc/sm70_turbomind/ops/awq_sm70_gemm.cu`
+- `csrc/sm70_turbomind/lmdeploy/src/turbomind/kernels/gemm/arch/config_sm70_s884.h`
+- `csrc/sm70_turbomind/lmdeploy/src/turbomind/kernels/gemm/kernel/sm70_884_4.cu`
+- `csrc/ops.h`
+- `csrc/torch_bindings.cpp`
+
+Validation evidence:
+
+- `_C` build passed with the SM70 TurboMind NVFP4 ops registered:
+  `nvfp4_sm70_prepare` and `nvfp4_gemm_sm70_out`.
+- Op-level V100 smoke passed for `M=16,K=128,N=128,group=16`:
+  `tm_weight=(128,16) int32`, `tm_scales=(8,128) fp16`,
+  `max_abs_err=0.0001220703125`, `mean_abs_err=5.960464477539063e-08`,
+  `torch.allclose(atol=0.25, rtol=0.05)=True` against a Python FP4-decode
+  reference.
+- 27B route smoke, TP2 V100 GPUs 1/2, non-eager:
+  `bench_results/nvfp4_mxfp4_27b_20260618/json/nvfp4_27b_tp2_smoke_in32_out4.json`
+  and log
+  `bench_results/nvfp4_mxfp4_27b_20260618/logs/nvfp4_27b_tp2_smoke_in32_out4.log`.
+  Route evidence includes `enforce_eager=false`,
+  `nvfp4_turbomind_effective=true`, and
+  `SM70 compressed-tensors NVFP4 TurboMind W4A16 dense path enabled`.
+  Model loading used `10.97 GiB` per worker and generated 4 tokens.
+- 27B speed sample, TP2 V100 GPUs 1/2, non-eager with CUDA graph enabled:
+  `bench_results/nvfp4_mxfp4_27b_20260618/json/nvfp4_27b_tp2_input128_out32.json`
+  and log
+  `bench_results/nvfp4_mxfp4_27b_20260618/logs/nvfp4_27b_tp2_input128_out32.log`.
+  Command shape: Qwen3.5-27B-NVFP4, `tensor_parallel_size=2`,
+  `dtype=half`, `max_model_len=256`, `max_num_batched_tokens=192`,
+  `input_len=128`, `output_len=32`, `warmup=1`, `repeat=3`,
+  `ignore_eos=true`, `enforce_eager=false`. The log shows
+  `mode=VLLM_COMPILE`, `cudagraph_mode=FULL_AND_PIECEWISE`, graph capture
+  completion, and the NVFP4 TurboMind route log. Pure steady decode:
+  `52.387969`, `52.304605`, `52.365223 tok/s`;
+  mean `52.352599 tok/s`. Mean prefill/TTFT portion was `0.127920 s`.
+
+Remaining acceptance work:
+
+- Independent subagent review is still pending; the first attempt failed due
+  to agent usage limit before producing findings. Do not treat this entry as
+  satisfying the user's subagent acceptance requirement.
+- Add a model-quality comparison/gate for NVFP4 if this route is considered
+  for default enablement.
+- Keep the gate default-off until review and quality evidence pass.
+
+### MXFP4 status note
+
+Status: `accepted-route-smoke-speed-subagent`
+
+Implementation summary:
+
+- Current local MXFP4 route follows the prepare-plus-TurboMind-GEMM pattern and
+  is not a full fp16 pre-dequant path.
+- The SM70 exact-device route prepares `weight_packed` plus MXFP4 block scales
+  into TurboMind layout, stores them under `_sm70_turbomind_linear`, clears the
+  original checkpoint tensors, and calls the C++ TurboMind GEMM op at runtime.
+- This is a V100 W4A16 route for compressed-tensors MXFP4 weights.
+
+Validation evidence:
+
+- `_C` exposes the SM70 TurboMind MXFP4 ops:
+  `mxfp4_sm70_prepare` and `mxfp4_gemm_sm70_out`.
+- Op-level V100 smoke passed for `M=16,K=128,N=128,group=32` against a Python
+  FP4 E2M1 plus MX scale reference: `tm_weight=(128,16) int32`,
+  `tm_scales=(4,128) uint8`, `max_abs_err=0.0`, `mean_abs_err=0.0`.
+- 27B route smoke, TP2 V100 GPUs 1/2, non-eager:
+  `bench_results/nvfp4_mxfp4_27b_20260618/json/mxfp4_27b_tp2_smoke_in32_out4.json`
+  and log
+  `bench_results/nvfp4_mxfp4_27b_20260618/logs/mxfp4_27b_tp2_smoke_in32_out4.log`.
+  Route evidence includes `enforce_eager=false`,
+  `mxfp4_turbomind_effective=true`, and
+  `SM70 compressed-tensors MXFP4 TurboMind dense path enabled`. Model loading
+  used `18.26 GiB` per worker and generated 4 tokens.
+- 27B speed sample, TP2 V100 GPUs 1/2, non-eager with CUDA graph enabled:
+  `bench_results/nvfp4_mxfp4_27b_20260618/json/mxfp4_27b_tp2_input128_out32.json`
+  and log
+  `bench_results/nvfp4_mxfp4_27b_20260618/logs/mxfp4_27b_tp2_input128_out32.log`.
+  Command shape: Qwen3.5-27B-MXFP4, `tensor_parallel_size=2`,
+  `dtype=half`, `max_model_len=256`, `max_num_batched_tokens=192`,
+  `input_len=128`, `output_len=32`, `warmup=1`, `repeat=3`,
+  `ignore_eos=true`, `enforce_eager=false`. The log shows
+  `mode=VLLM_COMPILE`, `cudagraph_mode=FULL_AND_PIECEWISE`, graph capture
+  completion, and the MXFP4 TurboMind route log. Pure steady decode:
+  `41.283211`, `41.244299`, `41.265769 tok/s`;
+  mean `41.264427 tok/s`. Mean prefill/TTFT portion was `0.116895 s`.
+
+Remaining acceptance work:
+
+- Independent subagent review passed on 2026-06-18. The reviewer found no
+  blocking issues and accepted the route, smoke, speed, and documentation
+  evidence.
+- Non-blocking risk: MXFP4 prepare is not a runtime fp16 full-predequant path,
+  but it still creates transient load-time buffers while converting packed FP4
+  weights into TurboMind layout. This can raise peak load memory and should be
+  watched when moving to larger MXFP4 models.
+- The earlier 27B MXFP4 TP4 run only proved load/route hit; generation hit a
+  shared-memory broadcast wait and produced no valid decode JSON. It must not
+  be counted as speed evidence.
+
+### Gemma4 31B NVFP4 first route check
+
+Status: `route-smoke-speed-quality-smoke-passed`
+
+Model and dependency notes:
+
+- Downloaded `RedHatAI/gemma-4-31B-it-NVFP4` to
+  `/home/ymzx/models/gemma-4-31B-it-NVFP4`. This checkpoint is
+  compressed-tensors `nvfp4-pack-quantized`, has `model_type=gemma4`, and is
+  `21.67 GiB`.
+- The previous environment dependency `transformers==4.57.6` did not recognize
+  `model_type=gemma4` and also failed on the Gemma4 tokenizer
+  `extra_special_tokens` schema. Upgraded the local `vllm-0.0.5-t210`
+  environment to `transformers==5.12.1`, which recognizes `Gemma4Config` and
+  loads the tokenizer.
+
+Validation evidence:
+
+- First TP2 attempt with `gpu_memory_utilization=0.82` reached vLLM engine
+  initialization but failed the startup memory reservation check:
+  `25.33 GiB` free was below the requested `26.02 GiB`.
+- TP2 route smoke passed on V100 GPUs 1/2 with `gpu_memory_utilization=0.75`,
+  `dtype=half`, `max_model_len=256`, `max_num_batched_tokens=64`,
+  `input_len=32`, `max_tokens=4`, `ignore_eos=true`, and
+  `enforce_eager=false`.
+- JSON:
+  `bench_results/gemma4_31b_20260618/json/gemma4_31b_nvfp4_tp2_smoke_in32_out4_mem075.json`.
+  Log:
+  `bench_results/gemma4_31b_20260618/logs/gemma4_31b_nvfp4_tp2_smoke_in32_out4_mem075.log`.
+- Route evidence includes `Resolved architecture: Gemma4ForConditionalGeneration`,
+  Gemma4 forcing `TRITON_ATTN` for heterogeneous head dimensions,
+  `SM70 compressed-tensors NVFP4 TurboMind W4A16 dense path enabled`,
+  `nvfp4_turbomind_effective=true`, and `total_output_tokens=4`.
+  Model loading used `11.76 GiB` per worker and took `13.426309 s`;
+  full engine load was `34.920535 s`.
+- First non-eager TP2 speed attempt with the default custom all-reduce reached
+  CUDA graph profiling, then failed in `custom_all_reduce.cuh:578` with
+  `invalid argument`. Do not count that run as speed evidence.
+- Accepted speed samples therefore set `disable_custom_all_reduce=true`, using
+  runtime TP communication backend `['PYNCCL']`. Both samples kept
+  `enforce_eager=false`, `dtype=half`, `VLLM_SM70_NVFP4_TURBOMIND=1`,
+  text-only Gemma4 engine args, CUDA graph capture, and
+  `nvfp4_turbomind_effective=true`.
+- Decode-focused speed sample: `input_len=128`, `output_len=32`,
+  `max_model_len=192`, `max_num_batched_tokens=128`,
+  `gpu_memory_utilization=0.55`, warmup 1, repeat 3. JSON:
+  `bench_results/gemma4_31b_20260618/json/gemma4_31b_nvfp4_tp2_input128_out32_mem055_nccl.json`.
+  Log:
+  `bench_results/gemma4_31b_20260618/logs/gemma4_31b_nvfp4_tp2_input128_out32_mem055_nccl.log`.
+  Results: steady decode mean `45.220961 tok/s`
+  (`[45.207258, 45.232795, 45.222830]`), output TPS mean
+  `42.390435 tok/s`, TPOT mean `0.022114 s`, prefill mean
+  `0.068696 s` for 128 prompt tokens (`1863.27 prompt tok/s`), first-token
+  latency mean `0.069104 s`, and engine load `67.220902 s`.
+- Prefill-focused speed sample: `input_len=512`, `output_len=8`,
+  `max_model_len=640`, `max_num_batched_tokens=512`,
+  `gpu_memory_utilization=0.55`, warmup 1, repeat 3. JSON:
+  `bench_results/gemma4_31b_20260618/json/gemma4_31b_nvfp4_tp2_input512_out8_mem055_nccl.json`.
+  Log:
+  `bench_results/gemma4_31b_20260618/logs/gemma4_31b_nvfp4_tp2_input512_out8_mem055_nccl.log`.
+  Results: prefill mean `0.103900 s` for 512 prompt tokens
+  (`4927.82 prompt tok/s`), first-token latency mean `0.104570 s`,
+  steady decode mean `40.184508 tok/s`
+  (`[36.275510, 42.171057, 42.106958]`), output TPS mean
+  `28.640214 tok/s`, TPOT mean `0.025010 s`, and engine load
+  `109.228980 s`. The first repeat still saw a Triton attention JIT spike;
+  repeats 2/3 are the cleaner steady-decode signal for this shape.
+- Quality gate, thinking enabled: TP2 V100 GPUs 1/2, non-eager CUDA graph,
+  `VLLM_SM70_NVFP4_TURBOMIND=1`, `disable_custom_all_reduce=true`,
+  `language_model_only=true`, `skip_mm_profiling=true`, text-only multimodal
+  limits, `max_model_len=1024`, `max_num_batched_tokens=512`,
+  `gpu_memory_utilization=0.55`, `quality_max_tokens=384`, official
+  `generation_config` sampling with seed `20260618`, and a greedy
+  determinism double-run. JSON:
+  `bench_results/gemma4_31b_20260618/quality/gemma4_31b_nvfp4_quality_tp2.json`.
+  Log:
+  `bench_results/gemma4_31b_20260618/quality/gemma4_31b_nvfp4_quality_tp2.log`.
+  Results: `quality_passed=true`, `deterministic_exact=true`,
+  no repeated-window, bad-marker, long digit-run, or same-token-run failures
+  across `code_macos`, `code_snake`, `long_story_review`, and
+  `structured_design`. This mode emits `<|channel>thought` content, so it is
+  route/degeneration evidence, not final user-output evidence.
+- Quality gate, thinking disabled: same TP2/non-eager route with
+  `--disable-thinking` and `gpu_memory_utilization=0.75`. JSON:
+  `bench_results/gemma4_31b_20260618/quality/gemma4_31b_nvfp4_quality_tp2_nothink.json`.
+  Log:
+  `bench_results/gemma4_31b_20260618/quality/gemma4_31b_nvfp4_quality_tp2_nothink.log`.
+  Results: `quality_passed=true`, `deterministic_exact=true`,
+  `enable_thinking=false`, no quality-gate failures across all four prompts,
+  and deterministic greedy hashes matched:
+  `f061951d993100d86d72e70a2b8e8d065d9ef6d4764d502f4f87158422bc2385`.
+  The generated previews are normal final Chinese/code outputs rather than
+  `<|channel>thought`. Speed sidecar in this same run:
+  prefill `0.072834 s` for 128 tokens (`1757.42 tok/s`) and steady decode
+  `44.386287 tok/s`.
+- Same-model AWQ reference checks:
+  `bench_results/gemma4_31b_20260618/quality/gemma4_31b_awq_quality_tp2_ref.json`
+  passed with thinking enabled (`quality_passed=true`,
+  `deterministic_exact=true`). The no-thinking AWQ reference
+  `bench_results/gemma4_31b_20260618/quality/gemma4_31b_awq_quality_tp2_ref_nothink.json`
+  had all four business prompts pass the degeneration gates, but
+  `deterministic_exact=false` for the greedy double-run, so it is useful only
+  as a content/template sanity check, not as a deterministic oracle for NVFP4.
+- A no-thinking NVFP4 retry with `gpu_memory_utilization=0.55` failed before
+  generation because unrelated Qwen runs occupied GPUs 1/2 and KV-cache
+  initialization reported no available cache memory. Do not count that failed
+  run as quality evidence.
+
+Remaining acceptance work:
+
+- The runtime emitted an NVFP4 warning that parallel layers such as
+  q/k/v projections have different global scales. The end-to-end quality smoke
+  above did not show visible degeneration and greedy NVFP4 was deterministic,
+  but this warning is still a quantization-accuracy caveat until a BF16
+  full-model reference, shared-scale NVFP4 checkpoint, or external eval set is
+  available.
+- If production Gemma4 TP2 is expected to use the local custom all-reduce path,
+  debug the `custom_all_reduce.cuh:578` failure separately. Current Gemma4 31B
+  NVFP4 speed evidence uses NCCL/PYNCCL for hidden-state all-reduce.
+
+### 2026-06-18 27B-AWQ no-MTP FlashQLA row-strided decode gap fix
+
+Status: `implemented-speed-smoke-passed`
+
+Problem:
+
+- The AWQ TurboMind dense GEMM kernel tuning showed kernel-level speedup, but
+  end-to-end TPOT did not improve proportionally.
+- The missing piece was not QLA avoidance. The real no-MTP decode path slices
+  `mixed_qkv` out of a wider `qkvz` projection buffer, so the logical
+  `[tokens, qkv_dim]` tensor has `stride(0) > qkv_dim`.
+- The FlashQLA SM70 CUDA kernel already indexes by `mixed_qkv.stride(0)`, but
+  the Python/C++ validators and the vLLM route treated only compact contiguous
+  tensors as first-class valid input. That forced or encouraged compacting the
+  projection slice in the hot path and made JIT/capture/copy work eat the
+  kernel-level gain.
+
+Implementation:
+
+- `FlashQLA` now validates `mixed_qkv` as row-major, not necessarily compact:
+  `dim == 2`, `stride(1) == 1`, and `stride(0) >= logical_width`.
+- The SM70 FlashQLA extension name was bumped to force a fresh torch extension
+  cache after the contract change.
+- vLLM GDN decode routing now classifies `mixed_qkv` as `compact`,
+  `row_strided`, or `unsupported`, and FlashQLA decode accepts both compact and
+  row-strided layouts.
+- The old no-MTP decode fallback that compacted non-contiguous `mixed_qkv`
+  before FlashQLA has been removed from the target path.
+- FlashQLA decode warmup defaults on and warms both compact and qkvz-slice
+  row-strided shapes for `tokens in (1, 2)`, so the first real request does not
+  pay this JIT/capture tax.
+- Qwen3Next pipeline-rank checks are cached on the model object so CUDA graph
+  capture does not branch through a dynamic PP group query and hit the previous
+  `NoneType` `intermediate_tensors` failure.
+
+Validation:
+
+- Unit route test passed on V100:
+  `FlashQLA/tests/test_sm70_decode_strided.py` compares compact vs row-strided
+  `mixed_qkv` for `tokens=1` and `tokens=2`.
+- `py_compile` passed for the touched vLLM and FlashQLA Python files.
+- `git -C vllm diff --check` passed.
+- `ruff` is not installed in `vllm-0.0.5-t210`, so no ruff result is recorded
+  for this patch.
+
+End-to-end evidence:
+
+- Short CUDA graph smoke, Qwen3.6-27B-AWQ TP2 no-MTP, `input_len=128`,
+  `output_len=8`, `CUDA_VISIBLE_DEVICES=0,3`, AWQ, Flash-V100,
+  FlashQLA decode, `gpu_memory_utilization=0.5`:
+  - JSON:
+    `bench_results/awq_qla_strided_20260618/json/27b_awq_tp2_graph_smoke_i128_o8_mem05.json`
+  - Log:
+    `bench_results/awq_qla_strided_20260618/logs/27b_awq_tp2_graph_smoke_i128_o8_mem05.log`
+  - Result: `steady_decode_tps_mean=52.364051`, `tpot_seconds_mean=0.019097`.
+  - Route evidence: `SM70 AWQ TurboMind dense path enabled`,
+    `SM70 FlashQLA GDN decode route enabled`, graph capture finished, and real
+    decode hit `mixed_layout=row_strided` with `mixed_stride=(8192, 1)`.
+- Longer decode sample, Qwen3.6-27B-AWQ TP2 no-MTP, `input_len=4096`,
+  `output_len=256`, `CUDA_VISIBLE_DEVICES=0,3`,
+  `VLLM_SM70_AWQ_TUNE_SMALL_SHAPES=1`, CUDA graph on:
+  - JSON:
+    `bench_results/awq_qla_strided_20260618/json/27b_awq_tp2_graph_i4096_o256_awqtune.json`
+  - Log:
+    `bench_results/awq_qla_strided_20260618/logs/27b_awq_tp2_graph_i4096_o256_awqtune.log`
+  - Result: `steady_decode_tps_mean=52.837135`, `tpot_seconds_mean=0.018926`,
+    `prefill_time_mean=2.866176`, `decode_time_mean=4.826151`.
+  - Route evidence: CUDA graph `FULL_AND_PIECEWISE`, graph capture finished in
+    `114 s`, AWQ TurboMind dense path and AWQ warmup hit, FlashQLA decode hit
+    `stage=packed_explicit decision=take` with `mixed_layout=row_strided` and
+    `row_stride=8192`.
+
+Conclusion:
+
+- The QLA path was not bypassed. The working fix is to preserve the projection
+  slice layout as row-strided all the way into FlashQLA and warm that exact
+  shape before CUDA graph capture.
+- This preserves the AWQ kernel-level tuning while removing the specific
+  event-gap source caused by compacting/JITing the real decode layout.
+- Treat this as no-MTP 27B-AWQ TP2 evidence only. MTP and 35B-A3B still need
+  separate same-criterion validation.
+
+### 2026-06-18 27B-AWQ no-MTP AWQ split-count-only E2E check
+
+Status: `speed-evidence-positive-but-partial`
+
+Purpose:
+
+- Verify whether the AWQ dense kernel tuning is actually entering CUDA graph
+  replay, and whether avoiding full default-split preservation reflects in
+  no-MTP TPOT.
+
+Dispatch evidence:
+
+- Focused `TM_GEMM_TRACE_FILTER=sm70_f16_u4k128_f16_tnt_fff_1x` run:
+  `bench_results/awq_event_gap_20260618/logs/splitcount_i512_o32_tp2_graph_m1trace_mem05.log`.
+- During warmup, all four `m=1` AWQ dense shapes used
+  `measure|preserve_default_split_count`.
+- During CUDA graph capture/replay, the same `m=1` shapes used
+  `reuse|preserve_default_split_count`.
+- Representative tuned kernel:
+  `sm70_f16_u4k128_f16_tnt_ibb_8x256x64_2_1x1_s884_1x4x1_mgroup_c8x256_a1x1x64_01`.
+- This proves the tuned AWQ kernel is present in graph capture/replay; the
+  remaining E2E shortfall is not because graph replay silently fell back to the
+  default AWQ dispatch.
+
+Same-card A/B evidence:
+
+- Model/config: Qwen3.6-27B-AWQ, TP2, no-MTP, CUDA graph
+  `FULL_AND_PIECEWISE`, Flash-V100, FlashQLA decode, input 512, output 128,
+  repeat 2, GPUs 1/2, `gpu_memory_utilization=0.5`.
+- Default AWQ dispatch:
+  `bench_results/awq_event_gap_20260618/json/ab_default_i512_o128_tp2_graph_mem05_r2_gpu12.json`.
+  Mean TPOT `18.706227 ms`, steady decode `53.458135 tok/s`,
+  decode time `2.375691 s`.
+- Tuned split-count-only AWQ dispatch:
+  `bench_results/awq_event_gap_20260618/json/ab_splitcount_i512_o128_tp2_graph_mem05_r2_retry2.json`.
+  Mean TPOT `18.205076 ms`, steady decode `54.929736 tok/s`,
+  decode time `2.312045 s`.
+- Delta: TPOT improved by `0.501151 ms/token` (`2.679%`), steady decode
+  throughput improved by `2.753%`, and decode time improved by `63.646 ms`
+  over 127 steady decode tokens.
+
+Interpretation:
+
+- `VLLM_SM70_AWQ_PRESERVE_DEFAULT_SPLITS=1` is too conservative for speed
+  acceptance because it preserves the default kernel, not just the default
+  split count.
+- `VLLM_SM70_AWQ_PRESERVE_DEFAULT_SPLITS_ONLY=1` is the current graph-safe
+  speed lane: it keeps the default split count to avoid changing fp16 reduction
+  order, while allowing the measured tuned kernel to be reused in graph replay.
+- The E2E improvement is real but smaller than the AWQ GEMM-only improvement,
+  because the non-AWQ decode floor remains large: FlashQLA/GDN, attention,
+  custom all-reduce, sampler/output-copy, and graph replay scheduling still
+  account for the rest of TPOT.
+
+Next steps:
+
+- Run same-card NSYS for default vs split-count-only to split replay time into
+  AWQ GEMM, FlashQLA/GDN, attention, all-reduce, sampler/output-copy, and idle
+  gaps.
+- Keep split-count-only explicit until a no-MTP quality gate confirms that
+  changing the AWQ dense kernel while preserving split count is numerically
+  acceptable.
+
+### 2026-06-18 27B-AWQ no-MTP graph/event gap root-cause update
+
+Status: `kernel-speed-not-yet-dominant-in-e2e`
+
+Same-card NSYS A/B evidence:
+
+- Model/config: Qwen3.6-27B-AWQ, TP2, no-MTP, CUDA graph
+  `FULL_AND_PIECEWISE`, Flash-V100, FlashQLA decode, input 512, output 128,
+  repeat 1 under NSYS, GPUs 1/2, `gpu_memory_utilization=0.5`.
+- Reports:
+  `bench_results/awq_event_gap_20260618/nsys/default_i512_o128_tp2_graph_gpu12.nsys-rep`
+  and
+  `bench_results/awq_event_gap_20260618/nsys/splitcount_i512_o128_tp2_graph_gpu12.nsys-rep`.
+- Profiled default dispatch:
+  `bench_results/awq_event_gap_20260618/json/nsys_default_i512_o128_tp2_graph_gpu12.json`.
+  Mean TPOT `19.501671 ms`, steady decode `51.277658 tok/s`,
+  decode time `2.476712 s`.
+- Profiled split-count-only dispatch:
+  `bench_results/awq_event_gap_20260618/json/nsys_splitcount_i512_o128_tp2_graph_gpu12.json`.
+  Mean TPOT `19.077365 ms`, steady decode `52.418140 tok/s`,
+  decode time `2.422825 s`.
+
+GPU cluster evidence:
+
+- Stable decode clusters were detected after excluding prefill/first-token
+  activity.
+- Default dispatch: 126 stable decode GPU clusters, median active cluster span
+  `2.249890 ms`, median summed kernel duration across both ranks
+  `4.266479 ms`, and median inter-cluster idle/control gap `17.256706 ms`.
+- Split-count-only dispatch: 126 stable decode GPU clusters, median active
+  cluster span `2.251710 ms`, median summed kernel duration across both ranks
+  `4.261462 ms`, and median inter-cluster idle/control gap `16.767165 ms`.
+- The visible GPU work per token is only about `2.25 ms` of wall time in this
+  CUDA graph profile, while the token-to-token gap is about `16.8-17.3 ms`.
+  This is why a kernel-only win can be largely hidden at the TPOT level.
+
+Kernel bucket evidence:
+
+- In this graph-safe split-count-only profile, the visible TurboMind GEMM bucket
+  did not materially change:
+  - default TurboMind GEMM: `1.503356 ms/token`;
+  - split-count-only TurboMind GEMM: `1.503001 ms/token`.
+- Other major buckets were also effectively stable:
+  - CUTLASS GEMM: `2.043427 -> 2.045063 ms/token`;
+  - all-reduce/NCCL bucket: `0.194556 -> 0.178753 ms/token`;
+  - FlashQLA/GDN: `0.079508 -> 0.079459 ms/token`;
+  - Flash-V100 attention: `0.055763 -> 0.055720 ms/token`.
+- Therefore the earlier large kernel-level AWQ improvement should be treated as
+  evidence for the unconstrained/tuned kernel lane, not as evidence that the
+  current graph-safe split-count-only full decode path already reduced the
+  visible AWQ bucket by the same amount.
+
+CUDA API/event evidence:
+
+- Default profiled run:
+  - CUDA API window: `2762.548 ms`;
+  - `cudaEventSynchronize`: `2555.026 ms` total over 388 calls,
+    p95 `19.248 ms`, max `120.284 ms`;
+  - `cudaGraphLaunch`: 254 calls, `190.188 ms` total, median `0.740 ms`.
+- Split-count-only profiled run:
+  - CUDA API window: `2713.122 ms`;
+  - `cudaEventSynchronize`: `2459.991 ms` total over 388 calls,
+    p95 `18.672 ms`, max `89.561 ms`;
+  - `cudaGraphLaunch`: 254 calls, `215.634 ms` total, median `0.842 ms`.
+- The long events are not a separate CUDA kernel. They are the host-visible
+  wait point where the CPU must observe the previous decode result before it
+  can drive the next step.
+
+Negative-path checks:
+
+- Disabling async scheduling was worse:
+  `bench_results/awq_event_gap_20260618/json/noasync_default_i512_o128_tp2_graph_mem05_r1_gpu12.json`.
+  Mean TPOT `22.178255 ms`, steady decode `45.089210 tok/s`,
+  decode time `2.816638 s`.
+  The long wait moved to `GPUModelRunner.transfer_event.synchronize`, typically
+  about `16.7-17.1 ms`.
+- Using no-compile decode CUDA graph was also worse:
+  `bench_results/awq_event_gap_20260618/json/nocompile_default_i512_o128_tp2_graph_mem05_r1_gpu12.json`.
+  Mean TPOT `22.541941 ms`, steady decode `44.361753 tok/s`,
+  decode time `2.862826 s`.
+  The long wait remained on
+  `AsyncGPUModelRunnerOutput.async_copy_ready_event.synchronize`, typically
+  about `20-21 ms`.
+- A benchmark-only fake async output-token probe was also worse. It skipped the
+  CPU-visible sampled-token D2H wait by returning a dummy CPU token to the
+  scheduler while keeping the real sampled token on GPU for the next decode
+  input:
+  `bench_results/awq_event_gap_20260618/json/fake_default_i512_o32_tp2_graph_mem05_smoke_gpu23.json`.
+  The probe hit the guarded route, but mean TPOT was `22.305240 ms` and steady
+  decode was `44.832515 tok/s`.
+- The same-card normal o32 control was faster:
+  `bench_results/awq_event_gap_20260618/json/normal_default_i512_o32_tp2_graph_mem05_smoke_gpu23.json`.
+  Mean TPOT `18.640653 ms`, steady decode `53.646190 tok/s`.
+  Therefore the gap is not solved by hiding only the sampled-token CPU copy or
+  by returning fake CPU tokens; doing so perturbs the scheduler/output contract
+  without removing the real per-token control dependency.
+
+Conclusion:
+
+- The current fastest tested full path is still async scheduling plus the
+  compile-graph CUDA graph route.
+- The remaining E2E shortfall is not explained by FlashQLA being bypassed, and
+  it is not caused by a direct AWQ/QLA kernel conflict. FlashQLA decode is
+  taking the row-strided route.
+- The current blocker is the single-request no-MTP decode dependency chain:
+  after each token, vLLM still needs a host-visible sampled-token/result update
+  before the scheduler can issue the next token. That CPU/control/event
+  roundtrip dominates TPOT in this benchmark.
+
+Source-level anchors:
+
+- `vllm/v1/worker/gpu_model_runner.py`: `AsyncGPUModelRunnerOutput.get_output`
+  waits on `AsyncGPUModelRunnerOutput.async_copy_ready_event.synchronize`
+  before materializing CPU-side `sampled_token_ids` for the scheduler.
+- `vllm/v1/worker/gpu_model_runner.py`: async scheduling already caches
+  `prev_sampled_token_ids` on GPU and `_prepare_input_ids` can feed those GPU
+  tokens into the next model step without a scheduler roundtrip back to the
+  worker. This means the large gap is not a simple "copy token back to GPU"
+  problem.
+- `vllm/v1/engine/core.py`: `step_with_batch_queue` can queue the next batch
+  before blocking on the previous result, but single-request no-MTP still has
+  to call `scheduler.update_from_output` once per generated token.
+- `vllm/v1/core/sched/scheduler.py`: `update_from_output` consumes
+  `sampled_token_ids` to update request output tokens, stop/EOS state,
+  structured output, logprobs, routed experts, and cache accounting.
+  Therefore delaying the event wait only moves the block point unless the
+  scheduler contract is changed to accept multi-token progress per host update.
+
+Development direction:
+
+- Keep async scheduling and the compile-graph CUDA graph route as the baseline.
+- Do not make split-count-only the default yet. It has a small positive E2E
+  signal, but still needs a no-MTP quality gate and does not by itself solve
+  the event/control gap.
+- To make future AWQ kernel wins reflect in TPOT, add a no-MTP single-request
+  fast path that keeps the decode loop GPU-resident for multiple steps, or at
+  least defers the CPU-visible token/output update for a fixed number of steps.
+  This must be guarded by correctness constraints: greedy or otherwise
+  GPU-resident sampling, compatible EOS/stop handling, compatible logits
+  processors/penalties, and a clear fallback to the general scheduler path.
+- A benchmark-only first milestone can target fixed-length greedy decode with
+  `ignore_eos`-equivalent behavior, but it must return real generated tokens
+  in batches and update scheduler state consistently. The fake-token shortcut
+  above is not an accepted route.
+
+### 2026-06-18 27B-AWQ no-MTP async queue-depth probe
+
+Status: `implemented-awaiting-empty-gpu-validation`
+
+Purpose:
+
+- Preserve real AWQ/QLA/kernel execution and real generated tokens while
+  reducing the host-visible output collection cadence.
+- Avoid the rejected fake-token route. This probe changes only how many async
+  scheduled batches may be outstanding before EngineCore blocks on the oldest
+  result.
+
+Implementation:
+
+- New default-off environment knob:
+  `VLLM_SM70_ASYNC_SCHEDULING_QUEUE_DEPTH`.
+- Default `0` preserves upstream behavior: TP/no-PP async scheduling uses queue
+  depth `2`.
+- Values greater than `2` override the no-PP async queue depth in the
+  multiproc, uniproc, and ray executors.
+- EngineCore logs
+  `SM70 async scheduling queue depth override active: <depth>` when the knob is
+  active.
+
+Why this is the next real probe:
+
+- Async scheduling already keeps `prev_sampled_token_ids` on GPU, so the next
+  decode step can consume the real sampled token without CPU token feedback.
+- The scheduler already tracks in-flight async work with
+  `num_output_placeholders`, and it has a guard preventing extra scheduling
+  once the request is known to have reached `max_tokens`.
+- Increasing queue depth keeps the scheduler/output contract intact: every
+  token eventually returns as a real sampled token and `update_from_output`
+  still performs normal stop/EOS/cache/accounting work.
+
+Validation plan:
+
+- Same-card Qwen3.6-27B-AWQ TP2 no-MTP CUDA graph A/B, input 512, output 128,
+  `ignore_eos`, `max_num_seqs=1`, Flash-V100, FlashQLA decode.
+- Compare queue depths `2` (default), `4`, and `8`.
+- Acceptance signal for this probe: matching output hash versus default, route
+  logs still showing CUDA graph + FlashQLA + AWQ TurboMind, and TPOT improvement
+  without introducing new event stalls or worker shutdown errors.
+
+### 2026-06-18 27B-AWQ no-MTP dynamic no-preserve fast-lane check
+
+Status: `speed-evidence-positive-guarded`
+
+Purpose:
+
+- Re-check whether the AWQ kernel-level speedup can survive into CUDA graph TPOT
+  when the full default split/kernel preservation is removed.
+- Separate the dynamic measured no-preserve path from the older imported-LUT
+  no-preserve path that produced the large event-gap regression.
+
+Node-trace A/B/C evidence:
+
+- Model/config: Qwen3.6-27B-AWQ, TP2, no-MTP, CUDA graph
+  `FULL_AND_PIECEWISE`, Flash-V100, FlashQLA decode, input 512, output 64,
+  repeat 1 under NSYS `--cuda-graph-trace=node`, GPUs 0/1,
+  `gpu_memory_utilization=0.5`, `VLLM_SM70_ASYNC_SCHEDULING_QUEUE_DEPTH=4`.
+- Default:
+  `bench_results/awq_event_gap_20260618/json/default_qd4_i512_o64_node.json`.
+  TPOT `19.9016 ms`, steady decode `50.2471 tok/s`.
+- Split-count-only:
+  `bench_results/awq_event_gap_20260618/json/splitcount_qd4_i512_o64_node.json`.
+  TPOT `19.4552 ms`, steady decode `51.4002 tok/s`.
+- Dynamic no-preserve, without imported LUT reuse:
+  `bench_results/awq_event_gap_20260618/json/nopreserve_qd4_i512_o64_node.json`.
+  TPOT `18.6672 ms`, steady decode `53.5698 tok/s`.
+- All three runs produced matching output token hash
+  `e70d65dd83d7280a60209e331651b0f8f46443737ddb4b3af633ff6767c577b0`.
+
+Expanded graph-node interpretation:
+
+- The earlier non-node graph trace bucket undercounted graph replay work because
+  CUDA graph execution was not expanded to per-node kernels.
+- With node tracing enabled, the TurboMind GEMM bucket does move in the expected
+  direction:
+  - default: `1862.789 ms` summed over both ranks, about
+    `14.784 ms/token` wall-equivalent;
+  - split-count-only: `1808.205 ms`, about `14.351 ms/token`;
+  - dynamic no-preserve: `1736.569 ms`, about `13.782 ms/token`.
+- The total graph node span also improves from `1535.924 ms` default to
+  `1478.743 ms` dynamic no-preserve for the profiled o64 request.
+
+Full o128 speed validation:
+
+- Dynamic no-preserve command used:
+  `VLLM_SM70_AWQ_TUNE_SMALL_SHAPES=1`,
+  `VLLM_SM70_AWQ_PRESERVE_DEFAULT_SPLITS=0`, and no imported LUT reuse.
+- Output:
+  `bench_results/awq_event_gap_20260618/json/nopreserve_qd4_i512_o128_graph_mem05_gpu01.json`.
+- Result over repeat 2: steady decode `57.681699 tok/s`, TPOT
+  `17.336521 ms`, decode time `2.201738 s`.
+- Same-hash comparison set:
+  - qdepth4 default:
+    `bench_results/awq_event_gap_20260618/json/qdepth4_default_i512_o128_tp2_graph_mem05_gpu23.json`,
+    TPOT `18.6760 ms`, steady decode `53.5446 tok/s`;
+  - qdepth4 split-count-only:
+    `bench_results/awq_event_gap_20260618/json/qdepth4_splitcount_i512_o128_tp2_graph_mem05_gpu23.json`,
+    TPOT `18.1988 ms`, steady decode `54.9486 tok/s`;
+  - dynamic no-preserve:
+    TPOT `17.3365 ms`, steady decode `57.6817 tok/s`.
+- Dynamic no-preserve is therefore `1.3395 ms/token` faster than default
+  (`+7.72%` steady decode throughput) and `0.8623 ms/token` faster than
+  split-count-only (`+4.97%` throughput) on this no-MTP 27B-AWQ TP2 criterion.
+
+Implementation guard:
+
+- The accepted fast lane is dynamic measurement plus graph replay reuse inside the
+  same process, not blindly importing an old GEMM LUT under no-preserve policy.
+- Runtime warmup now skips `VLLM_SM70_GEMM_LUT_PATH` import/export whenever
+  `VLLM_SM70_AWQ_PRESERVE_DEFAULT_SPLITS=0` and
+  `VLLM_SM70_AWQ_PRESERVE_DEFAULT_SPLITS_ONLY=0`.
+- Reason: importing a GEMM LUT seeds the TurboMind dispatch cache. Once the cache
+  is seeded, `Measure` can early-exit on an exact cache hit and `Dispatch` can
+  reuse that imported launch spec even when the higher-level AWQ selector is
+  trying to exercise the dynamic measured lane.
+
+Guard validation:
+
+- Command intentionally set `VLLM_SM70_AWQ_REUSE_IMPORTED_CACHE=1` and pointed
+  `VLLM_SM70_GEMM_LUT_PATH` at the existing
+  `bench_results/nsys_27b_awq_20260618/awq_decode_measured_sm70.lut`, while
+  keeping AWQ no-preserve active.
+- Log:
+  `bench_results/awq_event_gap_20260618/logs/nopreserve_guard_lutreuse_qd4_i512_o64_graph_mem05_gpu01.log`.
+  Both TP ranks logged `Skipping SM70 GEMM LUT import for AWQ no-preserve
+  dispatch` and `Skipping SM70 GEMM LUT export for AWQ no-preserve dispatch`,
+  followed by `SM70 AWQ warmup finished (20 AWQ dense calls...)`.
+- Output:
+  `bench_results/awq_event_gap_20260618/json/nopreserve_guard_lutreuse_qd4_i512_o64_graph_mem05_gpu01.json`.
+  TPOT `17.445690 ms`, steady decode `57.320746 tok/s`, output hash
+  `e70d65dd83d7280a60209e331651b0f8f46443737ddb4b3af633ff6767c577b0`.
+- This confirms the guard preserves the dynamic no-preserve speed lane even when
+  the user accidentally leaves the imported-cache reuse env enabled.
+
+Current rule:
+
+- Do not accept `VLLM_SM70_AWQ_REUSE_IMPORTED_CACHE=1` plus AWQ no-preserve as a
+  speed or quality baseline.
+- Use dynamic no-preserve as the candidate 27B-AWQ no-MTP fast lane:
+  `VLLM_SM70_AWQ_TUNE_SMALL_SHAPES=1`,
+  `VLLM_SM70_AWQ_PRESERVE_DEFAULT_SPLITS=0`, CUDA graph enabled, FlashQLA route
+  intact, and no imported LUT.
+- Before making it default, run a broader deterministic quality gate and record
+  startup/autotune cost. Any future LUT cache acceptance needs policy/build
+  metadata, not the current unversioned import-only cache.
+
+### 2026-06-19 SM70 TurboMind quant dense tuning coverage
+
+Status: `implemented-with-staged-validation`
+
+Purpose:
+
+- Make the small-shape TurboMind GEMM tuning path available to every quant dense
+  route that actually uses the SM70 TurboMind GEMM dispatcher, not only AWQ.
+
+Conclusion:
+
+- This optimization is not AWQ-only. It is a dispatcher-level small-decode
+  dense-GEMM policy and should be exposed to every SM70 TurboMind quant dense
+  route that shares that dispatcher. Current implementation coverage is AWQ,
+  FP8, MXFP4, and NVFP4. Routes that use a different backend/kernel family will
+  not benefit automatically and need a separate integration path.
+
+Source changes:
+
+- FP8 was already on an independent dynamic selector through
+  `select_fp8_dense_dispatch_policy` and
+  `VLLM_SM70_FP8_TUNE_SMALL_SHAPES`, default enabled.
+- MXFP4 and NVFP4 no longer reuse the AWQ dense selector. They now have
+  independent TuneKey lanes:
+  - `TuneKeyKind::kMxfp4Dense`,
+    `select_mxfp4_dense_dispatch_policy`,
+    `VLLM_SM70_MXFP4_TUNE_SMALL_SHAPES`, and
+    `VLLM_SM70_MXFP4_DENSE_TUNE_MAX_M`;
+  - `TuneKeyKind::kNvfp4Dense`,
+    `select_nvfp4_dense_dispatch_policy`,
+    `VLLM_SM70_NVFP4_TUNE_SMALL_SHAPES`, and
+    `VLLM_SM70_NVFP4_DENSE_TUNE_MAX_M`.
+- The SM70 warmup now discovers prepared MXFP4/NVFP4 TurboMind dense layers and
+  warms them before CUDA graph capture, the same way it already warms AWQ and
+  FP8 dense routes.
+- GEMM LUT import/export guard is now dynamic-quant aware. It skips unversioned
+  LUT import/export when the loaded model actually has an AWQ no-preserve, FP8,
+  MXFP4, or NVFP4 dynamic dense route that should measure its own process-local
+  launch specs.
+- Benchmark metadata now records FP8/MXFP4/NVFP4 tune knobs and dense tune
+  max-M values in `sm70_tune_policy` / `sm70_turbomind_policy`.
+
+Current route classification:
+
+- AWQ: proven at 27B-AWQ no-MTP TP2 CUDA graph. Dynamic no-preserve reduces TPOT
+  from `18.6760 ms` to `17.3365 ms` on the same criterion, with matching token
+  hashes for the smoke prompts.
+- FP8: Qwen3.6-27B-FP8 TP2 CUDA graph now shows the dynamic selector reflected
+  in end-to-end decode. With identical prompt/output/token hash, fixed
+  `VLLM_SM70_FP8_TUNE_SMALL_SHAPES=0` measured `42.22 tok/s` steady decode /
+  `23.686 ms` TPOT, while dynamic `=1` measured `44.41 tok/s` steady decode /
+  `22.516 ms` TPOT (`+5.2%` steady decode, `-4.9%` TPOT).
+- NVFP4: now wired to an independent dynamic tuning selector and warmup. A
+  real-weight Gemma-4-31B-it-NVFP4 kernel selector gate passed fixed-vs-dynamic
+  equality on `72` cases. Whole-model token/speed evidence is still pending.
+- MXFP4: now wired to an independent dynamic tuning selector and warmup. No
+  local MXFP4 checkpoint was found during this pass, so only a finite synthetic
+  packed/scales kernel selector gate has run (`36` cases, fixed-vs-dynamic
+  bytes equal). Whole-model token/speed evidence remains pending until a real
+  MXFP4 checkpoint is available.
+
+Validation completed:
+
+- Python compile passed for `vllm/envs.py`,
+  `vllm/model_executor/warmup/awq_sm70_warmup.py`,
+  `benchmarks/benchmark_sm70_decode.py`, and
+  `benchmarks/benchmark_sm70_model_tokens.py`.
+- `git diff --check` passed for the touched C++/Python files.
+- Static dispatch audit:
+  - AWQ dense calls `select_awq_dense_dispatch_policy`;
+  - FP8 dense calls `select_fp8_dense_dispatch_policy`;
+  - MXFP4 dense calls `select_mxfp4_dense_dispatch_policy`;
+  - NVFP4 dense calls `select_nvfp4_dense_dispatch_policy`.
+- FP8 real-weight selector gate:
+  `bench_results/quant_tuning_20260619/fp8_fixed_vs_dynamic_qwen36_27b_after_multi_quant_20260619_004456.json`
+  loaded Qwen3.6-27B-FP8 weights, ran `159` cases across `53` layer prefixes
+  and `m={1,2,8}`, and reported `failures=0`,
+  `max_fixed_vs_dynamic_diff=0.0`.
+- FP4 selector gate:
+  `bench_results/quant_tuning_20260619/fp4_selector_fixed_vs_dynamic_after_multi_quant_finite.json`
+  ran `72` real NVFP4 cases plus `36` finite synthetic MXFP4 cases and reported
+  `failures=0`, `max_fixed_vs_dynamic_diff_nan_to_num=0.0`, `nan_cases=0`.
+- FP8 CUDA graph end-to-end gate:
+  - fixed selector:
+    `bench_results/quant_tuning_20260619/json/fp8_27b_tp2_graph_i128_o64_fixed.json`;
+  - dynamic selector:
+    `bench_results/quant_tuning_20260619/json/fp8_27b_tp2_graph_i128_o64_dynamic.json`.
+  Both used Qwen3.6-27B-FP8, TP2 on V100 GPUs 0/1, Flash-V100 CUDA graph,
+  `input_len=128`, `output_len=64`, no MTP, greedy ignore-EOS, and both
+  produced token hash
+  `ce711a2ba4f07dce52f45cb000ca6f19a6f38714165b7f0b9143850f3e1dff2f`.
+
+Next validation:
+
+- Run same-criterion MXFP4 and NVFP4 model-level CUDA graph decode benchmarks
+  only on models that hit the corresponding TurboMind dense route. FP8 has a
+  first TP2 short-decode proof; it still needs the acceptance-length TP4/longer
+  prompt matrix before calling the overall FP8 route fully recovered.
+- For each route, compare fixed-selector versus dynamic-selector output token
+  hashes first; if token hashes drift, collect logits/top-k margins before using
+  the speed result as accepted evidence.
+
+## 2026-06-19 FP8 speed target changed to AWQ parity
+
+The active FP8 objective is no longer a fixed `70 tok/s` target. The target is
+same-model-family AWQ parity: Qwen3.6 FP8 must be compared against Qwen3.6 AWQ
+under the same GPU set, TP size, prompt/output lengths, scheduler caps,
+attention backend, CUDA graph state, custom all-reduce policy, no-MTP state, and
+sampling parameters. A FP8 candidate is accepted only if its steady-decode TPOT
+is within `+3%` of the paired AWQ run, with `+5%` as the temporary investigation
+threshold, and the FP8 token hash matches the FP8 fixed-selector baseline.
+
+Implementation notes:
+
+- Added an explicit FP8 safe-fast selector lane:
+  `VLLM_SM70_FP8_SAFE_FAST_SELECTOR=1`.
+- The safe-fast lane keeps dynamic FP8 dense selection but applies FP8-specific
+  split preservation controls:
+  `VLLM_SM70_FP8_PRESERVE_DEFAULT_SPLITS` and
+  `VLLM_SM70_FP8_PRESERVE_DEFAULT_SPLITS_ONLY`.
+- The historical dynamic lanes remain diagnostics only:
+  `VLLM_SM70_FP8_TUNE_SMALL_SHAPES=1` and
+  `VLLM_SM70_FP8_0DOT3_DENSE_SELECTOR=1` are not accepted by themselves because
+  prior full-model evidence showed that speed can recover while output hashes
+  drift.
+- Added `benchmarks/benchmark_sm70_awq_fp8_decode_pair.py` to run AWQ and FP8
+  decode benchmarks in paired subprocesses and emit one summary with AWQ TPOT,
+  FP8 TPOT, FP8-over-AWQ percentage, and FP8 hash-equality versus the fixed FP8
+  selector.
+
+First acceptance command shape:
+
+```bash
+CUDA_VISIBLE_DEVICES=<two-empty-v100s> CUDA_DEVICE_ORDER=PCI_BUS_ID \
+  conda run --live-stream -n vllm-t210 \
+  python benchmarks/benchmark_sm70_awq_fp8_decode_pair.py \
+  --tensor-parallel-size 2 \
+  --max-model-len 8192 \
+  --max-num-batched-tokens 8192 \
+  --max-num-seqs 1 \
+  --gpu-memory-utilization 0.5
+```
+
+The default gate runs `i512/o128` and `i128/o512`, keeps CUDA graph enabled by
+not passing `--enforce-eager`, keeps custom all-reduce enabled by not passing
+`--disable-custom-all-reduce`, and compares FP8 `fixed`, `safe_splits`,
+`safe_split_count`, and `dynamic` selectors against the paired AWQ
+`fast_nopreserve` baseline.
+
+NSYS per-token root-cause pass, 2026-06-19:
+
+- Objective: explain why Qwen3.6-27B-FP8 TP2 decode remains slower than the
+  same-model AWQ lane after FP8 dynamic small-shape tuning is enabled.
+- FP8 capture:
+  `bench_results/nsys_awq_fp8_tpot_20260619/fp8_dynamic_qd4_i512_o64_node_gpu12.nsys-rep`
+  and `.sqlite`, Qwen3.6-27B-FP8, TP2, GPUs `1,2`, no-MTP, CUDA graph
+  `FULL_AND_PIECEWISE`, Flash-V100, FlashQLA decode, custom all-reduce,
+  queue depth `4`, `i512/o64`, repeat `1`, NSYS
+  `--capture-range=cudaProfilerApi --cuda-graph-trace=node:host-only`.
+- AWQ comparison:
+  `bench_results/awq_event_gap_20260618/nsys_node/nopreserve_qd4_i512_o64_node.sqlite`,
+  Qwen3.6-27B-AWQ, TP2, no-MTP, CUDA graph, Flash-V100, FlashQLA decode,
+  custom all-reduce, queue depth `4`, `i512/o64`, repeat `1`.
+- End-to-end decode:
+  - AWQ dynamic no-preserve: TPOT `18.6672 ms`, steady decode
+    `53.5698 tok/s`.
+  - FP8 dynamic no-preserve: TPOT `23.5850 ms`, steady decode
+    `42.3998 tok/s`.
+  - FP8 is therefore `+4.9178 ms/token` slower on this shape.
+- NSYS graph-node span:
+  - AWQ kernel span `1478.546 ms`.
+  - FP8 kernel span `1808.926 ms`.
+  - Span delta is `330.380 ms` over `63` steady decode tokens, or
+    `5.244 ms/token`, close to the measured TPOT delta.
+- Kernel-sum wall-equivalent buckets use
+  `sum(kernel_duration over both TP ranks) / 2 / 63`.
+
+| bucket | AWQ ms/token | FP8 ms/token | FP8-AWQ |
+| --- | ---: | ---: | ---: |
+| TurboMind quant GEMM | `12.278` | `19.889` | `+7.611` |
+| custom all-reduce | `1.903` | `2.010` | `+0.107` |
+| Flash-V100 decode attention | `0.968` | `0.957` | `-0.011` |
+| GDN/Flash/prefill/conv kernels | `0.867` | `0.810` | `-0.057` |
+| Triton elementwise/sampling | `1.856` | `1.704` | `-0.151` |
+| CUTLASS/cuBLAS/LM-head-ish kernels | `3.164` | `2.403` | `-0.761` |
+| TurboMind f16 dense | `1.504` | `0.000` | `-1.504` |
+
+Interpretation:
+
+- The FP8 gap is localized to the FP8 TurboMind E4M3 W8A16 dense kernels. The
+  non-GEMM stack is not the root cause: Flash-V100 decode attention, GDN/FLA,
+  sampling/Triton elementwise, and LM-head/cuBLAS buckets are flat or faster in
+  the FP8 trace. Custom all-reduce adds only about `0.107 ms/token`.
+- The dominant FP8 kernels use `Operand_B_Pack<__nv_fp8_e4m3>` and
+  `MMA_Map<8,256,32>`, while the AWQ path uses
+  `Operand_B_Pack<uint4_t>` and usually `MMA_Map<8,256,64>` for the comparable
+  small-decode GEMMs. FP8 therefore reads W8 weights and uses a smaller K tile;
+  this shows up as more expensive graph-node GEMMs rather than scheduler/event
+  gap.
+- Representative grid costs:
+  - AWQ `grid(8,9,2)` totals `3.883 ms/token`, average `60.1 us/kernel`.
+  - FP8 `grid(8,9,2)` totals `3.459 ms/token`, average `106.4 us/kernel`.
+  - FP8 adds another large peer shape, `grid(4,17,2)`, at
+    `3.483 ms/token`, average `107.1 us/kernel`.
+  - AWQ `grid(2,10,7)` averages `28.3 us/kernel`; FP8 `grid(2,10,7)`
+    averages `43.4 us/kernel`.
+- The load-time memory picture matches the kernel diagnosis: AWQ model loading
+  reported `11.13 GiB` on this TP2 lane, while FP8 reported `19.73 GiB` and
+  left only `0.56 GiB` KV cache memory at `gpu_memory_utilization=0.5`.
+
+Conclusion:
+
+- FP8 is not primarily missing QLA, FlashAttention, graph, all-reduce, or
+  selector optimizations. The current gap is the FP8 W8A16 TurboMind GEMM kernel
+  itself versus the AWQ W4A16 TurboMind GEMM kernel.
+- Selector work has already recovered the small available FP8 gain
+  (`~4-5%`). Closing the remaining AWQ-parity gap requires FP8 E4M3 small-M
+  kernel work: reduce W8 dequant/scale overhead, revisit the `K=32` tile policy,
+  improve CTA fill/tail behavior for the high-count decode grids, and validate
+  the new candidates with the same node-trace bucket table plus token/hash
+  checks.
+
+## 2026-06-19 FlashInfer-inspired paged-prefix split-KV prototype
+
+Implemented a default-off Flash-V100 paged-prefill split-KV prototype inspired
+by FlashInfer's planned paged-prefix execution model.
+
+Implementation:
+
+- Added `prefill_paged_splitkv_fwd` to the Flash-V100 extension and Python
+  wrapper `flash_attn_prefill_paged_splitkv`.
+- The partial kernel reuses the existing D=256 FP16 paged-prefill WMMA path but
+  launches `grid.y = num_kv_partitions`; each CTA handles one Q tile and one KV
+  partition, then writes fp32 partial numerator, row max, and row sum.
+- Added a merge kernel that combines partial softmax states and writes the final
+  fp16 output/LSE.
+- vLLM route is gated by default-off envs:
+  `VLLM_FLASH_V100_PREFILL_SPLIT_KV`,
+  `VLLM_FLASH_V100_PREFILL_SPLIT_KV_TOKENS`,
+  `VLLM_FLASH_V100_PREFILL_SPLIT_KV_MIN_Q`,
+  `VLLM_FLASH_V100_PREFILL_SPLIT_KV_MAX_Q`, and
+  `VLLM_FLASH_V100_PREFILL_SPLIT_KV_MIN_KV`.
+- Added diagnostic profiling gate
+  `VLLM_FLASH_V100_PREFILL_CHUNK_PROFILE=1`, which logs q/kv shape, route, and
+  CUDA-event elapsed time for prefix paged calls.
+
+Validation:
+
+- `python -m py_compile` passed for the touched Python files.
+- `CUDA_HOME=/usr/local/cuda TORCH_CUDA_ARCH_LIST=7.0 MAX_JOBS=4 python
+  setup.py build_ext --inplace` passed for `flash-attention-v100`.
+- Small page-16 smoke: `M=128,N=1024,Hq=4,Hkv=1,D=256`, split `512`, produced
+  `grid.y=2`, `reference_max_diff=1.220703125e-4`,
+  `reference_mean_diff=5.6028e-6`.
+- 1-partition fallback on the same shape produced `reference_max_diff=0.0`,
+  confirming wrapper/layout correctness.
+- Real hybrid block smoke: `M=256,N=2112,Hq=4,Hkv=1,D=256,block=528`, split
+  `1056`, produced `grid.y=2`, `reference_max_diff=1.220703125e-4`,
+  `reference_mean_diff=3.9935e-6`.
+
+Kernel timing on V100 GPU0:
+
+| shape | block | baseline | split-KV | split | diff | result |
+| --- | ---: | ---: | ---: | ---: | ---: | --- |
+| 27B-like `4096x32768,Hq=12,Hkv=2,D=256` | 784 | `155.441 ms` | `150.089 ms` | 16K | `3.05e-5` | `+3.6%` |
+| 27B-like `4096x65536,Hq=12,Hkv=2,D=256` | 784 | `312.920 ms` | `307.963 ms` | 16K | `3.05e-5` | `+1.6%` |
+| 27B-like `4096x65536,Hq=12,Hkv=2,D=256` | 784 | `312.920 ms` | `308.767 ms` | 32K | `3.05e-5` | `+1.3%` |
+| small-Q `512x65536,Hq=12,Hkv=2,D=256` | 784 | `51.066 ms` | `42.930 ms` | 16K | `1.53e-5` | `+18.9%` |
+
+Interpretation:
+
+- The split-KV prototype validates the FlashInfer borrowing direction for
+  small-Q/long-KV prefix calls where baseline CTA count is low.
+- It does not solve the main 16K-chunk long-prefill decay path: at
+  `M>=4096`, baseline already has enough CTAs, and the extra global workspace
+  plus merge kernel largely cancels KV-partition parallelism.
+- The nonzero diffs are classified as expected Type-B softmax merge-order drift
+  for now; they still require token/logprob quality gates before any default-on
+  decision.
+- Keep split-KV default-off and, when enabled, default it to small-Q long-KV
+  only (`MAX_Q=2048`). Use `VLLM_FLASH_V100_PREFILL_SPLIT_KV_MAX_Q=0` only for
+  explicit large-Q experiments.
+
+## 2026-06-19 D=256 paged-prefill BLOCK_M=32 experiment
+
+Tested whether increasing the D=256 low-smem paged-prefill Q tile from
+`BLOCK_M=16` to `BLOCK_M=32` can reduce long-prefix K/V rereads for large-Q
+chunked prefill. Added a default-off experiment gate:
+`VLLM_FLASH_V100_PREFILL_D256_BM32=1`.
+
+Validation:
+
+- Flash-V100 extension rebuilt successfully with the BM32 specialization.
+- Same-input correctness smoke, `M=512,N=4096,Hq=12,Hkv=2,D=256,block=784`,
+  BM16 versus BM32: `maxdiff=0.0`, `meandiff=0.0`, `torch.equal=True`.
+
+Kernel timing on V100 GPU0:
+
+| shape | block | BM16 low-smem | BM32 low-smem | result |
+| --- | ---: | ---: | ---: | --- |
+| `4096x65536,Hq=12,Hkv=2,D=256` | 784 | `312.590 ms` | `348.370 ms` | `-10.3%` throughput |
+| `16324x65296,Hq=12,Hkv=2,D=256` | 784 | `1098.908 ms` | `1228.638 ms` | `-10.6%` throughput |
+
+Interpretation:
+
+- BM32 halves the Q-tile CTA count and should reduce repeated K/V scanning, but
+  the per-CTA shared-memory footprint grows enough that V100 loses occupancy and
+  scheduling flexibility.
+- For the real large-Q long-prefix path, the current BM16 low-smem shape is
+  faster. Do not default BM32 or spend more time on this exact tile-size change
+  unless a later variant also reduces shared memory or improves resident warp
+  occupancy.
+
+## 2026-06-19 Contiguous paged-prefix dense fast path default
+
+Defaulted a guarded dense fast path for medium/large-Q prefix prefill when the
+vLLM paged KV block table is physically contiguous.
+
+Implementation:
+
+- Added default-on gate `VLLM_FLASH_V100_PREFILL_CONTIG_DENSE=1`.
+- Added default-off gate
+  `VLLM_FLASH_V100_PREFILL_CONTIG_DENSE_ALLOW_COPY=0` for real hybrid/HND
+  cache layouts that require a local K/V reshape copy before dense prefill.
+- Shape thresholds default to:
+  `VLLM_FLASH_V100_PREFILL_CONTIG_DENSE_MIN_Q=1536` and
+  `VLLM_FLASH_V100_PREFILL_CONTIG_DENSE_MIN_KV=8192`.
+- The route only supports FP16 KV, `D=256`, causal attention, and no sliding
+  window. It falls back to the existing paged path otherwise.
+- The default route checks whether the sequence block table is physically
+  consecutive and whether K/V can be represented as a dense `[1, N, Hkv, D]`
+  view without copying. Non-contiguous cache layouts can be tested with
+  `VLLM_FLASH_V100_PREFILL_CONTIG_DENSE_ALLOW_COPY=1`, but that path is not
+  default-safe.
+- The block-table contiguity decision is cached on `attn_metadata`, so the
+  small GPU-to-CPU block-table copy is not repeated by every layer for the same
+  metadata object.
+
+Kernel-only evidence on V100 GPU0 with synthetic contiguous block tables:
+
+| shape | paged | contiguous dense view | result | diff |
+| --- | ---: | ---: | --- | ---: |
+| `1536x8192,Hq=12,Hkv=2,D=256` | `16.175 ms` | `14.175 ms` | `+14.1%` | `0.0` |
+| `2048x8192,Hq=12,Hkv=2,D=256` | `18.274 ms` | `17.084 ms` | `+7.0%` | `0.0` |
+| `4096x8192,Hq=12,Hkv=2,D=256` | `30.857 ms` | `28.361 ms` | `+8.8%` | `0.0` |
+| `4096x32768,Hq=12,Hkv=2,D=256` | `151.384 ms` | `140.566 ms` | `+7.7%` | `0.0` |
+| `16324x65296,Hq=12,Hkv=2,D=256` | `1096.995 ms` | `1036.137 ms` | `+5.9%` | `0.0` |
+
+Follow-up threshold sweep:
+
+- `q_len={1536,2048,2560,3072,4096}` crossed with
+  `kv_len={8192,16384,32768,65536}` all showed positive speedup
+  (`+5.6%` to `+14.1%`) and `maxdiff=0.0`.
+- Earlier small-Q checks showed `q_len=32/64/256` can lose because the dense
+  wrapper overhead dominates. Keep the default at `MIN_Q=1536`; lower values
+  remain tunable by env for targeted experiments.
+
+Cost and risk:
+
+- It is not a universal replacement for paged prefill. Non-contiguous block
+  tables, FP8 KV, D!=256, sliding-window attention, and very small-Q prefix
+  chunks keep using the old paged/split-KV routes.
+- FP16 KV remains required for the default route because the win comes from a
+  zero-copy dense view over paged KV cache. FP8 KV would require dequantization
+  or copy/convert work and needs a separate benchmark before enabling.
+- The current dense wrapper still performs BMHD<->BHMD layout conversion around
+  the dense kernel. The measured gain already includes that cost.
+- Real-model benefit depends on how often long prefix block tables are
+  physically contiguous. Use `VLLM_FLASH_V100_ROUTE_SUMMARY=1` and
+  `VLLM_FLASH_V100_PREFILL_CHUNK_PROFILE=1` to confirm route hit rate and
+  per-chunk timing before claiming end-to-end speedup.
+
+Real 9B-AWQ TP1 E2E check on V100 GPU0, CUDA graph enabled,
+`max_num_batched_tokens=16384`, `max_model_len=70000`, `max_tokens=8`,
+`logprobs=5`:
+
+| route | gpu memory util | 64K TTFT | prefill TPS | finish | route hit |
+| --- | ---: | ---: | ---: | --- | --- |
+| paged baseline | `0.75` | `42.296 s` | `1549.4` | `length` | `prefill_prefix_flash=24` |
+| contig dense allow-copy | `0.75` | `40.846 s` | `1604.5` | `length` | `prefill_prefix_contig_dense=24` |
+
+Interpretation:
+
+- Real Qwen3.5-9B-AWQ uses attention page/block size `528` and an HND/hybrid KV
+  cache layout, so the zero-copy default path does not hit. The allow-copy path
+  does hit all 24 full-attention prefix calls, but only gives `+3.55%` TTFT
+  speedup at 64K because it pays K/V reshape-copy overhead.
+- At `gpu_memory_utilization=0.90`, the allow-copy run aborted the 64K request
+  after the first prefix chunk (`finish_reason=abort`, `output_tokens=0`).
+  Therefore `ALLOW_COPY` must remain default-off unless paired with a temp
+  workspace/memory-headroom policy.
+- Measured temporary allocation cost for the 9B HND/hybrid allow-copy path
+  (`q_len=16384,Hq=16,Hkv=4,D=256,fp16`) is:
+
+  | prefix seq len | K/V materialization copy | total dense temp peak |
+  | ---: | ---: | ---: |
+  | `32768` | `128 MiB` | `642.9 MiB` |
+  | `49152` | `192 MiB` | `770.9 MiB` |
+  | `65536` | `256 MiB` | `898.8 MiB` |
+
+  The total includes the local K/V reshape copy, dense wrapper K/V layout
+  copies, Q layout copy, output buffers, and softmax LSE. This is per attention
+  layer call and does not multiply by the 24 calls because calls are sequential,
+  but the allocator must have this peak headroom available.
+- A follow-up BHMD wrapper optimization avoids the BMHD public wrapper's second
+  K/V layout copy and final output materialization. The 64K shape peak drops
+  from `898.8 MiB` to `514.0 MiB`; projected 256K peak drops from roughly
+  `2.38 GiB` to roughly `1.25 GiB`.
+- The BHMD optimization fixes the safety failure at
+  `gpu_memory_utilization=0.90`: the 64K request completes with
+  `finish_reason=length` and 8 output tokens. However, it is not a speed win:
+  64K TTFT is `46.004 s` versus the paged baseline `42.239 s`
+  (`-8.2%` throughput). The materialization copy remains on the critical path,
+  so this route must remain experimental.
+- Output quality for the valid 0.75 run matched at token level:
+  prompt hash equal, output ids equal
+  `[13, 198, 1517, 197, 197, 510, 596, 29]`, top-logprob token sets equal.
+  Top-logprob values had `max_abs_diff=0.00958`; baseline-vs-baseline and
+  baseline-vs-no-hit runs already show `0.00692-0.00800` cross-process
+  compile-graph drift, so this is not classified as a route-specific quality
+  regression.
+
+## 2026-06-19 FP8 versus AWQ TurboMind GEMM root-cause pass
+
+Question: NSYS showed `TurboMind quant GEMM` at `12.278 ms/token` for AWQ and
+`19.889 ms/token` for FP8 on 27B TP2 decode (`+7.611 ms/token`). Since both SM70
+paths eventually feed fp16 HMMA, the delta needed kernel-level explanation.
+
+Important profiling correction:
+
+- NCU with only `--launch-skip 30` can capture autotune measurement candidates,
+  not the final dispatch-cache hit. Do not use those early NCU reports as final
+  kernel evidence.
+- Correct final-kernel NCU method: first export the TurboMind dispatch cache for
+  the target layer, then rerun NCU with `--import-cache` and capture the first
+  `gemm_kernel`. Reports are under
+  `bench_results/fp8_awq_gemm_rootcause_20260619/*_final_full.ncu-rep`.
+
+Layer microbench on V100 GPU1, `m=1`, `group_size=128`, CUDA event timing:
+
+| layer | AWQ mean | FP8 mean | delta | ratio |
+| --- | ---: | ---: | ---: | ---: |
+| `linear_attn.in_proj_qkv` | `0.05698 ms` | `0.08183 ms` | `+0.02485 ms` | `1.44x` |
+| `linear_attn.in_proj_z` | `0.04382 ms` | `0.05973 ms` | `+0.01591 ms` | `1.36x` |
+| `linear_attn.out_proj` | `0.04655 ms` | `0.06201 ms` | `+0.01546 ms` | `1.33x` |
+| `mlp.gate_proj` | `0.07340 ms` | `0.12093 ms` | `+0.04753 ms` | `1.65x` |
+| `mlp.up_proj` | `0.07295 ms` | `0.11972 ms` | `+0.04677 ms` | `1.64x` |
+| `mlp.down_proj` | `0.07971 ms` | `0.12455 ms` | `+0.04484 ms` | `1.56x` |
+
+Final-kernel NCU evidence:
+
+| layer | route | final tile / grid | duration | DRAM read | global ld inst | total inst |
+| --- | --- | --- | ---: | ---: | ---: | ---: |
+| `linear_attn.out_proj` | AWQ | `8x256x64`, grid `(4,5,7)` | `40.48 us` | `16.75 MiB` | `41,086` | `4.37M` |
+| `linear_attn.out_proj` | FP8 | `8x256x32`, grid `(8,3,7)` | `54.21 us` | `31.98 MiB` | `74,137` | `5.97M` |
+| `mlp.gate_proj` | AWQ | `8x256x64`, grid `(8,9,3)` | `70.88 us` | `47.38 MiB` | `104,115` | `11.52M` |
+| `mlp.gate_proj` | FP8 | `8x128x32`, grid `(16,9,14)` | `114.53 us` | `90.55 MiB` | `211,937` | `21.61M` |
+
+Interpretation:
+
+- The delta is not from fp16 HMMA math throughput alone. FP8 uses the SM70
+  `Operand_B_Pack<__nv_fp8_e4m3>` plus `Transform_HMMA_SIMT_B` path, while AWQ
+  uses `Operand_B_Pack<uint4_t>` plus uint32 scale/zero statistics.
+- FP8 reads about `1.91x` as many weight bytes as AWQ, which is expected for
+  W8 versus W4. That accounts for a large part of the gap, but not all of it.
+- The larger MLP matrices show a second issue: the final FP8 dispatch chooses
+  smaller tiles and much higher split-K (`gate_proj`: `8x128x32`, `splits=14`)
+  than AWQ (`8x256x64`, `splits=3`). This inflates CTA count from `216` to
+  `2016`, branch instructions by `~3.0x`, shared-store instructions by `~2.55x`,
+  and total executed instructions by `~1.88x`.
+- Therefore the FP8 slowdown is a combination of unavoidable W8 bandwidth and
+  avoidable dispatch/kernel-shape inefficiency. The next optimization should
+  test FP8 dense kernels/selector variants that recover AWQ-like `8x256x64`
+  behavior for the MLP shapes, or otherwise reduce the split-K/CTA overhead
+  without regressing correctness.
+
+Follow-up, same day:
+
+- Tested flat dense FP8 SM70 registry candidates
+  (`Config_E4M3<kColMajor>`) before the existing group-axis
+  `Config_E4M3<kColMajor, 0>` candidates in
+  `csrc/sm70_turbomind/lmdeploy/src/turbomind/kernels/gemm/kernel/sm70_884_8.cu`.
+  This made the final FP8 dispatch name `tnt_fff` instead of the earlier
+  grouped/mgroup family for dense GEMM, but it was not retained because it did
+  not improve speed and changed accumulation order.
+- A temporary forced tile/split diagnostic path was tested and then removed.
+  It swept `8x128x32`, `8x128x64`, `8x256x32`, and `8x256x64` over
+  split-K/swizzle choices after flat candidates were present. Longer
+  confirmation showed the apparent best short-run point was noise:
+  forced `8x128x32 split=14 swizzle=3` measured `0.146801 ms`, slower than
+  natural FP8 `0.118654 ms`, while AWQ measured `0.075930 ms`.
+- Fixed-cache NCU on `mlp.gate_proj`, V100 GPU0, `m=1`, `group_size=128`,
+  showed the remaining gap is dominated by W8 weight traffic, not HMMA:
+
+  | route | final tile / grid | duration | DRAM read | total thread inst | FP16 pipe inst | LSU pipe inst |
+  | --- | --- | ---: | ---: | ---: | ---: | ---: |
+  | AWQ | `8x256x64`, grid `(8,9,3)` | `71.104 us` | `45.19 MiB` | `370.14M` | `89.55M` | `31.32M` |
+  | FP8 flat | `8x128x64`, grid `(16,9,1)` | `115.552 us` | `86.35 MiB` | `495.98M` | `89.27M` | `42.32M` |
+
+- Old mgroup cache versus new flat output on the same `mlp.gate_proj` tensor is
+  not bitwise equal because the dispatch tile/split changed, but the drift is
+  small for this microcase: `max_diff=4.8828125e-4`,
+  `mean_diff=4.44e-7`. Inputs, FP8 weights, prepared weights, and scales had
+  identical hashes in both dumps.
+- Interpretation update: the earlier mgroup/split-K diagnosis was a real
+  inefficiency, but fixing the dense registry does not recover AWQ speed because
+  the FP8 W8 path already reads essentially the theoretical full FP8 weight
+  stream for this shape. The FP16 pipe work is equal to AWQ; FP8 reads
+  `1.91x` DRAM and executes `1.35x` LSU/thread instructions. On decode
+  `m=1`, this is the dominant cost.
+- Practical implication: matching current optimized AWQ decode speed with true
+  W8 FP8 weights is not a selector-only fix. Further FP8 speed work must either
+  reduce the weight stream (for example a different compressed storage route),
+  improve reuse by changing the served batch/graph shape, or accept that AWQ is
+  now faster for memory-bound decode because it is W4.
+- Code decision: do not keep the flat FP8 registry in the default build. It is a
+  rejected experiment unless a later patch demonstrates a real speed win and
+  passes a full quality gate.
+
+## 2026-06-19 MTP4 coding-prompt speed bottleneck profile
+
+Question: current quality-safe Qwen3.6-27B-AWQ TP2 MTP4 improves a real coding
+prompt from the user's no-MTP `~50 tok/s` class only to the high-70 tok/s class.
+The speed issue needed a route-level attribution without reopening the known-bad
+`spec_commit` split-GDN path.
+
+Artifacts:
+
+- Non-profile coding warm repeat:
+  `bench_results/mtp_speed_probe_20260619_code_only_warm/27b_awq_mtp4_fullgdn_code_macos512_warm2.json`.
+- Profile coding warm repeat:
+  `bench_results/mtp_speed_probe_20260619_code_only_profile/27b_awq_mtp4_fullgdn_code_macos512_profile_warm2.json`.
+- Prompt: the `code_macos` chat prompt asking for a complete HTML/CSS/JS macOS
+  desktop simulator. Output is real HTML/CSS code, but 512 tokens truncates the
+  file mid-CSS and is not a completeness check.
+
+Non-profile request metrics:
+
+- Warm request 1: `steady_decode_tps=71.543`, `prefill=4.912 s`,
+  `decode=7.143 s`.
+- Warm request 2: `steady_decode_tps=78.350`, `prefill=0.171 s`,
+  `decode=6.522 s`.
+
+Profile request metrics are lower because `VLLM_SM70_MTP_PROFILE=1` synchronizes
+CUDA events:
+
+- Profile warm request 2: `steady_decode_tps=71.531`, `prefill=0.182 s`,
+  `decode=7.144 s`.
+- Spec metrics during the second request: mean acceptance length `3.31`,
+  per-position acceptance `0.825, 0.649, 0.464, 0.376`, average draft
+  acceptance `57.9%`.
+
+Route-hit facts:
+
+- Target path logs `SM70 Qwen GDN full-forward guard armed` and
+  `SM70 Qwen GDN full-forward route enabled`; `VLLM_SM70_QWEN_GDN_SPEC_CORE_OP=0`
+  keeps the known-good quality guard.
+- AWQ target and MTP drafter both hit TurboMind dense fast paths, and the drafter
+  uses local argmax reduction.
+- V100 cannot use FlashInfer top-k/top-p sampling, so official stochastic
+  sampling falls back to PyTorch-native sampler.
+
+Hot-window profile attribution from the second request (`calls=160 -> 288`,
+incremental average per spec step):
+
+- Runner: `target_forward=23.323 ms`, `target_logits=2.051 ms`,
+  `target_rejection_sample=1.409 ms`, `draft_total=12.530 ms`,
+  `bookkeeping=0.123 ms`.
+- Proposer inside `draft_total`: four draft sample points cost about
+  `2.294 ms` each (`~9.17 ms/spec-step` total), while draft forward work is
+  only about `2.77 ms/spec-step` (`0.812 + 0.654 + 0.653 + 0.655 ms`) and
+  loop metadata is about `0.96 ms/spec-step`.
+
+Interpretation:
+
+- The current MTP4 speed bottleneck is not a route miss and not primarily an
+  acceptance problem. The fixed per-spec-step cost is too high.
+- The two largest buckets are the quality-safe 5-token target verifier forward
+  (`~23 ms/spec-step`) and official stochastic MTP proposal/rejection plumbing.
+  Inside the proposal path, full-vocab PyTorch-native top-k/top-p/softmax/random
+  sampling dominates the drafter overhead.
+- Greedy draft and Python `topk + scatter` sparse-prob prototypes are already
+  known dead ends: greedy draft loses enough acceptance to erase the saving, and
+  Python scatter regressed throughput. The viable next speed work is a real
+  SM70/Triton fused sampling/probability path, or an adaptive-K/MTP2 policy that
+  reduces the expensive low-acceptance tail without quality regression.
+
+## 2026-06-19 Qwen3.5-2B-AWQ single-card MTP path probe
+
+Question: use a small MTP-capable ModelScope model to separate V100-specific MTP
+misses from general speculative fixed cost. The model is
+`tclf90/Qwen3.5-2B-AWQ`, downloaded to `/home/ymzx/models/Qwen3.5-2B-AWQ`.
+
+Model facts from `config.json`:
+
+- `architectures=["Qwen3_5ForConditionalGeneration"]`, `model_type=qwen3_5`.
+- `text_config.mtp_num_hidden_layers=1`.
+- `hidden_size=2048`, `num_hidden_layers=24`.
+- AWQ `bits=4`, `group_size=128`, `zero_point=true`.
+- Local weight size is about `3.04 GiB`.
+
+Common prompt and sampling:
+
+- Prompt: `Write a complete Python implementation of an LRUCache class using
+  collections.OrderedDict, including get, put, and a short demo in main. Return
+  only code.`
+- Output `512`, `temperature=1.0`, `top_p=0.95`, `top_k=20`, no sampling seed,
+  `language_model_only=true`.
+
+4060 Ti / SM89 result:
+
+- Artifacts:
+  - `bench_results/qwen35_2b_mtp_path_probe_20260619/rtx4060_qwen35_2b_awq_mtp4_lmonly_triton_o512.log`
+  - `bench_results/qwen35_2b_mtp_path_probe_20260619/rtx4060_qwen35_2b_awq_mtp4_lmonly_triton_isolated_o512.log`
+- The first text/MM run failed before generation because the current
+  FlashAttention wheel is built for the SM70 lane and the model's visual
+  encoder dummy path attempted FA2 on SM89.
+- With `language_model_only=true`, `TRITON_ATTN`, and isolated
+  `VLLM_CACHE_ROOT`/`TORCHINDUCTOR_CACHE_DIR`/`TRITON_CACHE_DIR`, initialization
+  reached the text-only model path and logged
+  `Using FlashInfer for top-p & top-k sampling`, proving the SM89 sampler route
+  can hit FlashInfer.
+- The isolated run still failed during the first Inductor dummy/profile run with
+  `torch.AcceleratorError: CUDA error: no kernel image is available for
+  execution on the device`, from an Inductor Triton kernel. Treat current local
+  4060 Ti E2E results as blocked by the SM70-built environment, not as a valid
+  MTP speed comparison. A real 4060 Ti comparison needs a separate SM89-capable
+  build/cache lane.
+
+V100 / SM70 MTP4 result:
+
+- Artifact:
+  `bench_results/qwen35_2b_mtp_path_probe_20260619/v100_qwen35_2b_awq_mtp4_lmonly_o512.json`.
+- Route facts:
+  - FlashInfer top-k/top-p sampler is unsupported on CC 7.0 and falls back to
+    PyTorch-native sampler.
+  - Target attention uses `FLASH_ATTN_V100`.
+  - Qwen GDN uses the active-MTP full-forward quality guard
+    (`VLLM_SM70_QWEN_GDN_SPEC_CORE_OP=0`).
+  - AWQ target and MTP drafter hit SM70 TurboMind dense routes.
+  - Drafter attention is `TRITON_ATTN`; local argmax reduction is enabled.
+- Request metrics: `generate_seconds=8.598`, `prefill_time=5.108`,
+  `decode_time=3.455`, `steady_decode_tps=147.885`.
+- Hot-window profile from `calls=128 -> 144`, incremental per spec step:
+  - Runner: `target_forward=5.772 ms`, `target_logits=1.048 ms`,
+    `target_rejection_sample=1.394 ms`, `draft_total=7.003 ms`,
+    `bookkeeping=0.093 ms`.
+  - Proposer: `total_gpu=6.755 ms`, `first_forward=0.538 ms`,
+    four sample points at about `1.33 ms` each, later loop forwards about
+    `0.26 ms` each, and loop metadata about `0.85 ms` total.
+
+V100 / SM70 no-MTP control:
+
+- Artifact:
+  `bench_results/qwen35_2b_mtp_path_probe_20260619/v100_qwen35_2b_awq_nomtp_lmonly_o512.json`.
+- Same model, prompt, sampling, and text-only policy, no speculative config.
+- Route facts match the target side: PyTorch-native sampler, `FLASH_ATTN_V100`,
+  and SM70 AWQ TurboMind dense route.
+- Request metrics: `generate_seconds=3.063`, `prefill_time=0.333`,
+  `decode_time=2.691`, `steady_decode_tps=189.913`.
+
+Interpretation:
+
+- This 2B single-card V100 run shows MTP4 is a net speed regression on the small
+  model: `147.9 tok/s` steady decode with MTP4 versus `189.9 tok/s` no-MTP.
+- The small model is useful as a latency microscope, not as proof that V100 is
+  missing a major external acceleration path. Even with V100-specific attention,
+  GDN, AWQ, local argmax, and graph routes hit, speculative fixed costs dominate.
+- FlashInfer sampler would help SM89, but the V100 hot-window numbers show the
+  sampler gap is not sufficient by itself to make MTP4 profitable on 2B. The
+  expensive pieces are the verifier forward, full-vocab stochastic
+  proposal/rejection sampling, and low useful accepted tokens per speculative
+  cycle.
+- Do not use this 2B result to tune final 27B/35B defaults directly. Use it to
+  test fused sampling/probability, adaptive MTP length, and warmup coverage
+  cheaply before spending 27B/35B model-load time.
+
+## 2026-06-19 Long-context prefill external-route backlog
+
+Question: the exact Flash-V100 paged-prefill work has improved kernel constants,
+but real 16K-chunk + long-prefix prefill still decays strongly with context
+length. Exact single-card full attention cannot remove the `O(chunk * prefix)`
+work, so the next backlog should explicitly track sparse/selection and context
+parallel routes.
+
+Candidate routes:
+
+| route | idea | local decision |
+| --- | --- | --- |
+| [BFLA](https://github.com/Alicewithrabbit/BFLA) / vLLM RFC [#42419](https://github.com/vllm-project/vllm/issues/42419) | vLLM-style paged sparse prefill for long-context workloads; training-free and explicitly aimed at Qwen 3.5/3.6-class models. | First route to inspect. It is closest to our vLLM paged-attention target and claims large long-prefill speedups, but it must stay default-off until token/logprob and task-quality gates pass. |
+| [CompactAttention](https://github.com/jiwonsong-dev/CompactAttention) | Chunked-prefill KV block selection. It lowers block-sparse masks into per-group KV block tables and then runs dense/paged attention over selected KV blocks. | Very relevant to our 16K chunk + long-prefix problem. Inspect after BFLA, especially the zero-copy selected-KV table design. |
+| [MInference](https://github.com/microsoft/MInference) | Dynamic sparse prefill using head-level patterns such as vertical/slash/block sparse. | Mature reference for selector design and quality methodology. Our old inventory already classified vertical/slash helper ops as out of the exact Flash-V100 path; reopen only as an explicit sparse-prefill experiment. |
+| [TensorRT-LLM Skip Softmax](https://github.com/NVIDIA/TensorRT-LLM/blob/main/docs/source/blogs/tech_blog/blog16_Accelerating_Long_Context_Inference_with_Skip_Softmax_Attention.md) | Kernel-side approximate skip after QK/online-softmax statistics show low block contribution. | Good Flash-V100 kernel idea, but approximate by design. Use only behind an env gate with strict quality evaluation. |
+| vLLM PCP / ring attention ([RFC #37995](https://github.com/vllm-project/vllm/issues/37995), [docs](https://docs.vllm.ai/en/latest/serving/context_parallel_deployment/)) | Exact context parallelism that distributes long-context prefill across GPUs. | Exact route for reducing wall time, but not a TP1/default answer. Keep for multi-GPU acceptance and later 35B/277B planning. |
+| [UniPrefill](https://github.com/qhfan/UniPrefill) | Architecture-agnostic long-context prefill acceleration with vLLM scheduling integration claims. | Worth reading because Qwen3.5/3.6 are hybrid full-attention + GDN models. Validate maturity before porting. |
+| [FlashPrefill](https://github.com/qhfan/FlashPrefill), [XAttention](https://github.com/mit-han-lab/x-attention), [FlexPrefill](https://github.com/ByteDance-Seed/FlexPrefill) | Sparse-prefill selectors and dynamic block importance scoring. | Research-heavy references. Mine selector/kernel ideas after BFLA and CompactAttention; do not treat paper speedups as accepted V100/vLLM speed evidence. |
+
+Acceptance gates for any sparse/approximate route:
+
+- Keep the route default-off until it has explicit quality classification. It
+  cannot count as accepted performance while labeled `B-pending`.
+- Report route hit rate, prefill-only kernel timing, TTFT, output tokens,
+  logprob drift, and at least one long-context retrieval/reasoning quality
+  check. Exact-token equality is preferred but not sufficient by itself.
+- Test real shapes first: 9B/27B/35B Qwen full-attention layer geometry, page
+  sizes `528/784/1056`, `max_num_batched_tokens=16384`, and 16K/64K/256K
+  prompt lengths where feasible.
+- If a route changes attention semantics, document the budget knob, fallback
+  condition, and failure mode before enabling broader E2E tests.
+
+## 2026-06-19 Flash-V100 BFLA experimental port
+
+Status: `in-progress`, default-off.
+
+Source:
+
+- Local source checkout: `BFLA/`
+- Upstream commit: `46907c2c10d27a7a6ea58f718a049607aeb0353e`
+- The upstream patch targets vLLM 0.19.1 Triton attention. The local experiment
+  ports only the BFLA sparse-prefill idea into Flash-V100 paged prefill rather
+  than copying the Triton backend wholesale.
+
+Implementation shape:
+
+- New default-off env gate: `VLLM_FLASH_V100_BFLA_PREFILL=1`.
+- New Flash-V100 extension route: `prefill_paged_bfla_fwd`.
+- The route builds a per-sequence mask shaped `[1, Hkv, q_tiles, kv_tiles]`
+  from pooled Q and paged K cache, then the paged prefill kernel skips KV tiles
+  where the mask is zero.
+- Guardrails: FP16 KV, `D=256`, causal attention, no sliding window,
+  `q_len >= VLLM_FLASH_V100_BFLA_MIN_Q`, and
+  `seq_len >= VLLM_FLASH_V100_BFLA_MIN_KV`.
+- Default knobs for first tests:
+  `MASK_BLOCK_N=256`, `THRESHOLD=999`, `KEEP_MASS=0.99`,
+  `LOCAL_BLOCKS=8`, `POOL=flat64`.
+
+Acceptance status:
+
+- This is a semantic sparse/approximate path. Dense-vs-BFLA nonzero diff is not
+  fp16 noise and cannot be accepted without model/task quality gates.
+- The first required checks are all-keep mask exactness (`maxdiff=0` versus
+  existing paged prefill), sparse-mask reference comparison, then 9B-AWQ TP1
+  16K/64K E2E speed plus token/logprob and retrieval/counting quality probes.
+
+Initial validation:
+
+- Built `flash-attention-v100` in place for `TORCH_CUDA_ARCH_LIST=7.0`.
+- Kernel all-keep exactness passed on GPU0:
+  - `block_size=16, M=256, N=768, Hq=4, Hkv=1`: dense vs BFLA `maxdiff=0`,
+    `torch.equal=True`.
+  - `block_size=528, M=256, N=2112, Hq=16, Hkv=4`: dense vs BFLA `maxdiff=0`,
+    `torch.equal=True`.
+- Sparse-mask kernel semantics matched a PyTorch tile-mask reference at fp16
+  roundoff level: both synthetic shapes above had `maxdiff_ref=1.5259e-05`.
+- 9B-AWQ TP1 CUDA-graph smoke, `max_num_batched_tokens=8192`,
+  `max_model_len=65536`, prompt `32768`, output `1`, `logprobs=5`:
+  - Dense `low_smem`: `ttft=14.859s`, `prefill_tps=2205.2`,
+    routes `prefill_prefix_flash=24`.
+  - `bfla_allkeep`: route hit `prefill_prefix_bfla=8`, `ttft=15.070s`,
+    output token/hash equal, top-5 token ids equal, but top-5 logprob max drift
+    was `0.00727`; treat this as E2E numeric drift to investigate, not a
+    bitwise quality pass.
+  - `bfla_sparse` default knobs: route hit `prefill_prefix_bfla=8`,
+    `ttft=12.222s`, `prefill_tps=2681.0`, about `+21.6%` TTFT throughput
+    versus dense for this smoke. Output token/hash stayed equal, but top-5
+    tokens changed at rank 5 and top-5 logprob max drift was `0.858`; this is
+    not accepted quality.
+- A 64K / 16K-chunk CUDA-graph run failed during engine-core initialization
+  after graph compile with no deeper Python exception printed. Retry after the
+  32K route/quality issues are addressed.
+
+Official-parameter Flash-V100 kernel reproduction:
+
+- After comparing against the BFLA README, the local Flash-V100 default
+  threshold was changed from `0.005` to the official recommended `999`. The
+  earlier 9B E2E smoke above used the old threshold and should not be cited as
+  an official-parameter run.
+- Added `benchmarks/kernels/benchmark_flash_v100_bfla_prefill.py` to benchmark
+  Flash-V100 paged prefill directly with the README recommended torch-mask
+  configuration: `MASK_BLOCK_N=256`, `POOL=flat64`, `THRESHOLD=999`,
+  `KEEP_MASS=0.99`, `KEEP_RATIO=0`, `MIN_KEEP_BLOCKS=0`, `LOCAL_BLOCKS=8`,
+  and no speculative rescue.
+- GPU0, `VLLM_FLASH_V100_PREFILL_D256_LOW_SMEM=1`, kernel-only results:
+
+| profile | shape | keep fraction | dense | BFLA kernel | BFLA total | speedup | maxdiff |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| qwen35-tp4 | 8192x65536 | 0.227 | 209.058 ms | 51.480 ms | 52.389 ms | 4.06x / 3.99x | 0.0994 |
+| qwen35-tp4 | 16384x262144 | 0.086 | 1663.220 ms | 177.554 ms | 181.207 ms | 9.37x / 9.18x | 0.1433 |
+| qwen9-tp1 | 8192x65536 | 0.208 | 802.998 ms | 182.344 ms | 186.111 ms | 4.40x / 4.31x | 0.1152 |
+| qwen9-tp1 | 16384x131072 | 0.134 | 3181.742 ms | 489.825 ms | 496.793 ms | 6.50x / 6.40x | 0.1422 |
+
+Interpretation:
+
+- The Flash-V100 port does reproduce and exceed the official `2-3x` speed target
+  at the attention-kernel level when the official sparse parameters are used.
+- The measured mask build time is small in this single-sequence kernel harness
+  (`~1.4-7.6 ms`), so total speedup is close to prebuilt-mask kernel speedup.
+- Quality is not accepted: dense-vs-sparse `maxdiff` is `0.10-0.14`, which is
+  expected for a semantic sparse path but too large to call precision-preserving.
+  The next work item is a quality-preserving selector sweep, not more proof that
+  the skip kernel can be fast.
+
+Length-sweep observation, qwen9-tp1 official-parameter kernel harness:
+
+| shape | keep fraction | total speedup | maxdiff | meandiff |
+| ---: | ---: | ---: | ---: | ---: |
+| 8192x32768 | 0.329 | 2.82x | 0.1147 | 0.0116 |
+| 8192x65536 | 0.208 | 4.31x | 0.1152 | 0.0107 |
+| 8192x131072 | 0.136 | 6.26x | 0.1204 | 0.0099 |
+| 8192x262144 | 0.080 | 9.72x | 0.1180 | 0.0094 |
+| 16384x65536 | 0.214 | 4.21x | 0.1201 | 0.0111 |
+| 16384x131072 | 0.134 | 6.19x | 0.1422 | 0.0101 |
+
+The raw attention-output activation drift is not constant, but in random-tensor
+kernel tests it also does not monotonically explode with KV length. The quality
+risk still rises with length because the kept causal tile fraction falls sharply;
+important rare long-range blocks become easier to drop, and model-level errors
+can accumulate across layers and chunks even if per-layer mean activation drift
+stays near `1e-2`.
+
+Controlled-mask diagnosis for the `maxdiff=0.10-0.14` activation drift:
+
+| config | density | total speedup | maxdiff | meandiff | interpretation |
+| --- | ---: | ---: | ---: | ---: | --- |
+| allkeep (`KEEP_MASS=1`) | 1.000 | 0.97x | 0.0000 | 0.0000 | wrapper/kernel exact |
+| dense-like (`THRESHOLD=0`, `KEEP_MASS=0`) | 1.000 | 0.96x | 0.0000 | 0.0000 | mask indexing exact |
+| local only (`KEEP_MASS=0`, local 8) | 0.083 | 9.17x | 0.2402 | 0.0256 | dropped-tile error |
+| official (`KEEP_MASS=0.99`, local 8) | 0.326 | 2.76x | 0.1077 | 0.0112 | sparse approximation |
+| safer mass (`KEEP_MASS=0.999`, local 8) | 0.563 | 1.66x | 0.0735 | 0.0068 | higher density reduces drift |
+| wider local (`KEEP_MASS=0.99`, local 32) | 0.467 | 1.95x | 0.0693 | 0.0081 | local rescue reduces drift |
+| top-ratio rescue (`KEEP_RATIO=0.30`) | 0.800 | 1.18x | 0.0285 | 0.0038 | near-dense, little speed left |
+
+This points away from a Flash-V100 mask-skip correctness bug: dense-equivalent
+masks are bitwise exact, and activation drift scales with how many causal tiles
+are dropped. The remaining risk is algorithmic/selector quality, not kernel
+addressing. The next acceptance path is to tune density/rescue to preserve model
+logprobs and task quality while retaining enough speed.
+
+Quality-speed sweep after the official-parameter reproduction:
+
+- Kernel Pareto, qwen9-tp1 `8192x65536`:
+  - official: density `0.208`, total `4.31x`, maxdiff `0.1152`.
+  - `KEEP_MASS=0.995`: density `0.262`, total `3.47x`, maxdiff `0.0966`.
+  - `LOCAL_BLOCKS=32`: density `0.290`, total `3.14x`, maxdiff `0.0731`.
+  - `KEEP_RATIO=0.05`: density `0.263`, total `3.49x`, maxdiff `0.0889`.
+  - `KEEP_RATIO=0.10`: density `0.387`, total `2.39x`, maxdiff `0.0509`.
+- Kernel Pareto, qwen9-tp1 `8192x131072`:
+  - official: density `0.136`, total `6.26x`, maxdiff `0.1204`.
+  - `LOCAL_BLOCKS=32`: density `0.179`, total `4.88x`, maxdiff `0.0813`.
+  - `KEEP_RATIO=0.05`: density `0.221`, total `4.04x`, maxdiff `0.0536`.
+  - `KEEP_RATIO=0.10`: density `0.366`, total `2.53x`, maxdiff `0.0359`.
+  - `MASK_BLOCK_N=512`: density `0.278`, total `3.29x`, maxdiff `0.0814`.
+- Kernel Pareto, qwen9-tp1 `8192x262144`:
+  - official: density `0.080`, total `9.74x`, maxdiff `0.1180`.
+  - `LOCAL_BLOCKS=32`: density `0.102`, total `7.90x`, maxdiff `0.0818`.
+  - `KEEP_RATIO=0.05`: density `0.197`, total `4.49x`, maxdiff `0.0384`.
+  - `MASK_BLOCK_N=512`: density `0.173`, total `5.08x`, maxdiff `0.0864`.
+
+9B-AWQ TP1 E2E smoke, CUDA graph, `max_num_batched_tokens=8192`,
+prompt `32768`, output `1`, `logprobs=5`:
+
+- Dense `low_smem`: `ttft=14.906s`, route `prefill_prefix_flash=24`.
+- `KEEP_RATIO=0.05`: route `prefill_prefix_bfla=8`, `ttft=12.577s`
+  (`+18.5%` TTFT throughput). Output token/hash stayed equal, but top-5 token
+  ids changed at rank 5 and max top-5 logprob drift was `1.428`.
+- `KEEP_RATIO=0.10`: route `prefill_prefix_bfla=8`, `ttft=12.568s`
+  (`+18.6%` TTFT throughput). Output token/hash and top-5 token ids stayed
+  equal, but max top-5 logprob drift was still `0.867`.
+
+9B-AWQ TP1 long E2E speed reproduction, CUDA graph,
+`max_num_batched_tokens=8192`, output `1`, `logprobs=0`:
+
+- Dense baseline artifact:
+  `benchmark-results/flash_v100_bfla_9b_low_smem_32k_256k_8192_gmem090.json`.
+  It used `max_model_len=262144`, `gpu_memory_utilization=0.90`, and the
+  existing Flash-V100 low-smem dense/paged prefill path.
+- BFLA official-speed artifacts:
+  `benchmark-results/flash_v100_bfla_9b_sparse_official_minq256_minkv256_32k_256k_8192_gmem090.json`
+  for 32K/64K and
+  `benchmark-results/flash_v100_bfla_9b_sparse_official_minq256_minkv256_128k_256k_8192_gmem086.json`
+  for 128K/256K. The BFLA run used the README-like route parameters
+  `MIN_Q=256`, `MIN_KV=256`, `MASK_BLOCK_N=256`, `KEEP_MASS=0.99`,
+  `KEEP_RATIO=0`, `LOCAL_BLOCKS=8`, `POOL=flat64`, `THRESHOLD=999`.
+- A 0.90-memory BFLA attempt completed 32K/64K but OOMed at 128K while
+  building the sparse mask (`pool_blocks` tried to allocate a 256 MiB K-padded
+  temporary with only about 242 MiB free). The 128K/256K rerun lowered
+  `gpu_memory_utilization` to `0.86` and `max_model_len` to `261121`, leaving
+  enough workspace while still supporting the 256K-class request.
+
+| input tokens | dense TTFT | BFLA TTFT | TTFT speedup | dense TPS | BFLA TPS |
+| ---: | ---: | ---: | ---: | ---: | ---: |
+| 32768 | 14.901 s | 9.532 s | 1.56x | 2199.1 | 3437.8 |
+| 65536 | 43.237 s | 18.374 s | 2.35x | 1515.7 | 3566.8 |
+| 131072 | 140.911 s | 37.404 s | 3.77x | 930.2 | 3504.3 |
+| 261120 | 499.099 s | 79.077 s | 6.31x | 523.2 | 3302.1 |
+
+Interpretation for the speed gate: the official `2.7x`-class end-to-end
+throughput claim is reproduced for 128K and 256K on 9B-AWQ TP1. It is not
+visible at 32K and is only near the threshold at 64K because Qwen3.5-9B is
+hybrid (`8/32` full-attention layers) and short chunks still spend substantial
+time outside full-attention paged prefix prefill. Quality remains unaccepted:
+the next step is model-logprob and task-quality validation for the same
+official-speed configuration, then density/rescue tuning only if quality fails.
+
+LongBench quality gate, 2026-06-19:
+
+- Added `benchmarks/benchmark_flash_v100_bfla_longbench.py`, a vLLM-based
+  LongBench runner that uses the official LongBench prompt templates and
+  metrics while keeping dense Flash-V100 and BFLA on the same model, seed,
+  prompt set, decoding parameters, and tokenizer.
+- Official BFLA paper quality references:
+  - LongBench Table 3 reports Full `0.4022`, BFLA `0.3975`, XAttention
+    `0.3976`, i.e. average BFLA gap `-0.0047` (`-0.47` points on a 0-100
+    scale). The largest listed drops are retrieval/counting-sensitive:
+    PassageCount `0.0883 -> 0.0663`, PassageRetrieval-en
+    `0.9534 -> 0.9272`, PassageRetrieval-zh `0.9293 -> 0.9131`.
+  - General benchmark Table 4 uses MMLU Pro, AIME 2026 no-tools,
+    GPQA Diamond, and LiveCodeBench v6 across Qwen 3.5-9B, Qwen 3.6-27B,
+    Gemma 4-E4B, and Gemma 4-31B. The often-quoted `-0.1` is the Qwen
+    3.6-27B MMLU Pro change `83.3% -> 83.2%`, not the LongBench average.
+- Local controlled LongBench subset:
+  - Model: `/home/ymzx/models/Qwen3.5-9B-AWQ`, TP1, AWQ, CUDA graph,
+    Flash-V100 backend, `max_num_batched_tokens=8192`, `max_model_len=65536`.
+  - Sample set: longest 10 examples each from `passage_count` and
+    `passage_retrieval_en`, all `>8K` prompt tokens after Qwen formatting.
+  - Dense artifact:
+    `benchmark-results/longbench_bfla_quality/low_smem_longest10_rerun`.
+  - BFLA official-speed artifact:
+    `benchmark-results/longbench_bfla_quality/bfla_sparse_official_longest10`.
+  - BFLA `KEEP_RATIO=0.10` artifact:
+    `benchmark-results/longbench_bfla_quality/bfla_ratio10_longest10`.
+
+| task | dense score | official-speed BFLA | `KEEP_RATIO=0.10` | dense median TTFT | official median TTFT | ratio10 median TTFT |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| `passage_count` | 20.0 | 10.0 | 20.0 | 9.924 s | 7.099 s | 7.500 s |
+| `passage_retrieval_en` | 75.0 | 10.0 | 55.0 | 5.780 s | 5.142 s | 5.149 s |
+
+- A BFLA all-keep sanity run on the first three `passage_retrieval_en`
+  examples scored `100/100/100`, matching dense for those examples:
+  `benchmark-results/longbench_bfla_quality/bfla_allkeep_retrieval3`.
+  This rules out a same-run model mismatch or wrapper-level route bug for
+  these examples. The quality loss appears when KV tiles are actually dropped.
+- Current interpretation: the official-speed BFLA parameters are not quality
+  acceptable on our Qwen3.5-9B-AWQ + Flash-V100 port for retrieval/counting
+  stress tasks. `KEEP_RATIO=0.10` recovers some quality but still drops
+  `passage_retrieval_en` from `75` to `55` with only `~1.12x` median TTFT
+  speedup on this 15K-token task. Continue with stricter rescue/density sweeps
+  and broader LongBench tasks before considering any default.
+- Official-distribution reproduction is now queued as
+  `benchmark-results/longbench_bfla_quality/official_strided20_dense` followed
+  by `benchmark-results/longbench_bfla_quality/official_strided20_bfla_official`.
+  This run uses all 21 LongBench tasks with `20` strided samples per task,
+  `max_input_tokens=60000`, `max_model_len=65536`, and the same Qwen3.5-9B-AWQ
+  TP1 Flash-V100 CUDA-graph setup. Treat it as a fast official-distribution
+  probe, not the full LongBench all-example score. Compare this separately from
+  the longest-example stress subset above.
+- Interim speed/quality search:
+  - `benchmark-results/longbench_bfla_quality/sensitivity_strided8_*` covers
+    `passage_count`, `passage_retrieval_en`, and `passage_retrieval_zh` with
+    8 strided samples each. Dense baseline scores are `0.0`, `83.33`, and
+    `100.0`.
+  - Unconditional official BFLA (`MIN_KV=256`, `KEEP_RATIO=0`) is rejected for
+    medium-length retrieval: `passage_retrieval_en` falls `83.33 -> 12.50`
+    while median TTFT is only `1.02x` faster. This is not a useful
+    speed/quality tradeoff.
+  - `KEEP_RATIO=0.10` still fails retrieval (`83.33 -> 37.50`) and is not
+    faster. `KEEP_RATIO=0.20` improves retrieval (`83.33 -> 70.83`) but is
+    slightly slower than dense on this 12K-token median task. `SPEC_STRIDE=16`
+    does not recover retrieval quality.
+  - New active candidates are length-gated: full strided20 runs are queued for
+    `MIN_KV=32768, KEEP_RATIO=0` at
+    `benchmark-results/longbench_bfla_quality/official_strided20_bfla_minkv32768`
+    and `MIN_KV=32768, KEEP_RATIO=0.20` at
+    `benchmark-results/longbench_bfla_quality/official_strided20_bfla_minkv32768_ratio20`.
+    Early `MIN_KV=32768` narrativeqa evidence shows dense fallback for
+    sub-32K prompts, about `1.34x` TTFT speedup on active >32K prompts, and no
+    current task-average quality regression (`31.67 -> 35.22` on the first
+    completed narrativeqa task).
+  - Early `MIN_KV=32768, KEEP_RATIO=0.20` evidence is weaker: on the first 18
+    narrativeqa samples it changes score `33.05 -> 32.16` and active >32K
+    speed is only about `1.13x`. Unless later tasks contradict this, the best
+    current candidate is `MIN_KV=32768, KEEP_RATIO=0`, not ratio-based rescue.
+  - Direct 9B-AWQ E2E long-context TTFT for `MIN_KV=32768, KEEP_RATIO=0.20`
+    was collected at
+    `benchmark-results/flash_v100_bfla_9b_ratio20_long_64k_256k_8192_gmem086_gpu3.json`.
+    It is faster than dense but much slower than official-density BFLA:
+    64K `43.24s -> 29.38s` (`1.47x`, versus ratio0 `18.37s` / `2.35x`),
+    128K `140.91s -> 75.53s` (`1.87x`, versus ratio0 `37.40s` / `3.77x`),
+    and 256K `499.10s -> 229.73s` (`2.17x`, versus ratio0 `79.08s` /
+    `6.31x`). The ratio20 LongBench continuation was stopped after this
+    evidence because it is not the speed/quality optimum.
+
+Interpretation:
+
+- Kernel random-activation maxdiff is a useful bug detector and coarse density
+  signal, but it is not sufficient for model quality. `KEEP_RATIO=0.05` looked
+  good in kernel space and still produced unacceptable model-logprob drift.
+- Current fixed sparse policies can recover speed, but none of the tested
+  policies are accepted as "basically no precision loss" for 9B E2E yet.
+  The next selector work should optimize directly against model-logprob drift,
+  likely with per-layer/head density rescue or a small set of high-fidelity
+  layers kept dense.
+
+2026-06-19 TurboQuant KV-cache route revalidation:
+
+- Rechecked the current tree's Google/TurboQuant KV path on SM70 using
+  Qwen3.5-2B-AWQ, TP1, dtype half, `max_model_len=1024`,
+  `max_num_batched_tokens=1024`, `max_num_seqs=1`, `input_len=512`,
+  `output_len=64`, greedy sampling, `logprobs=20`, and `--enforce-eager`.
+  GPU0 was already occupied by a separate long Flash-V100 run, so the accepted
+  artifacts below were collected on GPU2 after verifying it was free.
+- Baseline artifact:
+  `bench_results/sm70_migration_20260619/turboquant_qwen35_2b_awq_auto_kv_i512_o64_eager_20260619.json`.
+  Runtime logs hit ordinary `FLASH_ATTN_V100 prefill path active` and
+  `FLASH_ATTN_V100 decode path active`.
+- Candidate artifact:
+  `bench_results/sm70_migration_20260619/turboquant_qwen35_2b_awq_tq4bit_kv_i512_o64_eager_20260619.json`.
+  Engine kwargs include `kv_cache_dtype=turboquant_4bit_nc`; runtime logs hit
+  `Using TURBOQUANT attention backend`, `TURBOQUANT prefill using Flash-V100
+  dense raw-QKV path`, and `TURBOQUANT decode using Flash-V100 packed-cache
+  path (kv_cache_dtype=turboquant_4bit_nc, mse_bits=4, value_bits=4)`.
+- Compare artifact:
+  `bench_results/sm70_migration_20260619/compare_qwen35_2b_awq_auto_vs_tq4bit_kv_i512_o64_eager_20260619.json`.
+  Result: `equal=true`, `same_request_count=true`, `first_mismatch=null`.
+  Both outputs generated 64 tokens with identical output hash
+  `40b6cb480cff0530e7a1fed4c0facfbea45bfd00c9ef661dca27c94b84380536`.
+  Eager-only request metrics were baseline `tpot=0.0495403s`,
+  `decode_tps=20.1856`, candidate `tpot=0.0517006s`, `decode_tps=19.3421`;
+  do not use these as a speed baseline.
+- A first attempt with `benchmarks/benchmark_sm70_turboquant_quality.py`
+  also reached the same TurboQuant prefill/decode route logs, but the script
+  exited with code 143 during EngineCore shutdown and did not write JSON. Do
+  not cite that attempt as a quality gate.
+- CUDA graph route-hit artifact:
+  `bench_results/sm70_migration_20260619/turboquant_qwen35_2b_awq_tq4bit_kv_i512_o16_graph_20260619.json`.
+  This non-eager smoke used the same model and prompt length but only
+  `output_len=16`. It entered the SM70 0.0.3 compile CUDA graph policy
+  (`mode=VLLM_COMPILE`, `cudagraph_mode=FULL_AND_PIECEWISE`,
+  `capture_sizes=(1, 2)`), completed graph capture, and generated 16 tokens.
+  Runtime logs again hit `Using TURBOQUANT attention backend`,
+  `TURBOQUANT prefill using Flash-V100 dense raw-QKV path`, and
+  `TURBOQUANT decode using Flash-V100 packed-cache path`. Output hash was
+  `220e51bcf45e69de1a35817c9501aadfcae784ed195448b3bf37b05d4aa815a2`.
+  This is route/startup evidence, not a quality gate; graph quality still needs
+  a matched baseline/candidate comparison before promotion.
+
+2026-06-19 2080Ti MTP branch audit:
+
+- Inspected `/tmp/vllm-2080ti-definitive` at `ac2df76` (`v0.1.10+2080ti`,
+  base vLLM `0.21.0`). The branch targets dual RTX 2080 Ti / SM75 and should
+  not be treated as a drop-in SM70/V100 implementation source.
+- Its key MTP safety rule is configuration-level, not a fixed Qwen GDN split
+  repair. `VLLM_ALLOW_MAMBA_SPEC_FULL_CUDAGRAPH` defaults to `0`, and
+  `CompilationConfig.resolve_cudagraph_mode_and_sizes()` downgrades hybrid
+  Mamba/GDN speculative decode from decode `FULL` to `PIECEWISE`/`NONE` unless
+  the user explicitly opts into the full CUDA graph risk.
+- The launcher reinforces the same policy: `normal` MTP uses
+  `cudagraph_mode=PIECEWISE`; `fast` and `aggressive` use
+  `FULL_AND_PIECEWISE` and set `VLLM_ALLOW_MAMBA_SPEC_FULL_CUDAGRAPH=1`.
+  The branch's own comments describe this as a peak-throughput mode that may
+  reduce output stability.
+- Its GDN layer is the generic `gdn_attention_core` path. It does not contain
+  the current tree's Qwen-specific `qwen_gdn_attention_core_spec_commit`,
+  `qwen_gdn_full_forward`, `qwen_gdn_input_projection_core`, or output
+  projection custom-op experiments. The custom op mutates only output buffers
+  (`a_or_z_out`, `core_attn_out`) and relies on avoiding full spec-decode graph
+  replay rather than making conv/SSM cache side effects graph-visible.
+- Its GDN metadata builder uses upstream-style `block_table[:, :num_spec+1]`
+  state rows for spec decode. It does not implement the SM70 align-mode contract
+  now required in this tree: live `current_state_block_ids`, accepted slot
+  selection by `num_accepted_tokens - 1`, `PAD_SLOT_ID` for padded graph rows,
+  and synchronized `num_accepted_tokens_cpu` /
+  `spec_num_accepted_tokens_cpu` reset after rollover.
+- Speed evidence in that branch should be read by route:
+  - LongGen3 Qwen3.6-27B GPTQ-INT4 MTP sweep: noMTP `43.59 tok/s`, MTP3
+    `60.62 tok/s`, MTP4 `60.77 tok/s`, MTP5 `59.55 tok/s`; weighted
+    acceptance falls from `67.9%` at MTP3 to `57.7%` at MTP4.
+  - Profile tables also show selected dual-2080Ti Qwen3.6-27B GPTQ-INT4
+    routes around `85-100 tok/s`, but those mix SM75 hardware, GPTQ-INT4,
+    FP16KV/TurboQuant profiles, and branch-specific launch policy.
+- Actionable carryover for this SM70 tree:
+  - Keep the current full-Qwen-GDN quality guard as the default quality-safe
+    route. The already measured V100 whole-verifier `PIECEWISE` experiment
+    avoids the bad FULL split but decodes at only about `35 tok/s`, so it is
+    not a replacement for the full-GDN guard.
+  - Keep `spec_commit` and other split-Qwen-GDN FULL paths experimental until
+    their recurrent state/spec metadata contract is proven by kernel-level and
+    6k real-output tests.
+  - Borrow the branch's deployment discipline: separate safe/normal/fast
+    profiles, validate MTP with real prompts, and treat MTP3 as the safer
+    mixed-workload starting point while using MTP4 only as a workload-specific
+    speed candidate.
+  - Do not port the generic 2080Ti GDN metadata code into the Qwen3.6 SM70
+    path; it would drop the accepted-state rollover protections already added
+    here.
+
+2026-06-19 Flash-V100 BFLA official-implementation alignment:
+
+- Root cause update: dynamic mass selection was already active in the
+  Flash-V100 BFLA port. `KEEP_MASS=0.99` builds per-Q/K coarse scores, applies
+  softmax, sorts tiles, and keeps tiles until the cumulative probability mass
+  crosses the target. `KEEP_RATIO` is only an additional fixed top-k fallback,
+  not a replacement for dynamic mass.
+- Missing official knobs were added to the Flash-V100 path so future
+  experiments do not silently diverge from the reference:
+  - `VLLM_FLASH_V100_BFLA_SPEC_PROB`
+  - `VLLM_FLASH_V100_BFLA_SPEC_SEED`
+  - `maxabs` pooling mode
+  - `SPEC_STRIDE` now uses the official seed term instead of a hard-coded
+    `+1`.
+- Runner maintenance:
+  - `benchmarks/benchmark_flash_v100_bfla_longbench.py` now accepts and records
+    `--bfla-spec-prob` and `--bfla-spec-seed`.
+  - `benchmarks/benchmark_flash_v100_9b_awq_e2e.py` now records/overrides those
+    envs.
+  - `benchmarks/kernels/benchmark_flash_v100_bfla_prefill.py` now supports
+    both `--spec-stride` and `--spec-prob` in its independent torch mask
+    builder.
+- Full strided20 LongBench artifacts are complete:
+  - Dense:
+    `benchmark-results/longbench_bfla_quality/official_strided20_dense`
+    average score `50.299`, median TTFT `4.788s`, sum TTFT `2295.506s`.
+  - Aggressive README-style `MIN_KV=256`:
+    `benchmark-results/longbench_bfla_quality/official_strided20_bfla_official`
+    average score `42.1893`, median TTFT `4.504s`, sum TTFT `2007.796s`.
+    This is rejected: it saves only about `12.5%` total TTFT on this mixed
+    LongBench slice but loses `8.11` average points.
+  - Length-gated `MIN_KV=32768`:
+    `benchmark-results/longbench_bfla_quality/official_strided20_bfla_minkv32768`
+    average score `50.4694`, median TTFT `4.759s`, sum TTFT `2198.449s`.
+    This preserves quality on the strided20 slice and speeds only the true
+    long-prefix rows.
+- Quality loss concentration:
+  - `MIN_KV=256` loses most quality on 8K-32K prompts while gaining little
+    speed: `passage_retrieval_en` drops `80.83 -> 15.00`, `musique`
+    `42.01 -> 12.72`, `lsht` `60.00 -> 40.00`, `2wikimqa`
+    `64.74 -> 48.70`.
+  - Prompt-token buckets for `MIN_KV=256`: `<8K` roughly flat; `8K-16K`
+    average delta `-14.79` points at only `1.07x` mean TTFT speed; `16K-32K`
+    delta `-15.97` points at `1.25x`; `>=32K` showed no regression on this
+    small slice and averaged `1.78x`.
+- Interpretation:
+  - The official code's function default `bfla_min_prefill_tokens=32768`
+    matters. The README `256` setting is useful for broad/aggressive testing,
+    but it is not quality-safe on our Qwen3.5-9B-AWQ LongBench slice.
+  - The current best default-off candidate remains `MIN_KV=32768`,
+    `KEEP_MASS=0.99`, `KEEP_RATIO=0`, `LOCAL_BLOCKS=8`, `POOL=flat64`.
+    Lowering the gate toward 256 should be treated as an experimental speed
+    mode until retrieval/multihop quality is recovered.
+- Verification:
+  - `python -m py_compile` passed for `vllm/envs.py`,
+    `vllm/v1/attention/backends/flash_attn_v100.py`,
+    `benchmarks/benchmark_flash_v100_bfla_longbench.py`,
+    `benchmarks/benchmark_flash_v100_9b_awq_e2e.py`, and
+    `benchmarks/kernels/benchmark_flash_v100_bfla_prefill.py`.
+  - `git diff --check` passed for the same files.
+
+2026-06-19 Flash-V100 BFLA speed/quality operating point:
+
+- New quality artifact:
+  `benchmark-results/longbench_bfla_quality/selected6_bfla_minkv16384`.
+  This ran Qwen3.5-9B-AWQ TP1, CUDA graph, `max_input_tokens=60000`,
+  `max_num_batched_tokens=8192`, six LongBench tasks, strided 20 samples per
+  task, and `MIN_KV=16384`, `KEEP_MASS=0.99`, `KEEP_RATIO=0`, `POOL=flat64`.
+- Quality, selected six-task slice, dense baseline aligned by
+  `(dataset, source_index)`:
+
+  | task | dense | MIN_KV=256 | delta | MIN_KV=16384 | delta | MIN_KV=32768 | delta |
+  | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+  | passage_retrieval_en | `80.83` | `15.00` | `-65.83` | `80.83` | `+0.00` | `80.83` | `+0.00` |
+  | musique | `42.01` | `12.72` | `-29.29` | `17.72` | `-24.29` | `42.01` | `+0.00` |
+  | 2wikimqa | `64.74` | `48.70` | `-16.04` | `64.74` | `+0.00` | `64.74` | `+0.00` |
+  | narrativeqa | `31.67` | `24.25` | `-7.42` | `29.63` | `-2.05` | `35.22` | `+3.55` |
+  | gov_report | `33.41` | `32.08` | `-1.33` | `32.44` | `-0.96` | `32.89` | `-0.51` |
+  | repobench-p | `64.05` | `59.80` | `-4.25` | `63.00` | `-1.05` | `64.80` | `+0.75` |
+  | selected-six average | `52.79` | `32.09` | `-20.69` | `48.06` | `-4.73` | `53.42` | `+0.63` |
+
+- Quality interpretation:
+  - `MIN_KV=256` is rejected: it is the fastest broad setting but loses
+    `20.69` points on the stress slice and `8.11` points on the full
+    strided20 LongBench slice.
+  - `MIN_KV=16384` is also rejected for default use. It protects the
+    11K-15K retrieval samples but still destroys 16K-18K `musique`
+    multihop quality (`42.01 -> 17.72`), with only `1.04x` selected-slice
+    total-TTFT speedup.
+  - `MIN_KV=32768` is the current operating point: no measured quality drop on
+    the selected slice or full strided20 slice, while still accelerating true
+    long-prefix rows.
+- New speed artifact:
+  `benchmark-results/flash_v100_bfla_9b_sparse_minkv32768_64k_256k_8192_gmem086.json`.
+  This ran Qwen3.5-9B-AWQ TP1, CUDA graph, `max_num_batched_tokens=8192`,
+  `max_model_len=262144`, `max_tokens=1`, and one model load for
+  64K/128K/256K.
+- Long-context TTFT:
+
+  | input tokens | dense TTFT | MIN_KV=256 TTFT | speedup | MIN_KV=32768 TTFT | speedup | ratio20 TTFT | speedup |
+  | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+  | 65,536 | `43.237s` | `18.374s` | `2.35x` | `21.086s` | `2.05x` | `29.377s` | `1.47x` |
+  | 131,072 | `140.911s` | `37.404s` | `3.77x` | `39.928s` | `3.53x` | `75.531s` | `1.87x` |
+  | 261,120 | `499.099s` | `79.077s` | `6.31x` | `81.742s` | `6.11x` | `229.734s` | `2.17x` |
+
+- Decision:
+  - Recommended default-off experimental preset for further model/data testing:
+    `VLLM_FLASH_V100_BFLA_PREFILL=1`,
+    `VLLM_FLASH_V100_BFLA_MIN_Q=256`,
+    `VLLM_FLASH_V100_BFLA_MIN_KV=32768`,
+    `VLLM_FLASH_V100_BFLA_MASK_BLOCK_N=256`,
+    `VLLM_FLASH_V100_BFLA_KEEP_MASS=0.99`,
+    `VLLM_FLASH_V100_BFLA_KEEP_RATIO=0`,
+    `VLLM_FLASH_V100_BFLA_LOCAL_BLOCKS=8`,
+    `VLLM_FLASH_V100_BFLA_POOL=flat64`.
+  - Do not default-enable `MIN_KV=256` or `MIN_KV=16384` until a better
+    selector recovers retrieval/multihop quality in the 16K-32K band.
+
+2026-06-19 Qwen3.6-27B-AWQ TP2 BFLA experiment:
+
+- Purpose: test the default-off BFLA sparse-prefill lane on a real 27B-AWQ
+  model shape before considering broader rollout. The code gate remains
+  `VLLM_FLASH_V100_BFLA_PREFILL=0` by default; these runs explicitly enabled
+  the experimental preset with `MIN_Q=256`, `MIN_KV=32768`,
+  `KEEP_MASS=0.99`, `KEEP_RATIO=0`, `LOCAL_BLOCKS=8`, and `POOL=flat64`.
+- Speed artifacts:
+  - Dense:
+    `benchmark-results/flash_v100_bfla_27b_awq_dense_64k_256k_tp2_8192_gmem088.json`
+  - BFLA:
+    `benchmark-results/flash_v100_bfla_27b_awq_sparse_minkv32768_64k_256k_tp2_8192_gmem088.json`
+  - Model `/home/ymzx/models/Qwen3.6-27B-AWQ`, TP2, CUDA graph,
+    `max_num_batched_tokens=8192`, `max_model_len=262144`,
+    `max_tokens=1`, V100, Flash-V100.
+
+  | input tokens | dense TTFT | BFLA TTFT | speedup | time reduction | dense TPS | BFLA TPS | 1-token hash |
+  | --- | ---: | ---: | ---: | ---: | ---: | ---: | --- |
+  | 65,536 | `75.838s` | `41.984s` | `1.81x` | `44.6%` | `864.2` | `1561.0` | same |
+  | 131,072 | `244.007s` | `83.024s` | `2.94x` | `66.0%` | `537.2` | `1578.7` | same |
+  | 261,120 | `855.071s` | `170.168s` | `5.03x` | `80.1%` | `305.4` | `1534.5` | different |
+
+- Quality artifacts:
+  - Dense 0.86:
+    `benchmark-results/longbench_bfla_quality/27b_awq_tp2_selected3_dense`
+  - BFLA 0.80:
+    `benchmark-results/longbench_bfla_quality/27b_awq_tp2_selected3_bfla_minkv32768_gmem080`
+  - Isolation checks:
+    `benchmark-results/longbench_bfla_quality/27b_awq_tp2_musique_dense_gmem080_isolation`
+    and
+    `benchmark-results/longbench_bfla_quality/27b_awq_tp2_narrativeqa_dense_gmem080_isolation`.
+
+  | task | dense original | BFLA | delta | matched dense 0.80 | matched delta |
+  | --- | ---: | ---: | ---: | ---: | ---: |
+  | passage_retrieval_en | `100.00` | `100.00` | `+0.00` | `100.00` | `+0.00` |
+  | musique | `67.50` | `55.00` | `-12.50` | `55.00` | `+0.00` |
+  | narrativeqa | `37.27` | `26.18` | `-11.09` | `37.27` | `-11.09` |
+  | average | `68.26` | `60.39` | `-7.86` | `64.09` | `-3.70` |
+
+- Interpretation:
+  - Speed is strong and improves with context length, so the sparse lane is a
+    real long-prefill solution candidate for 27B-AWQ.
+  - Quality is not accepted. The matched 0.80 isolation shows `musique` loss is
+    not caused by BFLA, but `narrativeqa` sample `source_index=142`
+    (`59,744` prompt tokens) changes from `Bill`/100 to `Benson`/0 only when
+    BFLA is enabled. Keep the route default-off and treat future work as
+    selector-quality recovery, not default enablement.
+
+2026-06-19 Qwen3.6-27B-AWQ BFLA parameter sweep:
+
+- Kernel sweep artifact:
+  `benchmark-results/flash_v100_bfla_27b_kernel_sweep_20260619_213056.jsonl`.
+  Shape is the real 27B TP2 full-attention geometry:
+  `Hq=12`, `Hkv=2`, `D=256`, `block_size=784`, `q_len=8192`.
+
+  | parameter | 64K keep | 64K total speed | 64K maxdiff | 128K keep | 128K total speed | 128K maxdiff |
+  | --- | ---: | ---: | ---: | ---: | ---: | ---: |
+  | official `mass=.99,ratio=0` | `0.296` | `3.07x` | `0.07678` | `0.183` | `4.82x` | `0.08490` |
+  | `mass=.995` | `0.374` | `2.48x` | `0.06262` | `0.244` | `3.71x` | `0.07898` |
+  | `mass=.999` | `0.581` | `1.61x` | `0.04413` | `0.432` | `2.15x` | `0.05399` |
+  | `ratio=.10` | `0.515` | `1.82x` | `0.03647` | `0.492` | `1.90x` | `0.02823` |
+  | `ratio=.20` | `0.772` | `1.23x` | `0.02267` | `0.755` | `1.25x` | `0.01596` |
+  | `ratio=.40` | `0.967` | `0.99x` | `0.01326` | `0.958` | `0.99x` | `0.00883` |
+  | `spec_prob=.10` | `0.365` | `2.53x` | `0.05737` | `0.265` | `3.43x` | `0.05392` |
+  | `spec_prob=.25` | `0.472` | `1.97x` | `0.04562` | `0.388` | `2.39x` | `0.03561` |
+  | `local_blocks=16` | `0.320` | `2.88x` | `0.06934` | `0.196` | `4.51x` | `0.07916` |
+  | all-keep `mass=1.0` | `1.000` | `0.97x` | `0.00000` | `1.000` | `0.97x` | `0.00000` |
+
+- Bug triage:
+  - All-keep produces exact dense parity (`maxdiff=0`) on both 64K and 128K,
+    so the BFLA paged kernel itself is not the source of the quality failure.
+  - The regression is selector/approximation driven: increasing keep density
+    monotonically lowers maxdiff, but speed drops quickly.
+- Real 27B quality check:
+  - Artifact:
+    `benchmark-results/longbench_bfla_quality/27b_awq_tp2_narrativeqa_bfla_ratio20_minkv32768_gmem080`.
+  - `ratio=.10` artifacts:
+    `benchmark-results/longbench_bfla_quality/27b_awq_tp2_narrativeqa_bfla_ratio10_minkv32768_lazy_gmem080`
+    plus the graph-mode source-199 repair run
+    `benchmark-results/longbench_bfla_quality/27b_awq_tp2_narrativeqa_bfla_ratio10_minkv32768_lazy_gmem080_src199_graph`.
+  - Dataset: `narrativeqa`, strided 8, same samples as dense isolation.
+
+  | variant | score | source `142` / 59,744 tokens | source `199` / 33,873 tokens |
+  | --- | ---: | --- | --- |
+  | dense 0.80 | `37.27` | `Bill`, `100.00` | `When Ryuji dies`, `15.38` |
+  | official BFLA | `26.18` | `Benson`, `0.00` | `When she finds Ryuji dead`, `26.67` |
+  | `ratio=.10` BFLA | `41.43` | `Bill`, `100.00` | `When Ryuji dies`, `15.38` |
+  | `ratio=.20` BFLA | `39.51` | `Bill`, `100.00` | `After Ryuji's death`, `0.00` |
+
+  Matched 8-sample mean TTFT on the same slice: dense `27.67s`,
+  `ratio=.10` `23.94s`, `ratio=.20` `23.45s`. On the three samples with
+  `prompt_tokens >= 32768`, mean TTFT is dense `44.83s`, `ratio=.10`
+  `34.00s`, `ratio=.20` `34.41s`.
+- Standalone speed artifacts, 27B-AWQ TP2, CUDA graph, `max_num_batched_tokens=8192`,
+  `gpu_memory_utilization=0.88`, `safetensors_load_strategy=lazy` for fixed-ratio
+  runs:
+  - `ratio=.10`:
+    `benchmark-results/flash_v100_bfla_27b_awq_sparse_ratio10_minkv32768_64k_128k_tp2_8192_gmem088_lazy.json`.
+  - `ratio=.20`:
+    `benchmark-results/flash_v100_bfla_27b_awq_sparse_ratio20_minkv32768_64k_128k_tp2_8192_gmem088_lazy.json`.
+
+  | input tokens | dense TTFT | official `ratio=0` | `ratio=.10` | `ratio=.20` | `ratio=.10` vs dense | `ratio=.10` vs `ratio=.20` |
+  | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+  | 65,536 | `75.838s` | `41.984s` | `47.293s` | `55.078s` | `1.60x` | `1.16x` |
+  | 131,072 | `244.007s` | `83.024s` | `111.996s` | `144.504s` | `2.18x` | `1.29x` |
+
+- Interpretation:
+  - `ratio=.20` fixes the main long-sample failure and improves the small
+    `narrativeqa` slice over dense, but it introduces a different sample-level
+    regression and only has about `1.25x` kernel speed at 128K.
+  - `ratio=.10` now runs with `safetensors_load_strategy=lazy` and is the
+    better 27B quality point on this `narrativeqa` slice: it keeps the source
+    `142` repair and restores source `199` to the dense answer. One 8-sample
+    CUDA-graph run segfaulted after 7 samples; the missing source `199` then
+    passed as an isolated CUDA-graph run, so treat this as a lifecycle
+    stability issue to reproduce separately, not a source-199 quality failure.
+  - Current best known fixed-ratio 27B point is `ratio=.10`: it is faster than
+    `ratio=.20` at both 64K and 128K and better on the `narrativeqa` slice.
+    The route remains default-off because it is approximate and still needs
+    broader LongBench validation plus a clean 256K speed run. A 262K one-shot
+    speed attempt hung during decode full graph capture; rerun 256K as an
+    isolated case before recording long-tail speed.
+
+2026-06-19 Qwen3.6-27B BFLA ratio default:
+
+- Route change:
+  - `VLLM_FLASH_V100_BFLA_PREFILL` remains globally default-off.
+  - When BFLA is explicitly enabled and
+    `VLLM_FLASH_V100_BFLA_KEEP_RATIO` is not set, the SM70 Flash-V100 baseline
+    now auto-sets `VLLM_FLASH_V100_BFLA_KEEP_RATIO=0.10` for the 27B
+    attention shape `num_attention_heads=24`, `num_key_value_heads=4`,
+    `head_dim=256`.
+  - This default follows model architecture, not quantization. Qwen3.6-27B-AWQ
+    and Qwen3.6-27B-FP8 have the same text config and both use runtime
+    attention block size `784` on this hybrid layout.
+- Benchmark harness change:
+  - `benchmark_flash_v100_bfla_longbench.py` no longer passes an implicit
+    `--bfla-keep-ratio 0.0`; unset means the runtime architecture default can
+    apply. Passing `--bfla-keep-ratio` still overrides it.
+  - The 9B/27B E2E Flash-V100 harness now accepts `--quantization` and
+    `--kv-cache-dtype`, so AWQ/FP8 can share the same long-prefill test path.
+- FP8 route-hit and quality evidence:
+  - Model `/home/ymzx/models/Qwen3.6-27B-FP8`, TP2, CUDA graph,
+    `quantization=fp8`, `max_model_len=65536`, `max_num_batched_tokens=8192`,
+    `gpu_memory_utilization=0.80`, `safetensors_load_strategy=lazy`.
+  - Ratio10-auto artifact:
+    `benchmark-results/longbench_bfla_quality/27b_fp8_tp2_narrativeqa_bfla_ratio10_auto_minkv32768_gmem080_src142_199`.
+    Logs confirmed auto-setting `VLLM_FLASH_V100_BFLA_KEEP_RATIO=0.10` and
+    BFLA sparse prefix prefill route hit.
+  - Ratio20 artifact:
+    `benchmark-results/longbench_bfla_quality/27b_fp8_tp2_narrativeqa_bfla_ratio20_minkv32768_gmem080_src142_199`.
+  - Dense baseline artifact:
+    `benchmark-results/longbench_bfla_quality/27b_fp8_tp2_narrativeqa_dense_gmem080_src142_199`.
+
+  | variant | source `142` / 59,744 tokens | source `199` / 33,873 tokens |
+  | --- | --- | --- |
+  | dense FP8 | `100.00`, TTFT `67.564s` | `15.38`, TTFT `30.150s` |
+  | `ratio=.10` auto FP8 | `100.00`, TTFT `46.610s` | `15.38`, TTFT `26.078s` |
+  | `ratio=.20` FP8 | `100.00`, TTFT `50.571s` | `15.38`, TTFT `27.273s` |
+
+- Interpretation:
+  - FP8 does not show a reason to prefer `ratio=.20` on the two AWQ-sensitive
+    `narrativeqa` samples. `ratio=.10` preserves the dense answers and is
+    faster than `ratio=.20`.
+  - The current default for explicitly enabled 27B BFLA should therefore be
+    architecture-driven `ratio=.10` for both AWQ and FP8. This is still an
+    experimental approximate path, not a global default-enable decision.
+
+2026-06-19 AWQ Marlin backend sharing SM70 TurboMind MoE:
+
+- Route change:
+  - Explicit AWQ Marlin still keeps dense linear layers on Marlin.
+  - On exact SM70, AWQ Marlin `RoutedExperts` now selects
+    `AWQSM70MoEMethod` when `VLLM_SM70_AWQ_TURBOMIND=1`,
+    `VLLM_SM70_AWQ_MOE_DISABLE=0`, 4-bit AWQ zero-points are present,
+    `group_size` is 32/64/128, and the MoE has no bias.
+  - This lets `VLLM_SM70_QUANT_BACKEND=marlin` reuse the accepted
+    TurboMind AWQ MoE batched and legacy single-token compact routes without
+    moving dense AWQ linear layers to TurboMind.
+- Route-hit evidence:
+  - Lightweight dispatch check under
+    `CUDA_DEVICE_ORDER=PCI_BUS_ID CUDA_VISIBLE_DEVICES=2,3
+    VLLM_SM70_QUANT_BACKEND=marlin` returned `AWQSM70MoEMethod`.
+  - Full Qwen3.6-35B-A3B-AWQ TP2 run logged all MoE layers selecting
+    `SM70 AWQ TurboMind MoE route under AWQ Marlin`, then
+    `SM70 AWQ MoE TurboMind batched path enabled (256 experts)`.
+  - SM70 warmup logged `0 AWQ dense calls` and `8 MoE stage calls`,
+    confirming this is dense Marlin plus TurboMind MoE, not a full TurboMind
+    dense route.
+- Speed evidence, diagnostic non-AOT CUDA-graph lane:
+  - Artifact:
+    `benchmark-results/backend_compare/qwen36_35b_a3b_awq_tp2_1k256_marlin_sm70_moe_noaot.json`.
+  - Model `/home/ymzx/models/Qwen3.6-35B-A3B-AWQ`, TP2,
+    `CUDA_VISIBLE_DEVICES=2,3`, input 1024, output 256, warmup 1,
+    repeat 3, `enforce_eager=False`, CUDA graph capture completed,
+    `VLLM_USE_AOT_COMPILE=0`.
+  - Results: prefill mean `0.16744185999656716s`, pure decode mean
+    `2.455101999997472s`, steady decode `103.86533844031753 tok/s`,
+    output TPS `97.54255688686705`.
+  - Previous explicit Marlin artifact
+    `qwen36_35b_a3b_awq_tp2_1k256_marlin.json`: pure decode
+    `4.860214932016485s`, steady decode `52.466815985039126 tok/s`.
+  - Same-run TurboMind artifact
+    `qwen36_35b_a3b_awq_tp2_1k256_turbomind.json`: pure decode
+    `2.4804601893314007s`, steady decode `102.80353182983112 tok/s`.
+  - The new Marlin+SM70-MoE path therefore recovers the old Marlin decode
+    gap to TurboMind-level speed on this diagnostic lane.
+- Quality/hash note:
+  - The new Marlin+SM70-MoE token hash
+    `782d4576cb63874bdba78d84d46e278e549ac366c6d2fd3b3bc47567bd9b9694`
+    matches the previous explicit Marlin artifact, as expected because dense
+    Marlin remains unchanged.
+  - It differs from the full TurboMind artifact hash
+    `8bb2d07e7551200c4c0107722dc4f333c34c8972df13343203b824d86820295f`,
+    which uses the TurboMind dense AWQ route.
+- AOT status:
+  - The AOT benchmark variant failed during CUDA graph capture with the
+    existing Torch Dynamo guard serialization error:
+    `pybind11_detail_function_record... is not pickleable`.
+  - This is the same AOT failure reproduced before and after the MoE route
+    change; do not count it as a Marlin+SM70-MoE route failure.
+
+2026-06-19 Qwen3.6-27B-AWQ TP2 backend speed check:
+
+- Model `/home/ymzx/models/Qwen3.6-27B-AWQ`, TP2,
+  `CUDA_VISIBLE_DEVICES=2,3`, input 1024, output 256, warmup 1, repeat 3,
+  `enforce_eager=False`, CUDA graph capture completed,
+  `VLLM_USE_AOT_COMPILE=0`.
+- This model is dense `Qwen3_5ForConditionalGeneration`, not A3B MoE, so this
+  compares dense AWQ Marlin against dense AWQ TurboMind rather than the shared
+  AWQ MoE route.
+- Explicit Marlin artifact:
+  `benchmark-results/backend_compare/qwen36_27b_awq_tp2_1k256_marlin_noaot.json`.
+  Results: prefill mean `0.6993483946813891s`, pure decode mean
+  `13.662682776659494s`, steady decode `18.663977274249053 tok/s`, output TPS
+  `17.82150392717129`.
+- TurboMind artifact:
+  `benchmark-results/backend_compare/qwen36_27b_awq_tp2_1k256_turbomind_noaot.json`.
+  Results: prefill mean `0.5528312949851776s`, pure decode mean
+  `4.778137704677647s`, steady decode `53.3680728780179 tok/s`, output TPS
+  `48.00268552503858`.
+- Interpretation: for dense 27B AWQ, the current SM70 TurboMind dense route is
+  about `2.86x` faster than explicit Marlin on pure decode and about `2.69x`
+  faster on end-to-end output TPS under this diagnostic CUDA-graph lane.
+
+2026-06-19 Qwen3.6-27B-AWQ explicit Marlin dense speed recovery:
+
+- Route change:
+  - Exact-SM70 AWQ Marlin dense Linear now prepares the original AWQ packed
+    weights with the same SM70 TurboMind AWQ dense layout used by the `awq`
+    route, then calls `awq_gemm_sm70_out` directly at runtime.
+  - The branch is limited to 4-bit AWQ with zero-points, group size 32/64/128,
+    default A16 activations, CUDA capability exactly 7.0, and
+    `VLLM_SM70_AWQ_TURBOMIND=1`.
+  - Unsupported cases still fall through to the existing AWQ-to-Marlin
+    conversion plus `MarlinLinearKernel`.
+- Route-hit evidence:
+  - Run command used TP2 on physical GPUs `2,3` with
+    `CUDA_DEVICE_ORDER=PCI_BUS_ID CUDA_VISIBLE_DEVICES=2,3`,
+    `VLLM_SM70_QUANT_BACKEND=marlin`, `VLLM_USE_AOT_COMPILE=0`,
+    input 1024, output 256, warmup 1, repeat 3, greedy ignore-EOS,
+    `enforce_eager=False`, and CUDA graph capture completed.
+  - Logs include `Using MarlinLinearKernel for AWQMarlinLinearMethod`,
+    `SM70 AWQ TurboMind dense path enabled under AWQ Marlin`, and
+    `SM70 TurboMind warmup finished (20 AWQ dense calls, 0 FP8 dense calls,
+    0 FP4 dense calls, 0 MoE stage calls, 0 single-token active-expert calls)`.
+  - An attempted generic `sm70_turbomind.apply_prepared_linear` reuse was
+    rejected because CUDA graph capture could hang; the accepted implementation
+    mirrors the direct field/apply structure of `AWQLinearMethod`.
+- Speed evidence:
+  - Artifact:
+    `benchmark-results/backend_compare/qwen36_27b_awq_tp2_1k256_marlin_sm70_dense_noaot.json`.
+  - New explicit Marlin+SM70-dense results: prefill mean
+    `0.49903542932588607s`, pure decode mean `4.928026396334947s`,
+    steady decode `51.74485292546152 tok/s`, output TPS
+    `47.15263017971813`.
+  - Previous explicit Marlin artifact
+    `qwen36_27b_awq_tp2_1k256_marlin_noaot.json`: pure decode
+    `13.662682776659494s`, steady decode `18.663977274249053 tok/s`,
+    output TPS `17.82150392717129`.
+  - Previous TurboMind artifact
+    `qwen36_27b_awq_tp2_1k256_turbomind_noaot.json`: pure decode
+    `4.778137704677647s`, steady decode `53.3680728780179 tok/s`,
+    output TPS `48.00268552503858`.
+  - The recovered Marlin path is `2.77x` faster than old explicit Marlin on
+    pure decode and is within about `3.0%` of the recorded TurboMind steady
+    decode artifact on the same diagnostic lane.
+- Quality/hash note:
+  - New Marlin+SM70-dense token hash
+    `498a54a24f7caa632d007d4230ea185365eee764d3e69a6674ed3eafe98b742f`
+    matches the TurboMind artifact hash and differs from the old explicit
+    Marlin hash
+    `53f4a9b6bdc3890f2c0e0b6324e3b7a704434a0316f5023a7f6eab1e16a119f5`,
+    as expected because dense AWQ now uses the same SM70 TurboMind math path.
+
+2026-06-19 Qwen3.5-27B-NVFP4 explicit Marlin dense speed recovery:
+
+- Build/route fix:
+  - The active `_C` extension was replaced with the SM70-Marlin build from
+    `build/temp.linux-x86_64-cpython-312-sm70-marlin-v100/_C.abi3.so`.
+    Its hash is
+    `a40e35ee98a93786fcdb9b0c1476dc79e0e9aeb63376679106f69dc7af9f1624`,
+    matching the active `vllm/_C.abi3.so`.
+  - `CMakeLists.txt` now defines `ENABLE_SM70_MARLIN=1` only for the pure
+    SM70 Marlin build, and `_C::sm70_marlin_available()` exposes that marker
+    to Python. `is_fp4_marlin_supported()` accepts exact SM70 only when this
+    marker is present, preventing a mixed/non-SM70 extension from silently
+    advertising V100 Marlin FP4 support.
+- Route change:
+  - Explicit compressed-tensors NVFP4 Marlin on exact SM70 now follows the AWQ
+    dense recovery precedent: the public backend remains `marlin`, but W4A4
+    and W4A16 NVFP4 layers prepare their packed FP4 weights into the SM70
+    TurboMind dense layout and call the existing SM70 FP4 dense op at runtime.
+  - The helper gate is `should_prepare_turbomind_or_marlin(...)`, so `auto` /
+    `turbomind` still use the TurboMind route and explicit `marlin` gets the
+    same V100-optimized dense kernel instead of the slow generic Marlin FP4
+    GEMM.
+  - Generic explicit Marlin NVFP4 is kept as a fallback for unsupported
+    devices/builds. It remains too slow on this V100 target and should not be
+    used as the accepted performance path.
+- Route-hit evidence:
+  - Import check after rebuild returned `sm70_marlin_available=True` and
+    `is_fp4_marlin_supported=True`.
+  - Dummy V100 W4A16 route check under
+    `CUDA_DEVICE_ORDER=PCI_BUS_ID CUDA_VISIBLE_DEVICES=0
+    VLLM_SM70_QUANT_BACKEND=marlin` produced
+    `prepared=True`, `op_kind=nvfp4`, `tm_weight_shape=(5120, 32)`,
+    `tm_scales_shape=(320, 256)`, and a finite `fp16` output.
+  - Full speed run logs include `linear_backend='marlin'`,
+    `SM70 compressed-tensors NVFP4 TurboMind W4A16 dense path enabled`,
+    SM70 FP4 dense warmup, Flash-V100 attention, and CUDA graph capture
+    completion. This is not eager mode.
+- Speed evidence:
+  - Model:
+    `/home/ymzx/.cache/huggingface/hub/models--apolo13x--Qwen3.5-27B-NVFP4/snapshots/f48cfc832696cccd195ac305ff7d2ffaeeab4d28`.
+  - Shared benchmark shape: TP2, input 1024, output 256, warmup 1, repeat 3,
+    greedy ignore-EOS, `max_model_len=2048`, `max_num_batched_tokens=1024`,
+    `max_num_seqs=1`, CUDA graph enabled, `VLLM_USE_AOT_COMPILE=0`.
+  - Previous explicit Marlin artifact
+    `benchmark-results/backend_compare/qwen35_27b_nvfp4_tp2_1k256_marlin_sm70_noaot.json`:
+    prefill mean `0.6863738586544059s`, pure decode mean
+    `14.440067318995716s`, steady decode `17.659334377029335 tok/s`,
+    output TPS `16.922189925405288`.
+  - TurboMind baseline artifact
+    `benchmark-results/backend_compare/qwen35_27b_nvfp4_tp2_1k256_turbomind_noaot.json`:
+    prefill mean `0.566358134325128s`, pure decode mean
+    `4.882517051330069s`, steady decode `52.236148206072734 tok/s`,
+    output TPS `46.968546554682085`.
+  - Recovered explicit Marlin+SM70-FP4-dense artifact
+    `benchmark-results/backend_compare/qwen35_27b_nvfp4_tp2_1k256_marlin_sm70_tmfast_noaot.json`:
+    prefill mean `0.5595701336569618s`, pure decode mean
+    `4.818029662012123s`, steady decode `52.926199764454076 tok/s`,
+    output TPS `47.58765693562373`.
+  - The recovered Marlin path is about `3.0x` faster than old explicit Marlin
+    on pure decode and is within measurement noise of the TurboMind baseline
+    on the same TP2 1k/256 lane.
+- Quality/hash note:
+  - Recovered Marlin, old explicit Marlin, and TurboMind baseline all produced
+    the same token hash:
+    `26514f49d19f5ba1cca5fc71c8ae28834263c50054b6db43f6e95a282b5a221a`.
+  - This verifies the speed recovery did not change the deterministic greedy
+    output for this benchmark prompt.

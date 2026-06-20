@@ -195,6 +195,12 @@ class EngineCore:
         if self.batch_queue_size > 1:
             logger.debug("Batch queue is enabled with size %d", self.batch_queue_size)
             self.batch_queue = deque(maxlen=self.batch_queue_size)
+            if envs.VLLM_SM70_ASYNC_SCHEDULING_QUEUE_DEPTH > 0:
+                logger.info(
+                    "SM70 async scheduling queue depth override active: %d",
+                    self.batch_queue_size,
+                )
+        self._sm70_async_cpu_trace_step = 0
 
         self.is_ec_consumer = (
             vllm_config.ec_transfer_config is None
@@ -497,6 +503,21 @@ class EngineCore:
         batch_queue = self.batch_queue
         assert batch_queue is not None
 
+        trace_enabled = envs.VLLM_SM70_ASYNC_CPU_TRACE
+        trace_step = self._sm70_async_cpu_trace_step
+        trace_log = trace_enabled and (
+            trace_step % envs.VLLM_SM70_ASYNC_CPU_TRACE_EVERY == 0
+        )
+        if trace_enabled:
+            self._sm70_async_cpu_trace_step += 1
+        trace_t0 = time.perf_counter() if trace_log else 0.0
+        trace_schedule_ms = 0.0
+        trace_execute_submit_ms = 0.0
+        trace_sample_submit_ms = 0.0
+        trace_wait_ms = 0.0
+        trace_update_ms = 0.0
+        trace_scheduled_tokens = 0
+
         # Try to schedule a new batch if the batch queue is not full, but
         # the scheduler may return an empty batch if all requests are scheduled.
         # Note that this is not blocking.
@@ -505,11 +526,22 @@ class EngineCore:
         model_executed = False
         deferred_scheduler_output = None
         if self.scheduler.has_requests():
+            trace_schedule_t0 = time.perf_counter() if trace_log else 0.0
             scheduler_output = self.scheduler.schedule()
+            if trace_log:
+                trace_schedule_ms = (
+                    time.perf_counter() - trace_schedule_t0
+                ) * 1000.0
+                trace_scheduled_tokens = scheduler_output.total_num_scheduled_tokens
             with self.log_error_detail(scheduler_output):
+                trace_execute_t0 = time.perf_counter() if trace_log else 0.0
                 exec_future = self.model_executor.execute_model(
                     scheduler_output, non_block=True
                 )
+                if trace_log:
+                    trace_execute_submit_ms = (
+                        time.perf_counter() - trace_execute_t0
+                    ) * 1000.0
             if self.is_ec_consumer:
                 model_executed = scheduler_output.total_num_scheduled_tokens > 0
 
@@ -520,12 +552,17 @@ class EngineCore:
                 if not scheduler_output.pending_structured_output_tokens:
                     # We aren't waiting for any tokens, get any grammar output
                     # and sample immediately.
+                    trace_sample_t0 = time.perf_counter() if trace_log else 0.0
                     grammar_output = self.scheduler.get_grammar_bitmask(
                         scheduler_output
                     )
                     future = self.model_executor.sample_tokens(
                         grammar_output, non_block=True
                     )
+                    if trace_log:
+                        trace_sample_submit_ms = (
+                            time.perf_counter() - trace_sample_t0
+                        ) * 1000.0
                 else:
                     # We need to defer sampling until we have processed the model output
                     # from the prior step.
@@ -541,6 +578,23 @@ class EngineCore:
                 ):
                     # Don't block on next worker response unless the queue is full
                     # or there are no more requests to schedule.
+                    if trace_log:
+                        logger.info(
+                            "SM70 async cpu trace step=%d mode=enqueue_return "
+                            "total_ms=%.3f schedule_ms=%.3f "
+                            "execute_submit_ms=%.3f sample_submit_ms=%.3f "
+                            "queue_len=%d queue_size=%d scheduled_tokens=%d "
+                            "oldest_done=%s",
+                            trace_step,
+                            (time.perf_counter() - trace_t0) * 1000.0,
+                            trace_schedule_ms,
+                            trace_execute_submit_ms,
+                            trace_sample_submit_ms,
+                            len(batch_queue),
+                            self.batch_queue_size,
+                            trace_scheduled_tokens,
+                            batch_queue[-1][0].done(),
+                        )
                     return None, True
 
         elif not batch_queue:
@@ -555,7 +609,10 @@ class EngineCore:
             self.log_error_detail(scheduler_output),
             self.log_iteration_details(scheduler_output),
         ):
+            trace_wait_t0 = time.perf_counter() if trace_log else 0.0
             model_output = future.result()
+            if trace_log:
+                trace_wait_ms = (time.perf_counter() - trace_wait_t0) * 1000.0
             if model_output is None:
                 # None from sample_tokens() implies that the original execute_model()
                 # call failed - raise that exception.
@@ -565,9 +622,12 @@ class EngineCore:
         # Before processing the model output, process any aborts that happened
         # during the model execution.
         self._process_aborts_queue()
+        trace_update_t0 = time.perf_counter() if trace_log else 0.0
         engine_core_outputs = self.scheduler.update_from_output(
             scheduler_output, model_output
         )
+        if trace_log:
+            trace_update_ms = (time.perf_counter() - trace_update_t0) * 1000.0
 
         # NOTE(nick): We can either handle the deferred tasks here or save
         # in a field and do it immediately once step_with_batch_queue is
@@ -592,6 +652,26 @@ class EngineCore:
             )
             future = self.model_executor.sample_tokens(grammar_output, non_block=True)
             batch_queue.appendleft((future, deferred_scheduler_output, exec_future))
+
+        if trace_log:
+            logger.info(
+                "SM70 async cpu trace step=%d mode=block_result total_ms=%.3f "
+                "schedule_ms=%.3f execute_submit_ms=%.3f "
+                "sample_submit_ms=%.3f wait_ms=%.3f update_ms=%.3f "
+                "queue_len=%d queue_size=%d scheduled_tokens=%d "
+                "deferred_sample=%s",
+                trace_step,
+                (time.perf_counter() - trace_t0) * 1000.0,
+                trace_schedule_ms,
+                trace_execute_submit_ms,
+                trace_sample_submit_ms,
+                trace_wait_ms,
+                trace_update_ms,
+                len(batch_queue),
+                self.batch_queue_size,
+                trace_scheduled_tokens,
+                deferred_scheduler_output is not None,
+            )
 
         return engine_core_outputs, model_executed
 

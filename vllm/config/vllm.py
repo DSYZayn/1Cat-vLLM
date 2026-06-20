@@ -1129,7 +1129,7 @@ class VllmConfig:
             and current_platform.is_cuda()
             and current_platform.is_device_capability((7, 0))
             and envs.VLLM_SM70_FP8_DEQUANT_FALLBACK
-            and envs.VLLM_SM70_FP8_TURBOMIND
+            and envs.use_sm70_turbomind(envs.VLLM_SM70_FP8_TURBOMIND)
             and "VLLM_SM70_FP8_MOE_DEQUANT_FALLBACK" not in os.environ
         ):
             os.environ["VLLM_SM70_FP8_MOE_DEQUANT_FALLBACK"] = "0"
@@ -1149,6 +1149,8 @@ class VllmConfig:
             and current_platform.is_device_capability((7, 0))
             and envs.VLLM_SM70_FP8_DEQUANT_FALLBACK
             and envs.VLLM_SM70_FP8_MOE_DEQUANT_FALLBACK
+            and not envs.use_sm70_turbomind(envs.VLLM_SM70_FP8_TURBOMIND)
+            and not envs.force_sm70_marlin()
             and "VLLM_SM70_FP8_TURBOMIND" not in os.environ
         ):
             os.environ["VLLM_SM70_FP8_TURBOMIND"] = "0"
@@ -1164,6 +1166,30 @@ class VllmConfig:
             and envs.VLLM_SM70_FLASH_ATTN_V100
         )
         if sm70_flash_v100_baseline:
+            if (
+                envs.VLLM_FLASH_V100_BFLA_PREFILL
+                and self.model_config is not None
+                and "VLLM_FLASH_V100_BFLA_KEEP_RATIO" not in os.environ
+            ):
+                hf_text_config = self.model_config.hf_text_config
+                num_attention_heads = getattr(
+                    hf_text_config, "num_attention_heads", None
+                )
+                num_key_value_heads = getattr(
+                    hf_text_config, "num_key_value_heads", num_attention_heads
+                )
+                head_dim = getattr(hf_text_config, "head_dim", None)
+                if (
+                    num_attention_heads == 24
+                    and num_key_value_heads == 4
+                    and head_dim == 256
+                ):
+                    os.environ["VLLM_FLASH_V100_BFLA_KEEP_RATIO"] = "0.10"
+                    logger.info_once(
+                        "Auto-setting VLLM_FLASH_V100_BFLA_KEEP_RATIO=0.10 "
+                        "for the SM70 Flash-V100 BFLA Qwen3.5/3.6-27B "
+                        "attention shape. Set it explicitly to override."
+                    )
             sm70_baseline_env_defaults = {
                 "VLLM_ENABLE_FLA_PACKED_RECURRENT_DECODE": "1",
                 "VLLM_SM70_GDN_KKT_SCHEDULE": "1",
@@ -1454,7 +1480,7 @@ class VllmConfig:
                 and self.model_config.quantization == "fp8"
                 and current_platform.is_cuda()
                 and current_platform.is_device_capability((7, 0))
-                and envs.VLLM_SM70_FP8_TURBOMIND
+                and envs.use_sm70_turbomind(envs.VLLM_SM70_FP8_TURBOMIND)
             ):
                 return False
             return True

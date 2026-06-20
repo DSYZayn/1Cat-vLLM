@@ -29,6 +29,18 @@ logger = init_logger(__name__)
 
 _SM70_GDN_STATE_TABLE_DUMP_COUNTS: dict[int, int] = {}
 
+GDN_SPEC_METADATA_TENSORS = tuple[
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+]
+_GDN_SPEC_METADATA_TENSOR_REGISTRY: dict[str, GDN_SPEC_METADATA_TENSORS] = {}
+
 
 def _sm70_flashqla_original_prefill_enabled() -> bool:
     raw = os.getenv("VLLM_SM70_FLASHQLA_ORIGINAL_PREFILL")
@@ -197,16 +209,7 @@ def _empty_gdn_spec_metadata_tensors(
 def gdn_spec_metadata_tensors(
     attn_metadata: GDNAttentionMetadata | None,
     device: torch.device,
-) -> tuple[
-    torch.Tensor,
-    torch.Tensor,
-    torch.Tensor,
-    torch.Tensor,
-    torch.Tensor,
-    torch.Tensor,
-    torch.Tensor,
-    torch.Tensor,
-]:
+) -> GDN_SPEC_METADATA_TENSORS:
     """Return graph-visible active-MTP metadata tensors for Qwen GDN ops."""
     if attn_metadata is None:
         return _empty_gdn_spec_metadata_tensors(device)
@@ -231,6 +234,26 @@ def gdn_spec_metadata_tensors(
         ),
         _or_empty_i32(attn_metadata.num_accepted_tokens),
     )
+
+
+def register_gdn_spec_metadata_tensors(
+    layer_names: list[str],
+    tensors: GDN_SPEC_METADATA_TENSORS,
+) -> None:
+    for layer_name in layer_names:
+        _GDN_SPEC_METADATA_TENSOR_REGISTRY[layer_name] = tensors
+
+
+def get_registered_gdn_spec_metadata_tensors(
+    layer_name: str,
+    device: torch.device,
+) -> GDN_SPEC_METADATA_TENSORS:
+    tensors = _GDN_SPEC_METADATA_TENSOR_REGISTRY.get(layer_name)
+    if tensors is None:
+        return _empty_gdn_spec_metadata_tensors(device)
+    if tensors[0].device != device:
+        return _empty_gdn_spec_metadata_tensors(device)
+    return tensors
 
 
 def gather_gdn_state_block_ids(
@@ -329,10 +352,56 @@ def build_gdn_spec_decode_state_contract(
             num_spec,
         )
 
+    spec_num_accepted_tokens = num_accepted_tokens[accepted_mask]
+    if os.getenv("VLLM_SM70_GDN_STATE_CONTRACT_ASSERT") == "1":
+        if spec_num_accepted_tokens.numel() != spec_state_indices_tensor.shape[0]:
+            raise AssertionError(
+                "GDN spec state contract mismatch: accepted-token rows do "
+                "not match spec state rows"
+            )
+        invalid_accept = (spec_num_accepted_tokens < 1) | (
+            spec_num_accepted_tokens > num_spec + 1
+        )
+        if torch.any(invalid_accept).item():
+            raise AssertionError(
+                "GDN spec state contract mismatch: num_accepted_tokens must "
+                f"be in [1, {num_spec + 1}], got "
+                f"{spec_num_accepted_tokens.detach().cpu().tolist()}"
+            )
+        if spec_state_indices_tensor.numel() > 0:
+            rows = torch.arange(
+                spec_state_indices_tensor.shape[0],
+                device=spec_state_indices_tensor.device,
+                dtype=torch.long,
+            )
+            accepted_offsets = spec_num_accepted_tokens.to(
+                device=spec_state_indices_tensor.device,
+                dtype=torch.long,
+                non_blocking=True,
+            ) - 1
+            selected_state_slots = spec_state_indices_tensor[
+                rows, accepted_offsets
+            ]
+            if torch.any(selected_state_slots == PAD_SLOT_ID).item():
+                raise AssertionError(
+                    "GDN spec state contract mismatch: accepted slot points "
+                    "to PAD_SLOT_ID"
+                )
+        if current_state_block_ids is not None:
+            current_mask = _mask_for(current_state_block_ids)
+            active_state_ids = current_state_block_ids[
+                current_mask, : num_spec + 1
+            ]
+            if torch.any(active_state_ids == PAD_SLOT_ID).item():
+                raise AssertionError(
+                    "GDN spec state contract mismatch: active align-mode "
+                    "state ids contain PAD_SLOT_ID"
+                )
+
     return GDNSpecDecodeStateContract(
         spec_state_indices_tensor=spec_state_indices_tensor,
         non_spec_state_indices_tensor=non_spec_state_indices_tensor,
-        num_accepted_tokens=num_accepted_tokens[accepted_mask],
+        num_accepted_tokens=spec_num_accepted_tokens,
     )
 
 
@@ -424,6 +493,37 @@ class GDNAttentionMetadataBuilder(AttentionMetadataBuilder[GDNAttentionMetadata]
             dtype=torch.int32,
             device=device,
         )
+        if self.use_spec_decode and envs.VLLM_SM70_QWEN_GDN_SPEC_CORE_OP:
+            placeholder_rows = max(
+                1, min(self.num_spec + 1, self.decode_cudagraph_max_bs)
+            )
+            self.non_spec_query_start_loc[: placeholder_rows + 1].fill_(0)
+            self.non_spec_state_indices_tensor[:placeholder_rows].fill_(PAD_SLOT_ID)
+            self.spec_query_start_loc[: placeholder_rows + 1].fill_(0)
+            self.spec_state_indices_tensor[:placeholder_rows].fill_(PAD_SLOT_ID)
+            self.spec_sequence_masks[:placeholder_rows].fill_(False)
+            self.spec_token_indx[:placeholder_rows].copy_(
+                torch.arange(
+                    placeholder_rows,
+                    dtype=torch.int32,
+                    device=device,
+                )
+            )
+            self.non_spec_token_indx[:0].fill_(0)
+            self.num_accepted_tokens[:placeholder_rows].fill_(1)
+            register_gdn_spec_metadata_tensors(
+                self.layer_names,
+                (
+                    self.non_spec_query_start_loc[: placeholder_rows + 1],
+                    self.non_spec_state_indices_tensor[:placeholder_rows],
+                    self.spec_query_start_loc[: placeholder_rows + 1],
+                    self.spec_state_indices_tensor[:placeholder_rows],
+                    self.spec_token_indx[:placeholder_rows],
+                    self.non_spec_token_indx[:0],
+                    self.spec_sequence_masks[:placeholder_rows],
+                    self.num_accepted_tokens[:placeholder_rows],
+                ),
+            )
 
     def build(  # type: ignore[override]
         self,
@@ -550,6 +650,33 @@ class GDNAttentionMetadataBuilder(AttentionMetadataBuilder[GDNAttentionMetadata]
             non_spec_query_start_loc = query_start_loc
             non_spec_query_start_loc_cpu = query_start_loc_cpu
             num_accepted_tokens = None
+            if (
+                self.use_full_cuda_graph
+                and self.use_spec_decode
+                and envs.VLLM_SM70_QWEN_GDN_SPEC_CORE_OP
+            ):
+                placeholder_rows = min(self.num_spec + 1, self.decode_cudagraph_max_bs)
+                self.spec_state_indices_tensor[:placeholder_rows].fill_(PAD_SLOT_ID)
+                spec_state_indices_tensor = self.spec_state_indices_tensor[
+                    :placeholder_rows
+                ]
+                self.spec_sequence_masks[:placeholder_rows].fill_(False)
+                spec_sequence_masks = self.spec_sequence_masks[:placeholder_rows]
+                self.spec_query_start_loc[: placeholder_rows + 1].fill_(0)
+                spec_query_start_loc = self.spec_query_start_loc[
+                    : placeholder_rows + 1
+                ]
+                self.spec_token_indx[:placeholder_rows].copy_(
+                    torch.arange(
+                        placeholder_rows,
+                        dtype=torch.int32,
+                        device=query_start_loc.device,
+                    ),
+                    non_blocking=True,
+                )
+                spec_token_indx = self.spec_token_indx[:placeholder_rows]
+                self.num_accepted_tokens[:placeholder_rows].fill_(1)
+                num_accepted_tokens = self.num_accepted_tokens[:placeholder_rows]
         else:
             assert spec_sequence_masks_cpu is not None
             assert num_accepted_tokens is not None
@@ -830,6 +957,11 @@ class GDNAttentionMetadataBuilder(AttentionMetadataBuilder[GDNAttentionMetadata]
             batch_ptr=batch_ptr,
             token_chunk_offset_ptr=token_chunk_offset_ptr,
         )
+        if self.use_spec_decode and envs.VLLM_SM70_QWEN_GDN_SPEC_CORE_OP:
+            register_gdn_spec_metadata_tensors(
+                self.layer_names,
+                gdn_spec_metadata_tensors(attn_metadata, query_start_loc.device),
+            )
         if os.getenv("VLLM_SM70_DUMP_GDN_STATE_TABLE_DIR"):
 
             def _cpu(t: torch.Tensor | None) -> torch.Tensor | None:

@@ -1202,6 +1202,13 @@ if hasattr(torch.ops._C, "cutlass_mxfp8_grouped_mm"):
 
 
 # gptq_marlin
+def sm70_marlin_available() -> bool:
+    return bool(
+        hasattr(torch.ops._C, "sm70_marlin_available")
+        and torch.ops._C.sm70_marlin_available()
+    )
+
+
 def gptq_marlin_repack(
     b_q_weight: torch.Tensor,
     perm: torch.Tensor,

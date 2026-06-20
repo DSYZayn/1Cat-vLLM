@@ -1115,6 +1115,11 @@ class GPUModelRunner(
 
         # Async scheduling
         self.use_async_scheduling = self.scheduler_config.async_scheduling
+        self._sm70_async_worker_execute_trace_step = 0
+        self._sm70_async_worker_sample_trace_step = 0
+        self._sm70_async_worker_input_prep_trace_step = 0
+        self._sm70_async_staged_input_prep_active = False
+        self._sm70_async_staged_input_prep_logged = False
 
         # Sampler
         self.sampler = Sampler(logprobs_mode=self.model_config.logprobs_mode)
@@ -1634,6 +1639,55 @@ class GPUModelRunner(
             pin_memory=self.pin_memory,
             with_numpy=numpy,
         )
+
+    def _can_use_sm70_staged_input_prep(
+        self,
+        scheduler_output: "SchedulerOutput",
+    ) -> bool:
+        if not (
+            envs.VLLM_SM70_ASYNC_STAGED_INPUT_PREP
+            and self.use_async_scheduling
+            and self.device.type == "cuda"
+            and current_platform.is_device_capability(70)
+        ):
+            return False
+        if self.speculative_config is not None or self.num_spec_tokens:
+            return False
+        if self.model_config.is_encoder_decoder or scheduler_output.scheduled_encoder_inputs:
+            return False
+        if scheduler_output.scheduled_spec_decode_tokens:
+            return False
+        if scheduler_output.total_num_scheduled_tokens != 1:
+            return False
+        if self.input_batch.num_reqs != 1:
+            return False
+        if self.input_batch.prev_sampled_token_ids is None:
+            return False
+        if self.num_accepted_tokens_event is not None:
+            return False
+        return True
+
+    def _copy_buffer_to_gpu(
+        self, buffer: CpuGpuBuffer, n: int | None = None
+    ) -> torch.Tensor:
+        if self._sm70_async_staged_input_prep_active:
+            return buffer.copy_to_gpu_staged(n)
+        return buffer.copy_to_gpu(n)
+
+    def _copy_position_buffer_to_gpu(
+        self, buffer: CpuGpuBuffer, n: int
+    ) -> torch.Tensor:
+        src = buffer.cpu[:, :n]
+        dst = buffer.gpu[:, :n]
+        if self._sm70_async_staged_input_prep_active:
+            return buffer.copy_view_to_gpu_staged(src, dst)
+        return dst.copy_(src, non_blocking=True)
+
+    def _commit_block_table_to_gpu(self, num_reqs: int) -> None:
+        if self._sm70_async_staged_input_prep_active:
+            self.input_batch.block_table.commit_block_table_staged(num_reqs)
+        else:
+            self.input_batch.block_table.commit_block_table(num_reqs)
 
     def _get_mamba_bufs(self) -> mamba_utils.MambaBuffers:
         # Only reachable on the ``mamba_cache_mode == "align"`` path.
@@ -2428,10 +2482,14 @@ class GPUModelRunner(
 
         if self.input_batch.prev_sampled_token_ids is None:
             # Normal scheduling case
-            self.input_ids.copy_to_gpu(total_num_scheduled_tokens)
+            self._copy_buffer_to_gpu(self.input_ids, total_num_scheduled_tokens)
             if self.enable_prompt_embeds:
-                self.inputs_embeds.copy_to_gpu(total_num_scheduled_tokens)
-                self.is_token_ids.copy_to_gpu(total_num_scheduled_tokens)
+                self._copy_buffer_to_gpu(
+                    self.inputs_embeds, total_num_scheduled_tokens
+                )
+                self._copy_buffer_to_gpu(
+                    self.is_token_ids, total_num_scheduled_tokens
+                )
             return
 
         # Async scheduling case, where some decode requests from the previous
@@ -2481,10 +2539,14 @@ class GPUModelRunner(
         if num_common_tokens < total_without_spec:
             # If not all requests are decodes from the last iteration,
             # we need to copy the input_ids_cpu to the GPU first.
-            self.input_ids.copy_to_gpu(total_num_scheduled_tokens)
+            self._copy_buffer_to_gpu(self.input_ids, total_num_scheduled_tokens)
             if self.enable_prompt_embeds:
-                self.inputs_embeds.copy_to_gpu(total_num_scheduled_tokens)
-                self.is_token_ids.copy_to_gpu(total_num_scheduled_tokens)
+                self._copy_buffer_to_gpu(
+                    self.inputs_embeds, total_num_scheduled_tokens
+                )
+                self._copy_buffer_to_gpu(
+                    self.is_token_ids, total_num_scheduled_tokens
+                )
         if num_common_tokens == 0:
             # No requests in common with the previous iteration
             # So input_ids.cpu will have all the input ids.
@@ -2598,7 +2660,7 @@ class GPUModelRunner(
             )
             self.encoder_seq_lens.np[:num_reqs] = max_encoder_len
 
-        self.encoder_seq_lens.copy_to_gpu(num_reqs)
+        self._copy_buffer_to_gpu(self.encoder_seq_lens, num_reqs)
         encoder_seq_lens = self.encoder_seq_lens.gpu[:num_reqs]
         encoder_seq_lens_cpu = self.encoder_seq_lens.np[:num_reqs]
 
@@ -2624,7 +2686,7 @@ class GPUModelRunner(
 
         # OPTIMIZATION: Start copying the block table first.
         # This way, we can overlap the copy with the following CPU operations.
-        self.input_batch.block_table.commit_block_table(num_reqs)
+        self._commit_block_table_to_gpu(num_reqs)
 
         # Get request indices.
         # E.g., [2, 5, 3] -> [0, 0, 1, 1, 1, 1, 1, 2, 2, 2]
@@ -2723,7 +2785,7 @@ class GPUModelRunner(
         # Note: pad query_start_loc to be non-decreasing, as kernels
         # like FlashAttention requires that
         self.query_start_loc.np[num_reqs + 1 :].fill(cu_num_tokens[-1])
-        self.query_start_loc.copy_to_gpu()
+        self._copy_buffer_to_gpu(self.query_start_loc)
         query_start_loc = self.query_start_loc.gpu[: num_reqs + 1]
 
         # Compute optimistic seq_lens (assumes all draft tokens from previous
@@ -2750,7 +2812,7 @@ class GPUModelRunner(
         self.discard_request_mask.np[:num_reqs] = (
             self.optimistic_seq_lens_cpu[:num_reqs].numpy() < num_tokens_np
         )
-        self.discard_request_mask.copy_to_gpu(num_reqs)
+        self._copy_buffer_to_gpu(self.discard_request_mask, num_reqs)
 
         # Sync num_accepted_tokens from CPU (set by
         # _update_states_after_model_execute for hybrid models).
@@ -2784,7 +2846,7 @@ class GPUModelRunner(
                     self.input_batch.spec_num_accepted_tokens_cpu[:num_reqs]
                 )
             self.num_accepted_tokens.np[num_reqs:].fill(1)
-            self.num_accepted_tokens.copy_to_gpu()
+            self._copy_buffer_to_gpu(self.num_accepted_tokens)
         else:
             self.num_accepted_tokens.np.fill(1)
             self.num_accepted_tokens.gpu.fill_(1)
@@ -2807,8 +2869,8 @@ class GPUModelRunner(
             and self.valid_sampled_token_count_gpu is not None
             and prev_req_id_to_index
         ):
-            self.prev_positions.copy_to_gpu(num_reqs)
-            self.prev_num_draft_tokens.copy_to_gpu()
+            self._copy_buffer_to_gpu(self.prev_positions, num_reqs)
+            self._copy_buffer_to_gpu(self.prev_num_draft_tokens)
             cpu_values = self.input_batch.num_computed_tokens_cpu_tensor[:num_reqs].to(
                 device=self.device, non_blocking=True
             )
@@ -2827,12 +2889,12 @@ class GPUModelRunner(
             )
 
         self.req_indices.np[:total_num_scheduled_tokens] = req_indices
-        self.req_indices.copy_to_gpu(total_num_scheduled_tokens)
+        self._copy_buffer_to_gpu(self.req_indices, total_num_scheduled_tokens)
         req_indices_gpu = self.req_indices.gpu[:total_num_scheduled_tokens]
 
-        self.query_pos.copy_to_gpu(total_num_scheduled_tokens)
+        self._copy_buffer_to_gpu(self.query_pos, total_num_scheduled_tokens)
         self.num_scheduled_tokens.np[:num_reqs] = num_scheduled_tokens
-        self.num_scheduled_tokens.copy_to_gpu(num_reqs)
+        self._copy_buffer_to_gpu(self.num_scheduled_tokens, num_reqs)
         num_scheduled_tokens_gpu = self.num_scheduled_tokens.gpu[:num_reqs]
         self.positions[:total_num_scheduled_tokens] = (
             self.num_computed_tokens[req_indices_gpu].to(torch.int64)
@@ -2859,15 +2921,13 @@ class GPUModelRunner(
 
         if self.uses_mrope:
             # Only relevant for models using M-RoPE (e.g, Qwen2-VL)
-            self.mrope_positions.gpu[:, :total_num_scheduled_tokens].copy_(
-                self.mrope_positions.cpu[:, :total_num_scheduled_tokens],
-                non_blocking=True,
+            self._copy_position_buffer_to_gpu(
+                self.mrope_positions, total_num_scheduled_tokens
             )
         elif self.uses_xdrope_dim > 0:
             # Only relevant for models using XD-RoPE (e.g, HunYuan-VL)
-            self.xdrope_positions.gpu[:, :total_num_scheduled_tokens].copy_(
-                self.xdrope_positions.cpu[:, :total_num_scheduled_tokens],
-                non_blocking=True,
+            self._copy_position_buffer_to_gpu(
+                self.xdrope_positions, total_num_scheduled_tokens
             )
         if self.use_async_spec_decode and (self.uses_mrope or self.uses_xdrope_dim > 0):
             drift = self.num_computed_tokens[req_indices_gpu].to(
@@ -2916,7 +2976,7 @@ class GPUModelRunner(
             # For DECODE only cuda graph of some attention backends (e.g., GDN).
             self.num_decode_draft_tokens.np[:num_reqs] = num_decode_draft_tokens
             self.num_decode_draft_tokens.np[num_reqs:].fill(-1)
-            self.num_decode_draft_tokens.copy_to_gpu()
+            self._copy_buffer_to_gpu(self.num_decode_draft_tokens)
 
         # Hot-Swap lora model
         if self.lora_config:
@@ -2976,7 +3036,7 @@ class GPUModelRunner(
                 self.input_batch.spec_num_accepted_tokens_cpu[:num_reqs]
             )
             self.num_accepted_tokens.np[num_reqs:].fill(1)
-            self.num_accepted_tokens.copy_to_gpu(num_reqs_padded)
+            self._copy_buffer_to_gpu(self.num_accepted_tokens, num_reqs_padded)
 
         kv_cache_groups = self.kv_cache_config.kv_cache_groups
 
@@ -3079,7 +3139,7 @@ class GPUModelRunner(
                         state_block_ids.cpu[req_idx, offset] = block_ids[block_idx]
                     else:
                         break
-            state_block_ids.copy_to_gpu(num_reqs_padded)
+            self._copy_buffer_to_gpu(state_block_ids, num_reqs_padded)
             current_mamba_state_block_ids_by_gid[kv_cache_gid] = (
                 state_block_ids.gpu[:num_reqs_padded]
             )
@@ -3093,7 +3153,7 @@ class GPUModelRunner(
                 self.parallel_config.cp_kv_cache_interleave_size,
             )
             self.dcp_local_seq_lens.cpu[num_reqs:].fill_(0)
-            self.dcp_local_seq_lens.copy_to_gpu(num_reqs_padded)
+            self._copy_buffer_to_gpu(self.dcp_local_seq_lens, num_reqs_padded)
 
             cm_base.dcp_local_seq_lens = self.dcp_local_seq_lens.gpu[:num_reqs_padded]
             cm_base.dcp_local_seq_lens_cpu = self.dcp_local_seq_lens.cpu[
@@ -3984,11 +4044,15 @@ class GPUModelRunner(
 
         if should_sync_mrope_positions:
             self._calc_mrope_positions(scheduler_output)
-            self.mrope_positions.copy_to_gpu(total_num_scheduled_tokens)
+            self._copy_position_buffer_to_gpu(
+                self.mrope_positions, total_num_scheduled_tokens
+            )
 
         if should_sync_xdrope_positions:
             self._calc_xdrope_positions(scheduler_output)
-            self.xdrope_positions.copy_to_gpu(total_num_scheduled_tokens)
+            self._copy_position_buffer_to_gpu(
+                self.xdrope_positions, total_num_scheduled_tokens
+            )
 
         return mm_embeds, is_mm_embed
 
@@ -4706,21 +4770,69 @@ class GPUModelRunner(
         )
 
     @contextmanager
-    def synchronize_input_prep(self):
+    def synchronize_input_prep(self, skip_sync: bool = False):
+        trace_enabled = envs.VLLM_SM70_ASYNC_CPU_TRACE and self.use_async_scheduling
+        trace_step = self._sm70_async_worker_input_prep_trace_step
+        trace_log = trace_enabled and (
+            trace_step % envs.VLLM_SM70_ASYNC_CPU_TRACE_EVERY == 0
+        )
+        if trace_enabled:
+            self._sm70_async_worker_input_prep_trace_step += 1
+        trace_sync_ms = 0.0
+        trace_body_t0 = 0.0
+        previous_staged_input_prep = self._sm70_async_staged_input_prep_active
+        self._sm70_async_staged_input_prep_active = skip_sync
         if self.prepare_inputs_event is None:
-            yield
+            trace_body_t0 = time.perf_counter() if trace_log else 0.0
+            try:
+                yield
+            finally:
+                self._sm70_async_staged_input_prep_active = (
+                    previous_staged_input_prep
+                )
+                if trace_log:
+                    logger.info(
+                        "SM70 async worker trace kind=input_prep step=%d "
+                        "mode=no_event sync_ms=0.000 body_ms=%.3f",
+                        trace_step,
+                        (time.perf_counter() - trace_body_t0) * 1000.0,
+                    )
             return
 
-        # Async output processing may still be consuming tensors that input
-        # prep reuses on the next step.
-        sm70_trace_event_sync(
-            self.prepare_inputs_event,
-            "GPUModelRunner.prepare_inputs_event.synchronize",
-        )
+        # Async input prep normally waits for the previous step's H2D copies
+        # because they use reusable pinned CPU buffers. The staged SM70 decode
+        # path gives each H2D copy its own source buffer, so it can preserve
+        # stream ordering without blocking the CPU here.
+        if skip_sync:
+            if not self._sm70_async_staged_input_prep_logged:
+                logger.info(
+                    "SM70 async staged input prep enabled for no-MTP decode."
+                )
+                self._sm70_async_staged_input_prep_logged = True
+            trace_body_t0 = time.perf_counter() if trace_log else 0.0
+        else:
+            trace_sync_t0 = time.perf_counter() if trace_log else 0.0
+            sm70_trace_event_sync(
+                self.prepare_inputs_event,
+                "GPUModelRunner.prepare_inputs_event.synchronize",
+            )
+            if trace_log:
+                trace_sync_ms = (time.perf_counter() - trace_sync_t0) * 1000.0
+                trace_body_t0 = time.perf_counter()
         try:
             yield
         finally:
             self.prepare_inputs_event.record()
+            self._sm70_async_staged_input_prep_active = previous_staged_input_prep
+            if trace_log:
+                logger.info(
+                    "SM70 async worker trace kind=input_prep step=%d "
+                    "mode=%s sync_ms=%.3f body_ms=%.3f",
+                    trace_step,
+                    "staged_event" if skip_sync else "event",
+                    trace_sync_ms,
+                    (time.perf_counter() - trace_body_t0) * 1000.0,
+                )
 
     def _model_forward(
         self,
@@ -4819,6 +4931,28 @@ class GPUModelRunner(
         has_lora = num_active_loras > 0 if force_has_lora is None else force_has_lora
 
         num_tokens_padded = self._pad_for_sequence_parallelism(num_tokens)
+        disable_full_for_sm70_gdn_spec_decode = (
+            envs.VLLM_SM70_QWEN_GDN_SPEC_DECODE_PIECEWISE
+            and self.speculative_config is not None
+            and self.uniform_decode_query_len > 1
+            and uniform_decode
+            and force_uniform_decode is None
+            and self.cache_config.mamba_cache_mode == "align"
+            and self.kv_cache_config is not None
+            and self.kv_cache_config.has_mamba_layers
+            and current_platform.is_device_capability(70)
+        )
+        disable_full_cudagraph = (
+            use_cascade_attn
+            or has_encoder_output
+            or disable_full_for_sm70_gdn_spec_decode
+        )
+        if disable_full_for_sm70_gdn_spec_decode:
+            logger.info_once(
+                "Dispatching SM70 active-MTP Mamba/GDN verifier decode "
+                "batches through PIECEWISE CUDA graphs by excluding FULL "
+                "runtime replay."
+            )
 
         def dispatch_cudagraph(num_tokens, disable_full=False, valid_modes=None):
             return self.cudagraph_dispatcher.dispatch(
@@ -4831,8 +4965,15 @@ class GPUModelRunner(
             )
 
         cudagraph_mode, batch_descriptor = dispatch_cudagraph(
-            num_tokens_padded, disable_full=use_cascade_attn or has_encoder_output
+            num_tokens_padded, disable_full=disable_full_cudagraph
         )
+        if disable_full_for_sm70_gdn_spec_decode:
+            logger.info_once(
+                "SM70 active-MTP Mamba/GDN verifier CUDA graph dispatch "
+                "selected runtime=%s descriptor=%s.",
+                cudagraph_mode,
+                batch_descriptor,
+            )
         num_tokens_padded = batch_descriptor.num_tokens
         if self.compilation_config.pass_config.enable_sp:
             assert (
@@ -4866,6 +5007,7 @@ class GPUModelRunner(
                 # Re-dispatch with DP padding so we have the correct batch_descriptor
                 cudagraph_mode, batch_descriptor = dispatch_cudagraph(
                     num_tokens_padded,
+                    disable_full=disable_full_cudagraph,
                     valid_modes={CUDAGraphMode(synced_cudagraph_mode)},
                 )
                 # Assert to make sure the agreed upon token count is correct otherwise
@@ -5020,6 +5162,25 @@ class GPUModelRunner(
                 "after execute_model() returns None."
             )
 
+        trace_enabled = envs.VLLM_SM70_ASYNC_CPU_TRACE and self.use_async_scheduling
+        trace_step = self._sm70_async_worker_execute_trace_step
+        trace_log = trace_enabled and (
+            trace_step % envs.VLLM_SM70_ASYNC_CPU_TRACE_EVERY == 0
+        )
+        if trace_enabled:
+            self._sm70_async_worker_execute_trace_step += 1
+        trace_t0 = time.perf_counter() if trace_log else 0.0
+        trace_preprocess_ms = 0.0
+        trace_forward_submit_ms = 0.0
+        trace_postprocess_ms = 0.0
+        trace_update_states_ms = 0.0
+        trace_prepare_inputs_ms = 0.0
+        trace_batch_desc_ms = 0.0
+        trace_mamba_preprocess_ms = 0.0
+        trace_slot_mapping_ms = 0.0
+        trace_attn_metadata_ms = 0.0
+        trace_model_preprocess_ms = 0.0
+
         if self.routed_experts_initialized:
             self.routed_experts_capturer.clear_buffer()
 
@@ -5046,12 +5207,19 @@ class GPUModelRunner(
             get_kv_transfer_group().handle_preemptions(kv_connector_metadata)
 
         num_scheduled_tokens = scheduler_output.total_num_scheduled_tokens
+        staged_input_prep = self._can_use_sm70_staged_input_prep(scheduler_output)
+        trace_preprocess_t0 = time.perf_counter() if trace_log else 0.0
         with (
             record_function_or_nullcontext("gpu_model_runner: preprocess"),
-            self.synchronize_input_prep(),
+            self.synchronize_input_prep(skip_sync=staged_input_prep),
         ):
             # Update persistent batch states.
+            trace_update_states_t0 = time.perf_counter() if trace_log else 0.0
             deferred_state_corrections_fn = self._update_states(scheduler_output)
+            if trace_log:
+                trace_update_states_ms = (
+                    time.perf_counter() - trace_update_states_t0
+                ) * 1000.0
 
             if has_ec_transfer() and not get_ec_transfer().is_consumer:
                 with self.maybe_get_ec_connector_output(
@@ -5076,6 +5244,14 @@ class GPUModelRunner(
                     self._dummy_run(1)
                 if not has_kv_transfer_group():
                     # Return empty ModelRunnerOutput if no work to do.
+                    if trace_log:
+                        logger.info(
+                            "SM70 async worker trace kind=execute step=%d "
+                            "mode=empty total_ms=%.3f scheduled_tokens=%d",
+                            trace_step,
+                            (time.perf_counter() - trace_t0) * 1000.0,
+                            num_scheduled_tokens,
+                        )
                     return EMPTY_MODEL_RUNNER_OUTPUT
                 return self.kv_connector_no_forward(scheduler_output, self.vllm_config)
 
@@ -5093,10 +5269,15 @@ class GPUModelRunner(
             max_num_scheduled_tokens = int(num_scheduled_tokens_np.max())
             num_tokens_unpadded = scheduler_output.total_num_scheduled_tokens
 
+            trace_prepare_inputs_t0 = time.perf_counter() if trace_log else 0.0
             logits_indices, spec_decode_metadata = self._prepare_inputs(
                 scheduler_output,
                 num_scheduled_tokens_np,
             )
+            if trace_log:
+                trace_prepare_inputs_ms = (
+                    time.perf_counter() - trace_prepare_inputs_t0
+                ) * 1000.0
 
             cascade_attn_prefix_lens = None
             # Disable cascade attention when using microbatching (DBO)
@@ -5108,6 +5289,7 @@ class GPUModelRunner(
                     scheduler_output.num_common_prefix_blocks,
                 )
 
+            trace_batch_desc_t0 = time.perf_counter() if trace_log else 0.0
             (
                 cudagraph_mode,
                 batch_desc,
@@ -5122,6 +5304,10 @@ class GPUModelRunner(
                 use_cascade_attn=cascade_attn_prefix_lens is not None,
                 num_encoder_reqs=len(scheduler_output.scheduled_encoder_inputs),
             )
+            if trace_log:
+                trace_batch_desc_ms = (
+                    time.perf_counter() - trace_batch_desc_t0
+                ) * 1000.0
 
             logger.debug(
                 "Running batch with cudagraph_mode: %s, batch_descriptor: %s, "
@@ -5164,6 +5350,7 @@ class GPUModelRunner(
             pad_attn = cudagraph_mode == CUDAGraphMode.FULL
 
             if self.cache_config.mamba_cache_mode == "align":
+                trace_mamba_t0 = time.perf_counter() if trace_log else 0.0
                 # preprocess_mamba reads req_state.num_computed_tokens (CPU)
                 # to decide copy operations, so we must apply deferred
                 # corrections before it runs.
@@ -5189,11 +5376,16 @@ class GPUModelRunner(
                 self.num_accepted_tokens.np[:num_reqs] = (
                     self.input_batch.num_accepted_tokens_cpu[:num_reqs]
                 )
-                self.num_accepted_tokens.copy_to_gpu(num_reqs)
+                self._copy_buffer_to_gpu(self.num_accepted_tokens, num_reqs)
+                if trace_log:
+                    trace_mamba_preprocess_ms = (
+                        time.perf_counter() - trace_mamba_t0
+                    ) * 1000.0
 
             use_spec_decode = len(scheduler_output.scheduled_spec_decode_tokens) > 0
             ubatch_slices_attn = ubatch_slices_padded if pad_attn else ubatch_slices
 
+            trace_slot_mapping_t0 = time.perf_counter() if trace_log else 0.0
             slot_mappings_by_group, slot_mappings = self._get_slot_mappings(
                 num_tokens_padded=num_tokens_padded
                 if pad_attn or has_separate_kv_update
@@ -5204,7 +5396,12 @@ class GPUModelRunner(
                 num_tokens_unpadded=num_tokens_unpadded,
                 ubatch_slices=ubatch_slices_padded,
             )
+            if trace_log:
+                trace_slot_mapping_ms = (
+                    time.perf_counter() - trace_slot_mapping_t0
+                ) * 1000.0
 
+            trace_attn_metadata_t0 = time.perf_counter() if trace_log else 0.0
             attn_metadata, spec_decode_common_attn_metadata = (
                 self._build_attention_metadata(
                     num_tokens=num_tokens_unpadded,
@@ -5220,7 +5417,12 @@ class GPUModelRunner(
                     slot_mappings=slot_mappings_by_group,
                 )
             )
+            if trace_log:
+                trace_attn_metadata_ms = (
+                    time.perf_counter() - trace_attn_metadata_t0
+                ) * 1000.0
 
+            trace_model_preprocess_t0 = time.perf_counter() if trace_log else 0.0
             (
                 input_ids,
                 inputs_embeds,
@@ -5231,6 +5433,10 @@ class GPUModelRunner(
             ) = self._preprocess(
                 scheduler_output, num_tokens_padded, intermediate_tensors
             )
+            if trace_log:
+                trace_model_preprocess_ms = (
+                    time.perf_counter() - trace_model_preprocess_t0
+                ) * 1000.0
             _sm70_dump_compile_graph_inputs(
                 input_ids=input_ids,
                 positions=positions,
@@ -5249,6 +5455,11 @@ class GPUModelRunner(
                 num_computed_tokens=self.num_computed_tokens,
                 input_batch=self.input_batch,
             )
+
+        if trace_log:
+            trace_preprocess_ms = (
+                time.perf_counter() - trace_preprocess_t0
+            ) * 1000.0
 
         # Set cudagraph mode to none if calc_kv_scales is true.
         # KV scales calculation involves dynamic operations that are incompatible
@@ -5273,6 +5484,7 @@ class GPUModelRunner(
         _sync_sm70_before_compile_graph_forward(cudagraph_mode)
         mtp_profile_events = [] if self._sm70_mtp_profile_enabled() else None
         mtp_forward_start = self._sm70_mtp_profile_start(mtp_profile_events)
+        trace_forward_t0 = time.perf_counter() if trace_log else 0.0
         with (
             set_forward_context(
                 attn_metadata,
@@ -5298,10 +5510,15 @@ class GPUModelRunner(
                 inputs_embeds=inputs_embeds,
                 **model_kwargs,
             )
+        if trace_log:
+            trace_forward_submit_ms = (
+                time.perf_counter() - trace_forward_t0
+            ) * 1000.0
         self._sm70_mtp_profile_finish(
             mtp_profile_events, "target_forward", mtp_forward_start
         )
 
+        trace_postprocess_t0 = time.perf_counter() if trace_log else 0.0
         with record_function_or_nullcontext("gpu_model_runner: postprocess"):
             if self.use_aux_hidden_state_outputs:
                 # True when EAGLE 3 is used.
@@ -5373,6 +5590,11 @@ class GPUModelRunner(
                     mtp_profile_events, "target_logits", mtp_logits_start
                 )
 
+        if trace_log:
+            trace_postprocess_ms = (
+                time.perf_counter() - trace_postprocess_t0
+            ) * 1000.0
+
         sample_hidden_ready_event = _record_sm70_sample_hidden_ready_event(
             sample_hidden_states, cudagraph_mode
         )
@@ -5410,12 +5632,53 @@ class GPUModelRunner(
         if deferred_state_corrections_fn:
             deferred_state_corrections_fn()
 
+        if trace_log:
+            logger.info(
+                "SM70 async worker trace kind=execute step=%d mode=state_ready "
+                "total_ms=%.3f preprocess_ms=%.3f forward_submit_ms=%.3f "
+                "postprocess_ms=%.3f update_states_ms=%.3f "
+                "prepare_inputs_ms=%.3f batch_desc_ms=%.3f "
+                "mamba_preprocess_ms=%.3f slot_mapping_ms=%.3f "
+                "attn_metadata_ms=%.3f model_preprocess_ms=%.3f "
+                "scheduled_tokens=%d cudagraph_mode=%s",
+                trace_step,
+                (time.perf_counter() - trace_t0) * 1000.0,
+                trace_preprocess_ms,
+                trace_forward_submit_ms,
+                trace_postprocess_ms,
+                trace_update_states_ms,
+                trace_prepare_inputs_ms,
+                trace_batch_desc_ms,
+                trace_mamba_preprocess_ms,
+                trace_slot_mapping_ms,
+                trace_attn_metadata_ms,
+                trace_model_preprocess_ms,
+                num_scheduled_tokens,
+                cudagraph_mode,
+            )
+
         return None
 
     @torch.inference_mode
     def sample_tokens(
         self, grammar_output: "GrammarOutput | None"
     ) -> ModelRunnerOutput | AsyncModelRunnerOutput | IntermediateTensors:
+        trace_enabled = envs.VLLM_SM70_ASYNC_CPU_TRACE and self.use_async_scheduling
+        trace_step = self._sm70_async_worker_sample_trace_step
+        trace_log = trace_enabled and (
+            trace_step % envs.VLLM_SM70_ASYNC_CPU_TRACE_EVERY == 0
+        )
+        if trace_enabled:
+            self._sm70_async_worker_sample_trace_step += 1
+        trace_t0 = time.perf_counter() if trace_log else 0.0
+        trace_wait_hidden_ms = 0.0
+        trace_logits_ms = 0.0
+        trace_sample_ms = 0.0
+        trace_state_update_ms = 0.0
+        trace_bookkeeping_ms = 0.0
+        trace_async_output_ms = 0.0
+        trace_set_async_ids_ms = 0.0
+
         if self.execute_model_state is None:
             kv_connector_output = self.kv_connector_output
             self.kv_connector_output = None
@@ -5424,6 +5687,13 @@ class GPUModelRunner(
                 self._pp_receive_prev_sampled_token_ids_to_input_batch()
             # In case of PP with kv transfer, we need to pass through the
             # kv_connector_output
+            if trace_log:
+                logger.info(
+                    "SM70 async worker trace kind=sample step=%d mode=no_state "
+                    "total_ms=%.3f",
+                    trace_step,
+                    (time.perf_counter() - trace_t0) * 1000.0,
+                )
             return ModelRunnerOutput.with_kv_conn_output_only(kv_connector_output)
 
         # Unpack ephemeral state.
@@ -5447,10 +5717,16 @@ class GPUModelRunner(
         mtp_profile_ctx = getattr(self, "_sm70_mtp_runner_profile_pending", None)
         self._sm70_mtp_runner_profile_pending = None
 
+        trace_wait_hidden_t0 = time.perf_counter() if trace_log else 0.0
         _wait_sm70_sample_hidden_ready_event(
             sample_hidden_states, sample_hidden_ready_event
         )
+        if trace_log:
+            trace_wait_hidden_ms = (
+                time.perf_counter() - trace_wait_hidden_t0
+            ) * 1000.0
 
+        trace_logits_t0 = time.perf_counter() if trace_log else 0.0
         if grammar_output is not None and logits is None:
             logits = self.model.compute_logits(sample_hidden_states)
 
@@ -5460,8 +5736,11 @@ class GPUModelRunner(
             apply_grammar_bitmask(
                 scheduler_output, grammar_output, self.input_batch, logits
             )
+        if trace_log:
+            trace_logits_ms = (time.perf_counter() - trace_logits_t0) * 1000.0
 
         with record_function_or_nullcontext("gpu_model_runner: sample"):
+            trace_sample_t0 = time.perf_counter() if trace_log else 0.0
             mtp_sample_start = self._sm70_mtp_profile_start(
                 None if mtp_profile_ctx is None else mtp_profile_ctx["events"]
             )
@@ -5478,7 +5757,10 @@ class GPUModelRunner(
                 else "target_sample_no_spec",
                 mtp_sample_start,
             )
+            if trace_log:
+                trace_sample_ms = (time.perf_counter() - trace_sample_t0) * 1000.0
 
+        trace_state_update_t0 = time.perf_counter() if trace_log else 0.0
         self._update_states_after_model_execute(
             sampler_output.sampled_token_ids, scheduler_output
         )
@@ -5499,6 +5781,10 @@ class GPUModelRunner(
         self._draft_token_req_ids = None
         self.valid_sampled_token_count_gpu = None
         self.input_batch.prev_sampled_token_ids = None
+        if trace_log:
+            trace_state_update_ms = (
+                time.perf_counter() - trace_state_update_t0
+            ) * 1000.0
 
         def propose_draft_token_ids(sampled_token_ids):
             assert spec_decode_common_attn_metadata is not None
@@ -5617,6 +5903,7 @@ class GPUModelRunner(
                 self._copy_draft_token_ids_to_cpu(scheduler_output)
 
         with record_function_or_nullcontext("gpu_model_runner: bookkeep"):
+            trace_bookkeeping_t0 = time.perf_counter() if trace_log else 0.0
             mtp_bookkeeping_wall_start = (
                 time.perf_counter() if mtp_profile_ctx is not None else 0.0
             )
@@ -5648,6 +5935,10 @@ class GPUModelRunner(
                 "bookkeeping_wall_cpu",
                 mtp_bookkeeping_wall_start,
             )
+            if trace_log:
+                trace_bookkeeping_ms = (
+                    time.perf_counter() - trace_bookkeeping_t0
+                ) * 1000.0
 
         if propose_drafts_after_bookkeeping:
             # ngram and other speculative decoding methods use the sampled
@@ -5699,6 +5990,7 @@ class GPUModelRunner(
         with record_function_or_nullcontext(
             "gpu_model_runner: AsyncGPUModelRunnerOutput"
         ):
+            trace_async_output_t0 = time.perf_counter() if trace_log else 0.0
             # Async path: produce a device-side snapshot that the async
             # copy stream can D2H later. Both tensors must be private
             # clones because:
@@ -5731,17 +6023,44 @@ class GPUModelRunner(
                 vocab_size=self.input_batch.vocab_size,
                 routed_experts=routed_experts_snapshot,
             )
+            if trace_log:
+                trace_async_output_ms = (
+                    time.perf_counter() - trace_async_output_t0
+                ) * 1000.0
         with record_function_or_nullcontext(
             "gpu_model_runner: set_async_sampled_token_ids"
         ):
+            trace_set_async_t0 = time.perf_counter() if trace_log else 0.0
             # Save ref of sampled_token_ids CPU tensor if the batch contains
             # any requests with sampling params that require output ids.
             self.input_batch.set_async_sampled_token_ids(
                 async_output.sampled_token_ids_cpu,
                 async_output.async_copy_ready_event,
             )
+            if trace_log:
+                trace_set_async_ids_ms = (
+                    time.perf_counter() - trace_set_async_t0
+                ) * 1000.0
 
         self._sm70_mtp_profile_report(mtp_profile_ctx)
+        if trace_log:
+            logger.info(
+                "SM70 async worker trace kind=sample step=%d mode=async_output "
+                "total_ms=%.3f wait_hidden_ms=%.3f logits_ms=%.3f "
+                "sample_ms=%.3f state_update_ms=%.3f bookkeeping_ms=%.3f "
+                "async_output_ms=%.3f set_async_ids_ms=%.3f "
+                "scheduled_tokens=%d",
+                trace_step,
+                (time.perf_counter() - trace_t0) * 1000.0,
+                trace_wait_hidden_ms,
+                trace_logits_ms,
+                trace_sample_ms,
+                trace_state_update_ms,
+                trace_bookkeeping_ms,
+                trace_async_output_ms,
+                trace_set_async_ids_ms,
+                scheduler_output.total_num_scheduled_tokens,
+            )
         return async_output
 
     def _pp_broadcast_prev_sampled_token_ids(
@@ -6977,14 +7296,32 @@ class GPUModelRunner(
                 )
                 self.query_start_loc.np[1 : num_reqs + 1] = cum_num_tokens
                 self.query_start_loc.np[num_reqs + 1 :].fill(cum_num_tokens[-1])
-                self.query_start_loc.copy_to_gpu()
+                self._copy_buffer_to_gpu(self.query_start_loc)
 
                 # Sync block table CPU->GPU so cleared rows from
                 # remove_request() are visible to the attention metadata
                 # builder. Without this, stale block IDs from finished
                 # requests can corrupt Mamba state.
-                self.input_batch.block_table.commit_block_table(num_reqs_padded)
+                if self._sm70_async_staged_input_prep_active:
+                    self.input_batch.block_table.commit_block_table_staged(
+                        num_reqs_padded
+                    )
+                else:
+                    self.input_batch.block_table.commit_block_table(num_reqs_padded)
 
+                force_spec_graph_metadata = (
+                    self.speculative_config is not None
+                    and uniform_decode
+                    and max_query_len > 1
+                    and force_attention
+                    and envs.VLLM_SM70_QWEN_GDN_SPEC_CORE_OP
+                    and current_platform.is_device_capability(70)
+                )
+                # SM70 Qwen GDN split spec-core is part of the compiled FULL
+                # graph. Its first AOT warmup must see the same active-spec
+                # tensor shapes as replay; otherwise empty metadata tensors get
+                # frozen into the graph before CUDA graph capture.
+                build_for_capture = is_graph_capturing or force_spec_graph_metadata
                 pad_attn = cudagraph_runtime_mode == CUDAGraphMode.FULL
                 attn_metadata, _ = self._build_attention_metadata(
                     num_tokens=num_tokens_unpadded,
@@ -6993,7 +7330,7 @@ class GPUModelRunner(
                     num_reqs_padded=num_reqs_padded if pad_attn else None,
                     max_query_len=max_query_len,
                     ubatch_slices=(ubatch_slices_padded if pad_attn else ubatch_slices),
-                    for_cudagraph_capture=is_graph_capturing,
+                    for_cudagraph_capture=build_for_capture,
                     slot_mappings=slot_mappings_by_group,
                     use_spec_decode=self.speculative_config is not None,
                 )

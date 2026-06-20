@@ -5,6 +5,9 @@ from collections.abc import Callable
 import torch
 from torch.nn.parameter import Parameter
 
+from vllm import envs
+from vllm.logger import init_logger
+from vllm.model_executor.layers.quantization import sm70_turbomind as sm70_tm
 from vllm.model_executor.layers.quantization.compressed_tensors.schemes import (
     CompressedTensorsScheme,
 )
@@ -20,6 +23,8 @@ from vllm.model_executor.parameter import (
 
 __all__ = ["CompressedTensorsW4A16Fp4"]
 
+logger = init_logger(__name__)
+
 
 class CompressedTensorsW4A16Fp4(CompressedTensorsScheme):
     def __init__(self):
@@ -27,8 +32,7 @@ class CompressedTensorsW4A16Fp4(CompressedTensorsScheme):
 
     @classmethod
     def get_min_capability(cls) -> int:
-        # don't restrict as emulations
-        return 75
+        return 70
 
     def create_weights(
         self,
@@ -89,6 +93,26 @@ class CompressedTensorsW4A16Fp4(CompressedTensorsScheme):
             1.0 / layer.weight_global_scale.max().to(torch.float32), requires_grad=False
         )
 
+        if sm70_tm.should_prepare_turbomind_or_marlin(
+            layer.weight, envs.VLLM_SM70_NVFP4_TURBOMIND
+        ):
+            logger.info_once(
+                "SM70 compressed-tensors NVFP4 TurboMind W4A16 dense path "
+                "enabled under W4A16 Marlin."
+            )
+            sm70_tm.prepare_nvfp4_linear(layer)
+            layer.weight = Parameter(
+                torch.empty(0, dtype=torch.uint8, device=layer.weight.device),
+                requires_grad=False,
+            )
+            layer.weight_scale = Parameter(
+                torch.empty(
+                    0, dtype=torch.float8_e4m3fn, device=layer.weight_scale.device
+                ),
+                requires_grad=False,
+            )
+            return
+
         prepare_fp4_layer_for_marlin(layer)
 
     def apply_weights(
@@ -97,6 +121,8 @@ class CompressedTensorsW4A16Fp4(CompressedTensorsScheme):
         x: torch.Tensor,
         bias: torch.Tensor | None = None,
     ) -> torch.Tensor:
+        if sm70_tm.has_prepared_linear(layer):
+            return sm70_tm.apply_prepared_linear(layer, x, bias)
         return apply_fp4_marlin_linear(
             input=x,
             weight=layer.weight,

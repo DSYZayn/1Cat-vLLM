@@ -41,6 +41,13 @@ from flash_attn_v100.flash_attn_interface import (  # noqa: E402
     flash_attn_prefill_paged,
 )
 
+try:
+    from flash_attn_v100.flash_attn_interface import (  # noqa: E402
+        flash_attn_prefill_paged_splitkv,
+    )
+except ImportError:  # pragma: no cover - old local builds.
+    flash_attn_prefill_paged_splitkv = None
+
 
 PROFILE_SHAPES = {
     # Qwen3.6-35B-A3B TP1 local attention shape.
@@ -60,7 +67,12 @@ def _sync() -> None:
 
 
 def _paged_block_m(head_dim: int) -> int:
+    if os.getenv("VLLM_FLASH_V100_PREFILL_SPLIT_KV", "0") != "0":
+        return 16
     low_smem = os.getenv("VLLM_FLASH_V100_PREFILL_D256_LOW_SMEM", "0") != "0"
+    bm32 = os.getenv("VLLM_FLASH_V100_PREFILL_D256_BM32", "0") != "0"
+    if head_dim == 256 and low_smem and bm32:
+        return 32
     return 16 if head_dim == 256 and low_smem else 32
 
 
@@ -244,6 +256,9 @@ def bench_paged_step(
     reps: int | None,
     layers: int,
     nvtx: bool,
+    paged_split_kv: bool,
+    split_kv_tokens: int,
+    check_reference: bool,
 ) -> dict[str, Any]:
     q = torch.randn((1, q_len, heads_q, head_dim), device=device, dtype=dtype)
     k_cache, v_cache, block_table, seq_lens = _make_paged_cache(
@@ -256,7 +271,22 @@ def bench_paged_step(
     )
     holder: list[torch.Tensor | None] = [None]
 
+    if paged_split_kv and flash_attn_prefill_paged_splitkv is None:
+        raise RuntimeError("flash_attn_prefill_paged_splitkv is unavailable")
+
     def run() -> None:
+        if paged_split_kv:
+            holder[0] = flash_attn_prefill_paged_splitkv(
+                q,
+                k_cache,
+                v_cache,
+                block_table,
+                seq_lens,
+                causal=True,
+                split_kv_tokens=split_kv_tokens,
+                max_seq_len_hint=kv_len,
+            )
+            return
         holder[0] = flash_attn_prefill_paged(
             q,
             k_cache,
@@ -266,8 +296,9 @@ def bench_paged_step(
             causal=True,
         )
 
+    grid_y = math.ceil(kv_len / split_kv_tokens) if paged_split_kv else 1
     result: dict[str, Any] = {
-        "mode": "paged-step",
+        "mode": "paged-step-splitkv" if paged_split_kv else "paged-step",
         "q_len": q_len,
         "kv_len": kv_len,
         "heads_q": heads_q,
@@ -276,8 +307,10 @@ def bench_paged_step(
         "block_size": block_size,
         "cache_blocks": math.ceil(kv_len / block_size),
         "grid_x": math.ceil(q_len / _paged_block_m(head_dim)),
+        "grid_y": grid_y,
         "grid_z": heads_q,
-        "ctas": math.ceil(q_len / _paged_block_m(head_dim)) * heads_q,
+        "ctas": math.ceil(q_len / _paged_block_m(head_dim)) * grid_y * heads_q,
+        "split_kv_tokens": split_kv_tokens if paged_split_kv else None,
     }
     result.update(
         _time_cuda(
@@ -295,6 +328,21 @@ def bench_paged_step(
         causal=True,
         layers=layers,
     )
+    if check_reference:
+        ref = flash_attn_prefill_paged(
+            q,
+            k_cache,
+            v_cache,
+            block_table,
+            seq_lens,
+            causal=True,
+        )
+        if holder[0] is None:
+            run()
+        _sync()
+        diff = (holder[0] - ref).abs()
+        result["reference_max_diff"] = float(diff.max().item())
+        result["reference_mean_diff"] = float(diff.mean().item())
     return result
 
 
@@ -312,6 +360,9 @@ def bench_chunked_prompt(
     reps: int | None,
     layers: int,
     nvtx: bool,
+    paged_split_kv: bool,
+    split_kv_tokens: int,
+    check_reference: bool,
 ) -> dict[str, Any]:
     chunk_results: list[dict[str, Any]] = []
     pos = 0
@@ -347,8 +398,15 @@ def bench_chunked_prompt(
                 reps=reps,
                 layers=layers,
                 nvtx=nvtx,
+                paged_split_kv=paged_split_kv,
+                split_kv_tokens=split_kv_tokens,
+                check_reference=check_reference,
             )
-            chunk["mode"] = "chunked-prefix-paged"
+            chunk["mode"] = (
+                "chunked-prefix-paged-splitkv"
+                if paged_split_kv
+                else "chunked-prefix-paged"
+            )
         chunk["chunk_idx"] = chunk_idx
         chunk["prompt_len"] = prompt_len
         chunk["chunk_start"] = pos
@@ -476,6 +534,17 @@ def main() -> None:
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--warmup", type=int, default=None)
     parser.add_argument("--reps", type=int, default=None)
+    parser.add_argument(
+        "--paged-split-kv",
+        action="store_true",
+        help="Use the experimental split-KV paged prefill op for paged chunks.",
+    )
+    parser.add_argument("--split-kv-tokens", type=int, default=32768)
+    parser.add_argument(
+        "--check-reference",
+        action="store_true",
+        help="Compare the measured paged output against the legacy paged op.",
+    )
     parser.add_argument("--jsonl", action="store_true")
     parser.add_argument("--json-out", type=Path, default=None)
     parser.add_argument(
@@ -517,10 +586,31 @@ def main() -> None:
             "VLLM_FLASH_V100_PREFILL_D256_LOW_SMEM": os.getenv(
                 "VLLM_FLASH_V100_PREFILL_D256_LOW_SMEM"
             ),
+            "VLLM_FLASH_V100_DENSE_D256_LOW_SMEM": os.getenv(
+                "VLLM_FLASH_V100_DENSE_D256_LOW_SMEM"
+            ),
+            "VLLM_FLASH_V100_DENSE_D256_WMMA_QK": os.getenv(
+                "VLLM_FLASH_V100_DENSE_D256_WMMA_QK"
+            ),
+            "VLLM_FLASH_V100_PREFILL_D256_SCALAR_QK": os.getenv(
+                "VLLM_FLASH_V100_PREFILL_D256_SCALAR_QK"
+            ),
+            "VLLM_FLASH_V100_PREFILL_D256_BM32": os.getenv(
+                "VLLM_FLASH_V100_PREFILL_D256_BM32"
+            ),
             "VLLM_FLASH_V100_PREFILL_SCALAR_PV": os.getenv(
                 "VLLM_FLASH_V100_PREFILL_SCALAR_PV"
             ),
+            "VLLM_FLASH_V100_PREFILL_SPLIT_KV": os.getenv(
+                "VLLM_FLASH_V100_PREFILL_SPLIT_KV"
+            ),
+            "VLLM_FLASH_V100_PREFILL_SPLIT_KV_TOKENS": os.getenv(
+                "VLLM_FLASH_V100_PREFILL_SPLIT_KV_TOKENS"
+            ),
         },
+        "paged_split_kv": args.paged_split_kv,
+        "split_kv_tokens": args.split_kv_tokens,
+        "check_reference": args.check_reference,
     }
     print(json.dumps({"run": header}, sort_keys=True))
 
@@ -559,6 +649,9 @@ def main() -> None:
                 reps=args.reps,
                 layers=layers,
                 nvtx=args.nvtx,
+                paged_split_kv=args.paged_split_kv,
+                split_kv_tokens=args.split_kv_tokens,
+                check_reference=args.check_reference,
             )
             results.append(result)
             _emit(result, jsonl=args.jsonl)
@@ -579,6 +672,9 @@ def main() -> None:
                 reps=args.reps,
                 layers=layers,
                 nvtx=args.nvtx,
+                paged_split_kv=args.paged_split_kv,
+                split_kv_tokens=args.split_kv_tokens,
+                check_reference=args.check_reference,
             )
             results.append(result)
             _emit(result, jsonl=args.jsonl)

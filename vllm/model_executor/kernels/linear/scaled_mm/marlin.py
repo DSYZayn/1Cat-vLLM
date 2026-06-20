@@ -40,7 +40,7 @@ class MarlinFP8ScaledMMLinearKernel(FP8ScaledMMLinearKernel):
             return False, "requires CUDA."
         # Check if platform supports FP8 Marlin
         if not is_fp8_marlin_supported():
-            return False, "FP8 Marlin requires compute capability 7.5 or higher"
+            return False, "FP8 Marlin requires compute capability 7.0 or higher"
         if envs.VLLM_BATCH_INVARIANT:
             return False, "FP8 Marlin not supported for batch invariant execution."
         if (

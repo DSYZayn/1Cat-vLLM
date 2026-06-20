@@ -196,83 +196,28 @@ Important defaults:
 - `122B` uses a smaller prefill chunk budget to leave room for SM70 MoE
   temporary workspace during long-context serving.
 
-## Launch Examples
+## Recommended Launch Commands
 
-All commands below are full runnable commands. When using prebuilt wheels, run
-them outside the source checkout so Python loads the installed package and its
-CUDA extensions.
+These are the recommended public serving commands for the 27B AWQ and 35B AWQ
+V100 profiles. When using prebuilt wheels, run them outside the source checkout
+so Python loads the installed package and its CUDA extensions.
 
 Use `CUDA_VISIBLE_DEVICES=0,1,2,3` only when you need to select a specific
 four-card V100 set.
 
-### Qwen3.5-27B-AWQ, TP4
+### Qwen3.6-27B-AWQ, TP4
 
 ```bash
 python -m vllm.entrypoints.openai.api_server \
-  --model /path/to/Qwen3.5-27B-AWQ \
-  --served-model-name Qwen3.5-27B-AWQ \
+  --model /path/to/Qwen3.6-27B-AWQ \
+  --served-model-name qwen3.6-27b-awq \
+  --trust-remote-code \
   --attention-backend FLASH_ATTN_V100 \
   --tensor-parallel-size 4 \
   --gpu-memory-utilization 0.88 \
   --max-model-len 262144 \
-  --max-num-seqs 1 \
-  --max-num-batched-tokens 16384 \
-  --host 0.0.0.0 \
-  --port 8000
-```
-
-### Qwen3.6-27B-AWQ, TP4, MTP + Prefix Cache
-
-This profile keeps 256K context, enables tool calling, and uses the public MTP
-serving defaults for the Qwen3.6 27B AWQ model family.
-
-```bash
-python -m vllm.entrypoints.openai.api_server \
-  --model /path/to/Qwen3.6-27B-AWQ \
-  --served-model-name qwen3.6-27b-awq-mtp \
-  --trust-remote-code \
-  --tensor-parallel-size 4 \
-  --enable-auto-tool-choice \
-  --tool-call-parser qwen3_coder \
-  --host 0.0.0.0 \
-  --port 8000
-```
-
-On V100, 1Cat-vLLM applies these defaults for this model family:
-
-- MTP4 speculative decoding.
-- 256K context from the model config.
-- `max_num_seqs=4` and `max_num_batched_tokens=8192` for TP4.
-- Prefix cache with `mamba_cache_mode=align`.
-- Text-only multimodal defaults to avoid unnecessary vision cache/profiling.
-- `gpu_memory_utilization=0.88`.
-- MTP4 CUDA graph capture sizes used by the validated TP4/TP2 profiles.
-
-If you need a non-default experiment, override the relevant flag explicitly.
-For example:
-
-```bash
---speculative-config '{"method":"mtp","num_speculative_tokens":8}'
-```
-
-Do not set `VLLM_SM70_ENABLE_DENSE_F16_FASTPATH=1` for this public MTP profile.
-That dense fast path is experimental and should be benchmarked separately.
-
-If decode throughput is much lower than expected, check `/metrics` for the MTP
-acceptance length first. Very low acceptance usually means the prompt is too
-divergent for speculative decoding or a tuning flag was overridden.
-
-### Qwen3.6-27B-AWQ, TP2, MTP + Prefix Cache
-
-Use this profile for two 32 GB V100 cards. It keeps the 256K context limit, but
-uses lower concurrency because the TP4 MTP setting does not fit on 64 GB.
-
-```bash
-python -m vllm.entrypoints.openai.api_server \
-  --model /path/to/Qwen3.6-27B-AWQ \
-  --served-model-name qwen3.6-27b-awq-mtp-tp2 \
-  --trust-remote-code \
-  --tensor-parallel-size 2 \
+  --max-num-seqs 4 \
+  --max-num-batched-tokens 8192 \
   --enable-auto-tool-choice \
   --tool-call-parser qwen3_coder \
   --host 0.0.0.0 \
@@ -284,29 +229,14 @@ python -m vllm.entrypoints.openai.api_server \
 ```bash
 python -m vllm.entrypoints.openai.api_server \
   --model /path/to/Qwen3.6-35B-A3B-AWQ \
-  --served-model-name Qwen3.6-35B-A3B-AWQ \
+  --served-model-name qwen3.6-35b-a3b-awq \
+  --trust-remote-code \
   --attention-backend FLASH_ATTN_V100 \
   --tensor-parallel-size 4 \
   --gpu-memory-utilization 0.88 \
   --max-model-len 262144 \
   --max-num-seqs 1 \
   --max-num-batched-tokens 8192 \
-  --host 0.0.0.0 \
-  --port 8000
-```
-
-### Qwen3.5-122B-A10B-AWQ, TP4
-
-```bash
-python -m vllm.entrypoints.openai.api_server \
-  --model /path/to/Qwen3.5-122B-A10B-AWQ \
-  --served-model-name Qwen3.5-122B-A10B-AWQ \
-  --attention-backend FLASH_ATTN_V100 \
-  --tensor-parallel-size 4 \
-  --gpu-memory-utilization 0.88 \
-  --max-model-len 262144 \
-  --max-num-seqs 1 \
-  --max-num-batched-tokens 8096 \
   --host 0.0.0.0 \
   --port 8000
 ```
@@ -318,7 +248,7 @@ curl http://127.0.0.1:8000/v1/chat/completions \
   -H 'Content-Type: application/json' \
   -H 'Authorization: Bearer EMPTY' \
   -d '{
-    "model": "Qwen3.5-27B-AWQ",
+    "model": "qwen3.6-27b-awq",
     "messages": [{"role": "user", "content": "用一句话回答，2+2等于几？"}],
     "temperature": 0,
     "max_completion_tokens": 32,

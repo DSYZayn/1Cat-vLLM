@@ -108,6 +108,42 @@ at::Tensor flash_attention_prefill_paged(
     const int window_size_right
 );
 
+at::Tensor flash_attention_prefill_paged_bfla(
+    const at::Tensor& q,
+    const at::Tensor& k_cache,
+    const at::Tensor& v_cache,
+    std::optional<at::Tensor>& out_,
+    const at::Tensor& block_table,
+    const at::Tensor& seq_lens,
+    const at::Tensor& bfla_block_mask,
+    const int bfla_mask_block_n,
+    const float softmax_scale,
+    const std::string& kv_cache_dtype,
+    const float k_scale,
+    const float v_scale,
+    const bool is_causal,
+    const int window_size_left,
+    const int window_size_right
+);
+
+at::Tensor flash_attention_prefill_paged_splitkv(
+    const at::Tensor& q,
+    const at::Tensor& k_cache,
+    const at::Tensor& v_cache,
+    std::optional<at::Tensor>& out_,
+    const at::Tensor& block_table,
+    const at::Tensor& seq_lens,
+    const float softmax_scale,
+    const std::string& kv_cache_dtype,
+    const float k_scale,
+    const float v_scale,
+    const bool is_causal,
+    const int window_size_left,
+    const int window_size_right,
+    const int split_kv_tokens,
+    const int max_seq_len_hint
+);
+
 std::vector<at::Tensor> flash_attention_backward(
     const at::Tensor& dout,
     const at::Tensor& q,

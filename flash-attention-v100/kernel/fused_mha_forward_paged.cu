@@ -2,6 +2,7 @@
 #include <cuda_runtime.h>
 #include <cuda_fp16.h>
 #include <torch/extension.h>
+#include <algorithm>
 #include <cstdlib>
 #include <cstring>
 #include <string>
@@ -71,12 +72,15 @@ int kv_cache_dtype_code_from_string(const std::string& kv_cache_dtype) {
 #define BLOCK_N_256_LOW_SMEM 128
 #define KV_STAGE_N_256_LOW_SMEM 1
 #define WARPS_256_LOW_SMEM   16
+#define BLOCK_N_256_LOW_SMEM_SCALAR_QK 32
+#define KV_STAGE_N_256_LOW_SMEM_SCALAR_QK BLOCK_N_256_LOW_SMEM_SCALAR_QK
 #define LOW_SMEM_PAGE_SIZE   16
 
-template<int D, bool LOW_SMEM = false>
+template<int D, bool LOW_SMEM = false, bool LOW_SMEM_SCALAR_QK = false,
+         bool LOW_SMEM_BM32 = false>
 struct KernelConfig {
-    static constexpr int BLOCK_M = (D == 16) ? BLOCK_M_16 : (D == 32) ? BLOCK_M_32 : (D == 64) ? BLOCK_M_64 : (D == 128) ? BLOCK_M_128 : (LOW_SMEM ? BLOCK_M_256_LOW_SMEM : BLOCK_M_256);
-    static constexpr int BLOCK_N = (D == 16) ? BLOCK_N_16 : (D == 32) ? BLOCK_N_32 : (D == 64) ? BLOCK_N_64 : (D == 128) ? BLOCK_N_128 : (LOW_SMEM ? BLOCK_N_256_LOW_SMEM : BLOCK_N_256);
+    static constexpr int BLOCK_M = (D == 16) ? BLOCK_M_16 : (D == 32) ? BLOCK_M_32 : (D == 64) ? BLOCK_M_64 : (D == 128) ? BLOCK_M_128 : (LOW_SMEM ? (LOW_SMEM_BM32 ? BLOCK_M_256 : BLOCK_M_256_LOW_SMEM) : BLOCK_M_256);
+    static constexpr int BLOCK_N = (D == 16) ? BLOCK_N_16 : (D == 32) ? BLOCK_N_32 : (D == 64) ? BLOCK_N_64 : (D == 128) ? BLOCK_N_128 : (LOW_SMEM ? (LOW_SMEM_SCALAR_QK ? BLOCK_N_256_LOW_SMEM_SCALAR_QK : BLOCK_N_256_LOW_SMEM) : BLOCK_N_256);
     static constexpr int WARPS_PER_BLOCK = (D == 16) ? WARPS_16 : (D == 32) ? WARPS_32 : (D == 64) ? WARPS_64 : (D == 128) ? WARPS_128 : (LOW_SMEM ? WARPS_256_LOW_SMEM : WARPS_256);
 
     static constexpr int THREADS_PER_BLOCK = WARPS_PER_BLOCK * MAX_THREADS_PER_WARP;
@@ -84,7 +88,7 @@ struct KernelConfig {
     static constexpr int PAD               = (8 - (D % 32) + 32) % 32;
     static constexpr int Q_STRIDE          = D + PAD;
     static constexpr int KV_STRIDE         = D + PAD;
-    static constexpr int KV_STAGE_N        = (D == 256 && LOW_SMEM) ? KV_STAGE_N_256_LOW_SMEM : BLOCK_N;
+    static constexpr int KV_STAGE_N        = (D == 256 && LOW_SMEM) ? (LOW_SMEM_SCALAR_QK ? KV_STAGE_N_256_LOW_SMEM_SCALAR_QK : KV_STAGE_N_256_LOW_SMEM) : BLOCK_N;
     static constexpr int S_STRIDE          = BLOCK_N + PAD;
     static constexpr int P_SUB_TILE        = 32;
     static constexpr int P_STRIDE          = P_SUB_TILE + PAD;
@@ -108,6 +112,8 @@ struct KernelConfig {
         alignas(16) float  o      [BLOCK_M * O_STRIDE];
         alignas(16) float  row_max[BLOCK_M];
         alignas(16) float  row_sum[BLOCK_M];
+        alignas(16) int    page_idx[LOW_SMEM_PAGE_COUNT];
+        alignas(16) int    page_offset[LOW_SMEM_PAGE_COUNT];
     };
 
     static constexpr size_t TOTAL_SMEM = ((sizeof(SmemLayout) + 127) & ~size_t(127));
@@ -128,9 +134,12 @@ __device__ __forceinline__ void init_smem(char* smem_raw) {
     __syncthreads();
 }
 
-template<int D, bool LOW_SMEM, bool LOW_SMEM_CONTIG16, bool IS_CAUSAL,
-         int KV_DTYPE>
-__global__ void __launch_bounds__(KernelConfig<D, LOW_SMEM>::THREADS_PER_BLOCK, 2)
+template<int D, bool LOW_SMEM, bool LOW_SMEM_CONTIG_FAST,
+         bool LOW_SMEM_SCALAR_QK, bool LOW_SMEM_BM32, bool SPLIT_KV,
+         bool IS_CAUSAL, int KV_DTYPE>
+__global__ void __launch_bounds__(
+    KernelConfig<D, LOW_SMEM, LOW_SMEM_SCALAR_QK,
+                 LOW_SMEM_BM32>::THREADS_PER_BLOCK, 2)
 flash_attention_forward_kernel_paged(
     const __half* __restrict__ Q,
     const void* __restrict__ K_cache,
@@ -143,6 +152,12 @@ flash_attention_forward_kernel_paged(
     const int H,
     const int M,
     const int N,
+    const int* __restrict__ bfla_block_mask,
+    const int bfla_mask_block_n,
+    const int64_t bfla_mask_stride_b,
+    const int64_t bfla_mask_stride_h,
+    const int64_t bfla_mask_stride_q,
+    const int64_t bfla_mask_stride_k,
     const int page_block_size,
     const int num_kv_heads,
     const int64_t k_block_stride,
@@ -155,9 +170,14 @@ flash_attention_forward_kernel_paged(
     const float k_scale,
     const float v_scale,
     const int window_size_left,
-    const int window_size_right
+    const int window_size_right,
+          float* __restrict__ split_tmp_out,
+          float* __restrict__ split_tmp_row_max,
+          float* __restrict__ split_tmp_row_sum,
+    const int split_kv_tiles
 ) {
-    using Config = KernelConfig<D, LOW_SMEM>;
+    using Config = KernelConfig<D, LOW_SMEM, LOW_SMEM_SCALAR_QK,
+                                LOW_SMEM_BM32>;
     using Traits = FlashV100Traits<D>;
 
     constexpr int BLOCK_M           = Config::BLOCK_M;
@@ -240,8 +260,8 @@ flash_attention_forward_kernel_paged(
     float*  sO      = smem.o;
     float*  sRowMax = smem.row_max;
     float*  sRowSum = smem.row_sum;
-    int*    sPageIdx = reinterpret_cast<int*>(sK);
-    int*    sPageOffset = sPageIdx + Config::LOW_SMEM_PAGE_COUNT;
+    int*    sPageIdx = smem.page_idx;
+    int*    sPageOffset = smem.page_offset;
 
     const int  d_stride_uint4 = (D + PER_UINT4 - 1) / PER_UINT4;
     const int  q_stride_uint4 = (Q_STRIDE  + PER_UINT4 - 1) / PER_UINT4;
@@ -277,13 +297,37 @@ flash_attention_forward_kernel_paged(
     }
     __syncthreads();
 
-    for (int block_n = 0; block_n < num_n_tiles; ++block_n) {
+    int first_n_tile = 0;
+    int last_n_tile = num_n_tiles;
+    if constexpr (SPLIT_KV) {
+        const int partition_id = blockIdx.y;
+        const int tiles_per_partition =
+            split_kv_tiles > 1 ? split_kv_tiles : 1;
+        first_n_tile = partition_id * tiles_per_partition;
+        last_n_tile = min(num_n_tiles, first_n_tile + tiles_per_partition);
+    }
+
+    for (int block_n = first_n_tile; block_n < last_n_tile; ++block_n) {
         const int start_col = block_n * BLOCK_N;
         if (start_col >= actual_N) break;
         const int valid_k_rows = min(BLOCK_N, actual_N - start_col);
 
         if (start_col + valid_k_rows <= min_key_pos) {
             continue;
+        }
+
+        if (bfla_block_mask != nullptr && bfla_mask_block_n > 0) {
+            const int mask_q_idx = start_row / bfla_mask_block_n;
+            const int mask_k_idx = start_col / bfla_mask_block_n;
+            const int keep_tile = __ldg(
+                bfla_block_mask
+                + (int64_t)batch_id * bfla_mask_stride_b
+                + (int64_t)kv_head_id * bfla_mask_stride_h
+                + (int64_t)mask_q_idx * bfla_mask_stride_q
+                + (int64_t)mask_k_idx * bfla_mask_stride_k);
+            if (keep_tile == 0) {
+                continue;
+            }
         }
 
         const int partial_block_size = (block_n == num_n_tiles - 1 && actual_N % BLOCK_N != 0)
@@ -349,10 +393,9 @@ flash_attention_forward_kernel_paged(
             }
             __syncthreads();
 
-            if constexpr (LOW_SMEM_CONTIG16) {
+            if constexpr (LOW_SMEM_CONTIG_FAST) {
                 low_smem_contiguous_page_tile =
-                    page_block_size == LOW_SMEM_PAGE_SIZE && page_offset == 0
-                    && valid_k_rows == BLOCK_N
+                    valid_k_rows == BLOCK_N
                     && k_block_stride
                         == (int64_t)page_block_size * k_token_stride
                     && v_block_stride
@@ -360,9 +403,17 @@ flash_attention_forward_kernel_paged(
                     && sPageIdx[0] >= 0;
                 #pragma unroll
                 for (int i = 1; i < LOW_SMEM_PAGE_COUNT; ++i) {
+                    const int linear_offset =
+                        sPageOffset[0] + i * LOW_SMEM_PAGE_SIZE;
+                    const int expected_page_delta =
+                        linear_offset / page_block_size;
+                    const int expected_page_offset =
+                        linear_offset
+                        - expected_page_delta * page_block_size;
                     low_smem_contiguous_page_tile =
                         low_smem_contiguous_page_tile
-                        && sPageIdx[i] == sPageIdx[0] + i;
+                        && sPageIdx[i] == sPageIdx[0] + expected_page_delta
+                        && sPageOffset[i] == expected_page_offset;
                 }
             } else {
                 low_smem_contiguous_page_tile = false;
@@ -370,117 +421,217 @@ flash_attention_forward_kernel_paged(
 
             const __half* K_cache_h = reinterpret_cast<const __half*>(K_cache);
 
-            const int num_tiles_m_qk = (BLOCK_M + WMMA_M - 1) / WMMA_M;
-            const int num_tiles_n_qk = (BLOCK_N + WMMA_N - 1) / WMMA_N;
-            const int num_tiles_k_qk = (D + WMMA_K - 1) / WMMA_K;
-            const int total_tiles_qk = num_tiles_m_qk * num_tiles_n_qk;
-            const int tiles_per_warp_qk =
-                (total_tiles_qk + WARPS_PER_BLOCK - 1) / WARPS_PER_BLOCK;
-            const unsigned row_causal =
-                (lane_id & 0b1) + ((lane_id >> 2) & 0b1) * 8
-                + ((lane_id >> 4) & 0b1) * 4;
-            const unsigned col_causal =
-                ((lane_id >> 1) & 0b1) * 2 + ((lane_id >> 3) & 0b1) * 8;
-
-            for (int tile_idx = 0; tile_idx < tiles_per_warp_qk; ++tile_idx) {
-                const int global_tile_idx =
-                    warp_id * tiles_per_warp_qk + tile_idx;
-                if (global_tile_idx >= total_tiles_qk) break;
-
-                const int tile_m_idx = global_tile_idx / num_tiles_n_qk;
-                const int tile_n_idx = global_tile_idx % num_tiles_n_qk;
-
-                const int tile_m = tile_m_idx * WMMA_M;
-                const int tile_n = tile_n_idx * WMMA_N;
-
-                if (tile_m >= valid_q_rows || tile_n >= valid_k_rows) {
-                    continue;
-                }
-
-                const int page_slot = tile_n >> 4;
-                const int block_offset = sPageOffset[page_slot];
-                const int physical_block_idx_direct = sPageIdx[page_slot];
-
-                fragment<matrix_a, WMMA_M, WMMA_N, WMMA_K, half, row_major>
-                    a_frag;
-                fragment<matrix_b, WMMA_M, WMMA_N, WMMA_K, half, col_major>
-                    b_frag;
-                fragment<accumulator, WMMA_M, WMMA_N, WMMA_K, float>
-                    acc_frag;
-                fill_fragment(acc_frag, 0.0f);
-
-                #pragma unroll
-                for (int k_tile = 0; k_tile < num_tiles_k_qk; ++k_tile) {
-                    const int k_offset = k_tile * WMMA_K;
-                    if (k_offset >= D) break;
-
-                    const __half* k_tile_ptr;
-                    if constexpr (LOW_SMEM_CONTIG16) {
-                        k_tile_ptr =
-                            low_smem_contiguous_page_tile
-                                ? K_cache_h
-                                      + (int64_t)sPageIdx[0] * k_block_stride
-                                      + (int64_t)tile_n * k_token_stride
-                                      + (int64_t)kv_head_id * k_head_stride
-                                      + k_offset
-                                : K_cache_h
-                                      + (int64_t)physical_block_idx_direct
-                                            * k_block_stride
-                                      + (int64_t)block_offset * k_token_stride
-                                      + (int64_t)kv_head_id * k_head_stride
-                                      + k_offset;
-                    } else {
-                        k_tile_ptr =
-                            K_cache_h
-                            + (int64_t)physical_block_idx_direct * k_block_stride
-                            + (int64_t)block_offset * k_token_stride
-                            + (int64_t)kv_head_id * k_head_stride + k_offset;
+            if constexpr (LOW_SMEM_SCALAR_QK) {
+                uint4* sK_vec = reinterpret_cast<uint4*>(sK);
+                for (int idx = tid; idx < valid_k_rows * d_stride_uint4;
+                     idx += THREADS_PER_BLOCK) {
+                    const int row = idx / d_stride_uint4;
+                    const int vec_col = idx % d_stride_uint4;
+                    uint4 k_val = make_uint4(0, 0, 0, 0);
+                    if (row < valid_k_rows && vec_col < d_stride_uint4) {
+                        const int page_slot = row >> 4;
+                        const int block_offset =
+                            sPageOffset[page_slot]
+                            + (row - page_slot * LOW_SMEM_PAGE_SIZE);
+                        const int physical_block_idx_direct =
+                            sPageIdx[page_slot];
+                        const __half* k_row_ptr;
+                        if constexpr (LOW_SMEM_CONTIG_FAST) {
+                            k_row_ptr =
+                                low_smem_contiguous_page_tile
+                                    ? K_cache_h
+                                          + (int64_t)sPageIdx[0] * k_block_stride
+                                          + (int64_t)(sPageOffset[0] + row)
+                                                * k_token_stride
+                                          + (int64_t)kv_head_id * k_head_stride
+                                    : K_cache_h
+                                          + (int64_t)physical_block_idx_direct
+                                                * k_block_stride
+                                          + (int64_t)block_offset
+                                                * k_token_stride
+                                          + (int64_t)kv_head_id * k_head_stride;
+                        } else {
+                            k_row_ptr =
+                                K_cache_h
+                                + (int64_t)physical_block_idx_direct
+                                      * k_block_stride
+                                + (int64_t)block_offset * k_token_stride
+                                + (int64_t)kv_head_id * k_head_stride;
+                        }
+                        const uint4* k_row_vec =
+                            reinterpret_cast<const uint4*>(k_row_ptr);
+                        k_val = __ldg(&k_row_vec[vec_col]);
                     }
-
-                    load_matrix_sync(
-                        a_frag, sQ + tile_m * Q_STRIDE + k_offset, Q_STRIDE);
-                    load_matrix_sync(b_frag, k_tile_ptr, k_token_stride);
-                    mma_sync(acc_frag, a_frag, b_frag, acc_frag);
+                    sK_vec[row * kv_stride_uint4 + vec_col] = k_val;
                 }
+                __syncthreads();
 
-                #pragma unroll
-                for (int i = 0; i < acc_frag.num_elements; ++i) {
-                    const unsigned col =
-                        col_causal + (i & 0b1) + ((i >> 2) & 0b1) * 4;
-                    const unsigned row = row_causal + ((i >> 1) & 0b1) * 2;
-
-                    const int global_m = start_row + tile_m + row;
-                    const int global_n = start_col + tile_n + col;
+                const int total_scores = valid_q_rows * valid_k_rows;
+                for (int idx = tid; idx < total_scores;
+                     idx += THREADS_PER_BLOCK) {
+                    const int row = idx / valid_k_rows;
+                    const int col = idx - row * valid_k_rows;
+                    const int global_m = start_row + row;
+                    const int global_n = start_col + col;
                     const int global_q_pos = global_m + causal_q_offset;
 
-                    const bool is_valid =
-                        (global_m < start_row + valid_q_rows)
-                        && (global_n < start_col + valid_k_rows);
-                    bool is_causal_valid = true;
+                    bool is_valid = true;
                     if constexpr (IS_CAUSAL) {
-                        is_causal_valid = global_n <= global_q_pos;
+                        is_valid = global_n <= global_q_pos;
                     }
-                    bool is_window_valid = true;
                     if (window_size_left >= 0) {
-                        is_window_valid =
-                            is_window_valid
+                        is_valid =
+                            is_valid
                             && global_n >= global_q_pos - window_size_left;
                     }
                     if (window_size_right >= 0) {
-                        is_window_valid =
-                            is_window_valid
+                        is_valid =
+                            is_valid
                             && global_n <= global_q_pos + window_size_right;
                     }
 
-                    acc_frag.x[i] =
-                        (is_valid && is_causal_valid && is_window_valid)
-                            ? acc_frag.x[i] * softmax_scale
-                            : NEG_INF;
+                    float acc = 0.0f;
+                    if (is_valid) {
+                        #pragma unroll 8
+                        for (int d = 0; d < D; d += 2) {
+                            const __half2 q_h2 =
+                                *reinterpret_cast<const __half2*>(
+                                    sQ + row * Q_STRIDE + d);
+                            const __half2 k_h2 =
+                                *reinterpret_cast<const __half2*>(
+                                    sK + col * KV_STRIDE + d);
+                            const float2 q_f2 = __half22float2(q_h2);
+                            const float2 k_f2 = __half22float2(k_h2);
+                            acc = fmaf(q_f2.x, k_f2.x, acc);
+                            acc = fmaf(q_f2.y, k_f2.y, acc);
+                        }
+                    }
+                    sS[row * S_STRIDE + col] =
+                        is_valid ? acc * softmax_scale : NEG_INF;
                 }
+            } else {
+                const int num_tiles_m_qk = (BLOCK_M + WMMA_M - 1) / WMMA_M;
+                const int num_tiles_n_qk = (BLOCK_N + WMMA_N - 1) / WMMA_N;
+                const int num_tiles_k_qk = (D + WMMA_K - 1) / WMMA_K;
+                const int total_tiles_qk = num_tiles_m_qk * num_tiles_n_qk;
+                const int tiles_per_warp_qk =
+                    (total_tiles_qk + WARPS_PER_BLOCK - 1) / WARPS_PER_BLOCK;
+                const unsigned row_causal =
+                    (lane_id & 0b1) + ((lane_id >> 2) & 0b1) * 8
+                    + ((lane_id >> 4) & 0b1) * 4;
+                const unsigned col_causal =
+                    ((lane_id >> 1) & 0b1) * 2 + ((lane_id >> 3) & 0b1) * 8;
 
-                store_matrix_sync(
-                    sS + tile_m * S_STRIDE + tile_n, acc_frag, S_STRIDE,
-                    mem_row_major);
+                for (int tile_idx = 0; tile_idx < tiles_per_warp_qk;
+                     ++tile_idx) {
+                    const int global_tile_idx =
+                        warp_id * tiles_per_warp_qk + tile_idx;
+                    if (global_tile_idx >= total_tiles_qk) break;
+
+                    const int tile_m_idx = global_tile_idx / num_tiles_n_qk;
+                    const int tile_n_idx = global_tile_idx % num_tiles_n_qk;
+
+                    const int tile_m = tile_m_idx * WMMA_M;
+                    const int tile_n = tile_n_idx * WMMA_N;
+
+                    if (tile_m >= valid_q_rows || tile_n >= valid_k_rows) {
+                        continue;
+                    }
+
+                    const int page_slot = tile_n >> 4;
+                    const int block_offset = sPageOffset[page_slot];
+                    const int physical_block_idx_direct = sPageIdx[page_slot];
+
+                    fragment<matrix_a, WMMA_M, WMMA_N, WMMA_K, half, row_major>
+                        a_frag;
+                    fragment<matrix_b, WMMA_M, WMMA_N, WMMA_K, half, col_major>
+                        b_frag;
+                    fragment<accumulator, WMMA_M, WMMA_N, WMMA_K, float>
+                        acc_frag;
+                    fill_fragment(acc_frag, 0.0f);
+
+                    #pragma unroll
+                    for (int k_tile = 0; k_tile < num_tiles_k_qk; ++k_tile) {
+                        const int k_offset = k_tile * WMMA_K;
+                        if (k_offset >= D) break;
+
+                        const __half* k_tile_ptr;
+                        if constexpr (LOW_SMEM_CONTIG_FAST) {
+                            k_tile_ptr =
+                                low_smem_contiguous_page_tile
+                                    ? K_cache_h
+                                          + (int64_t)sPageIdx[0] * k_block_stride
+                                          + (int64_t)(sPageOffset[0] + tile_n)
+                                                * k_token_stride
+                                          + (int64_t)kv_head_id * k_head_stride
+                                          + k_offset
+                                    : K_cache_h
+                                          + (int64_t)physical_block_idx_direct
+                                                * k_block_stride
+                                          + (int64_t)block_offset
+                                                * k_token_stride
+                                          + (int64_t)kv_head_id * k_head_stride
+                                          + k_offset;
+                        } else {
+                            k_tile_ptr =
+                                K_cache_h
+                                + (int64_t)physical_block_idx_direct
+                                      * k_block_stride
+                                + (int64_t)block_offset * k_token_stride
+                                + (int64_t)kv_head_id * k_head_stride
+                                + k_offset;
+                        }
+
+                        load_matrix_sync(
+                            a_frag,
+                            sQ + tile_m * Q_STRIDE + k_offset,
+                            Q_STRIDE);
+                        load_matrix_sync(b_frag, k_tile_ptr, k_token_stride);
+                        mma_sync(acc_frag, a_frag, b_frag, acc_frag);
+                    }
+
+                    #pragma unroll
+                    for (int i = 0; i < acc_frag.num_elements; ++i) {
+                        const unsigned col =
+                            col_causal + (i & 0b1) + ((i >> 2) & 0b1) * 4;
+                        const unsigned row =
+                            row_causal + ((i >> 1) & 0b1) * 2;
+
+                        const int global_m = start_row + tile_m + row;
+                        const int global_n = start_col + tile_n + col;
+                        const int global_q_pos = global_m + causal_q_offset;
+
+                        const bool is_valid =
+                            (global_m < start_row + valid_q_rows)
+                            && (global_n < start_col + valid_k_rows);
+                        bool is_causal_valid = true;
+                        if constexpr (IS_CAUSAL) {
+                            is_causal_valid = global_n <= global_q_pos;
+                        }
+                        bool is_window_valid = true;
+                        if (window_size_left >= 0) {
+                            is_window_valid =
+                                is_window_valid
+                                && global_n
+                                       >= global_q_pos - window_size_left;
+                        }
+                        if (window_size_right >= 0) {
+                            is_window_valid =
+                                is_window_valid
+                                && global_n
+                                       <= global_q_pos + window_size_right;
+                        }
+
+                        acc_frag.x[i] =
+                            (is_valid && is_causal_valid && is_window_valid)
+                                ? acc_frag.x[i] * softmax_scale
+                                : NEG_INF;
+                    }
+
+                    store_matrix_sync(
+                        sS + tile_m * S_STRIDE + tile_n, acc_frag, S_STRIDE,
+                        mem_row_major);
+                }
             }
             __syncthreads();
         } else {
@@ -903,12 +1054,13 @@ flash_attention_forward_kernel_paged(
                         const int physical_block_idx_direct =
                             sPageIdx[page_slot];
                         const __half* v_tile_ptr;
-                        if constexpr (LOW_SMEM_CONTIG16) {
+                        if constexpr (LOW_SMEM_CONTIG_FAST) {
                             v_tile_ptr =
                                 low_smem_contiguous_page_tile
                                     ? V_cache_h
                                           + (int64_t)sPageIdx[0] * v_block_stride
-                                          + (int64_t)token_offset * v_token_stride
+                                          + (int64_t)(sPageOffset[0] + token_offset)
+                                                * v_token_stride
                                           + (int64_t)kv_head_id * v_head_stride
                                           + tile_d
                                     : V_cache_h
@@ -940,6 +1092,27 @@ flash_attention_forward_kernel_paged(
             __syncthreads();
         }
 
+    }
+
+    if constexpr (SPLIT_KV) {
+        const int partition_id = blockIdx.y;
+        const int num_partitions = gridDim.y;
+        const int64_t row_base =
+            ((int64_t)batch_head_id * num_partitions + partition_id) * M
+            + start_row;
+
+        for (int i = tid; i < valid_q_rows * D; i += THREADS_PER_BLOCK) {
+            const int row = i / D;
+            const int col = i - row * D;
+            split_tmp_out[(row_base + row) * D + col] =
+                sO[row * O_STRIDE + col];
+        }
+
+        if (tid < valid_q_rows) {
+            split_tmp_row_max[row_base + tid] = sRowMax[tid];
+            split_tmp_row_sum[row_base + tid] = sRowSum[tid];
+        }
+        return;
     }
 
     const int total_fp16_x4 = (valid_q_rows * D) / 4;
@@ -980,7 +1153,13 @@ inline bool env_flag_enabled(const char* name) {
     return raw != nullptr && std::strcmp(raw, "0") != 0;
 }
 
-template<int D, int KV_DTYPE, bool LOW_SMEM, bool LOW_SMEM_CONTIG16>
+inline bool env_flag_default_enabled(const char* name) {
+    const char* raw = std::getenv(name);
+    return raw == nullptr || std::strcmp(raw, "0") != 0;
+}
+
+template<int D, int KV_DTYPE, bool LOW_SMEM, bool LOW_SMEM_CONTIG_FAST,
+         bool LOW_SMEM_SCALAR_QK, bool LOW_SMEM_BM32>
 void launcher_flash_attention_forward_paged_impl(
     const torch::Tensor& Q,
     const torch::Tensor& K_cache,
@@ -989,6 +1168,12 @@ void launcher_flash_attention_forward_paged_impl(
     torch::Tensor& softmax_lse,
     const torch::Tensor& block_table,
     const torch::Tensor& seq_lens,
+    const int* bfla_mask_ptr,
+    int bfla_mask_block_n,
+    int64_t bfla_mask_stride_b,
+    int64_t bfla_mask_stride_h,
+    int64_t bfla_mask_stride_q,
+    int64_t bfla_mask_stride_k,
     float softmax_scale,
     bool is_causal,
     float k_scale,
@@ -997,7 +1182,8 @@ void launcher_flash_attention_forward_paged_impl(
     int window_size_right,
     cudaStream_t stream
 ) {
-    using Config = KernelConfig<D, LOW_SMEM>;
+    using Config = KernelConfig<D, LOW_SMEM, LOW_SMEM_SCALAR_QK,
+                                LOW_SMEM_BM32>;
 
     const int B = Q.size(0);
     const int H = Q.size(1);
@@ -1023,15 +1209,20 @@ void launcher_flash_attention_forward_paged_impl(
 
     auto kernel = is_causal
                       ? (void*)flash_attention_forward_kernel_paged<
-                            D, LOW_SMEM, LOW_SMEM_CONTIG16, true, KV_DTYPE>
+                            D, LOW_SMEM, LOW_SMEM_CONTIG_FAST,
+                            LOW_SMEM_SCALAR_QK, LOW_SMEM_BM32, false, true,
+                            KV_DTYPE>
                       : (void*)flash_attention_forward_kernel_paged<
-                            D, LOW_SMEM, LOW_SMEM_CONTIG16, false, KV_DTYPE>;
+                            D, LOW_SMEM, LOW_SMEM_CONTIG_FAST,
+                            LOW_SMEM_SCALAR_QK, LOW_SMEM_BM32, false, false,
+                            KV_DTYPE>;
     cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize,
                          smem);
 
     if (is_causal) {
         flash_attention_forward_kernel_paged<
-            D, LOW_SMEM, LOW_SMEM_CONTIG16, true, KV_DTYPE>
+            D, LOW_SMEM, LOW_SMEM_CONTIG_FAST, LOW_SMEM_SCALAR_QK,
+            LOW_SMEM_BM32, false, true, KV_DTYPE>
             <<<grid, block, smem, stream>>>(
             reinterpret_cast<const __half*>(Q.data_ptr()),
             K_cache.data_ptr(),
@@ -1044,6 +1235,12 @@ void launcher_flash_attention_forward_paged_impl(
             H,
             M,
             N,
+            bfla_mask_ptr,
+            bfla_mask_block_n,
+            bfla_mask_stride_b,
+            bfla_mask_stride_h,
+            bfla_mask_stride_q,
+            bfla_mask_stride_k,
             page_block_size,
             num_kv_heads,
             k_block_stride,
@@ -1056,11 +1253,16 @@ void launcher_flash_attention_forward_paged_impl(
             k_scale,
             v_scale,
             window_size_left,
-            window_size_right
+            window_size_right,
+            nullptr,
+            nullptr,
+            nullptr,
+            0
         );
     } else {
         flash_attention_forward_kernel_paged<
-            D, LOW_SMEM, LOW_SMEM_CONTIG16, false, KV_DTYPE>
+            D, LOW_SMEM, LOW_SMEM_CONTIG_FAST, LOW_SMEM_SCALAR_QK,
+            LOW_SMEM_BM32, false, false, KV_DTYPE>
             <<<grid, block, smem, stream>>>(
             reinterpret_cast<const __half*>(Q.data_ptr()),
             K_cache.data_ptr(),
@@ -1073,6 +1275,12 @@ void launcher_flash_attention_forward_paged_impl(
             H,
             M,
             N,
+            bfla_mask_ptr,
+            bfla_mask_block_n,
+            bfla_mask_stride_b,
+            bfla_mask_stride_h,
+            bfla_mask_stride_q,
+            bfla_mask_stride_k,
             page_block_size,
             num_kv_heads,
             k_block_stride,
@@ -1085,9 +1293,267 @@ void launcher_flash_attention_forward_paged_impl(
             k_scale,
             v_scale,
             window_size_left,
-            window_size_right
+            window_size_right,
+            nullptr,
+            nullptr,
+            nullptr,
+            0
         );
     }
+}
+
+template<int D>
+__global__ void flash_attention_forward_paged_splitkv_merge_kernel(
+    const float* __restrict__ split_tmp_out,
+    const float* __restrict__ split_tmp_row_max,
+    const float* __restrict__ split_tmp_row_sum,
+          __half* __restrict__ Out,
+           float* __restrict__ softmax_lse,
+    const int B,
+    const int H,
+    const int M,
+    const int num_partitions
+) {
+    static_assert(D == 256, "split-KV paged prefill merge is D=256 only");
+    constexpr int BLOCK_M = BLOCK_M_256_LOW_SMEM;
+    constexpr int THREADS = 512;
+    const float NEG_INF = -1e30f;
+
+    const int batch_head_id = blockIdx.z;
+    if (batch_head_id >= B * H) return;
+
+    const int block_m = blockIdx.x;
+    const int start_row = block_m * BLOCK_M;
+    if (start_row >= M) return;
+    const int valid_q_rows = min(BLOCK_M, M - start_row);
+    const int tid = threadIdx.x;
+
+    __shared__ float sFinalMax[BLOCK_M];
+    __shared__ float sFinalSum[BLOCK_M];
+
+    if (tid < valid_q_rows) {
+        const int row = start_row + tid;
+        float final_max = NEG_INF;
+        #pragma unroll 1
+        for (int p = 0; p < num_partitions; ++p) {
+            const int64_t state_idx =
+                ((int64_t)batch_head_id * num_partitions + p) * M + row;
+            final_max = fmaxf(final_max, split_tmp_row_max[state_idx]);
+        }
+
+        float final_sum = 0.0f;
+        #pragma unroll 1
+        for (int p = 0; p < num_partitions; ++p) {
+            const int64_t state_idx =
+                ((int64_t)batch_head_id * num_partitions + p) * M + row;
+            const float part_sum = split_tmp_row_sum[state_idx];
+            if (part_sum > 0.0f) {
+                final_sum +=
+                    __expf(fmaxf(split_tmp_row_max[state_idx] - final_max,
+                                  -80.0f)) * part_sum;
+            }
+        }
+        sFinalMax[tid] = final_max;
+        sFinalSum[tid] = final_sum;
+        softmax_lse[(int64_t)batch_head_id * M + row] =
+            final_max + logf(fmaxf(final_sum, 1e-24f));
+    }
+    __syncthreads();
+
+    for (int idx = tid; idx < valid_q_rows * D; idx += THREADS) {
+        const int row_local = idx / D;
+        const int col = idx - row_local * D;
+        const int row = start_row + row_local;
+        const float final_max = sFinalMax[row_local];
+        const float inv_sum = 1.0f / fmaxf(sFinalSum[row_local], 1e-24f);
+
+        float acc = 0.0f;
+        #pragma unroll 1
+        for (int p = 0; p < num_partitions; ++p) {
+            const int64_t state_idx =
+                ((int64_t)batch_head_id * num_partitions + p) * M + row;
+            const float part_sum = split_tmp_row_sum[state_idx];
+            if (part_sum > 0.0f) {
+                const float scale =
+                    __expf(fmaxf(split_tmp_row_max[state_idx] - final_max,
+                                  -80.0f));
+                const int64_t out_idx = state_idx * D + col;
+                acc = fmaf(scale, split_tmp_out[out_idx], acc);
+            }
+        }
+        Out[((int64_t)batch_head_id * M + row) * D + col] =
+            __float2half_rn(acc * inv_sum);
+    }
+}
+
+template<int D, bool LOW_SMEM_CONTIG_FAST, bool LOW_SMEM_SCALAR_QK>
+void launcher_flash_attention_forward_paged_splitkv_impl(
+    const torch::Tensor& Q,
+    const torch::Tensor& K_cache,
+    const torch::Tensor& V_cache,
+    torch::Tensor& Out,
+    torch::Tensor& softmax_lse,
+    torch::Tensor& split_tmp_out,
+    torch::Tensor& split_tmp_row_max,
+    torch::Tensor& split_tmp_row_sum,
+    const torch::Tensor& block_table,
+    const torch::Tensor& seq_lens,
+    float softmax_scale,
+    bool is_causal,
+    float k_scale,
+    float v_scale,
+    int window_size_left,
+    int window_size_right,
+    int split_kv_tokens,
+    int max_seq_len_hint,
+    cudaStream_t stream
+) {
+    static_assert(D == 256, "split-KV paged prefill is D=256 only");
+    using Config = KernelConfig<D, true, LOW_SMEM_SCALAR_QK>;
+    constexpr int KV_DTYPE = flash_v100::KV_CACHE_DTYPE_FP16;
+
+    const int B = Q.size(0);
+    const int H = Q.size(1);
+    const int M = Q.size(2);
+    const int page_block_size = K_cache.size(1);
+    const int num_kv_heads = K_cache.size(2);
+    const int max_num_blocks = block_table.size(1);
+    const int N = max_num_blocks * page_block_size;
+    const int64_t k_block_stride = K_cache.stride(0);
+    const int64_t k_token_stride = K_cache.stride(1);
+    const int64_t k_head_stride = K_cache.stride(2);
+    const int64_t v_block_stride = V_cache.stride(0);
+    const int64_t v_token_stride = V_cache.stride(1);
+    const int64_t v_head_stride = V_cache.stride(2);
+
+    split_kv_tokens = std::max(split_kv_tokens, Config::BLOCK_N);
+    max_seq_len_hint = std::max(max_seq_len_hint, 1);
+    const int split_kv_tiles =
+        std::max(1, (split_kv_tokens + Config::BLOCK_N - 1) / Config::BLOCK_N);
+    const int max_kv_tiles =
+        std::max(1, (max_seq_len_hint + Config::BLOCK_N - 1) / Config::BLOCK_N);
+    const int num_partitions =
+        std::max(1, (max_kv_tiles + split_kv_tiles - 1) / split_kv_tiles);
+
+    const int grid_x = (M + Config::BLOCK_M - 1) / Config::BLOCK_M;
+    const dim3 grid(grid_x, num_partitions, B * H);
+    const dim3 block(Config::THREADS_PER_BLOCK);
+    const size_t smem = Config::TOTAL_SMEM;
+
+    TORCH_CHECK(smem <= MAX_SMEM_PER_SM, "Shared memory exceeds 96KB: ", smem,
+                " bytes");
+    TORCH_CHECK(split_tmp_out.size(2) == num_partitions,
+                "split_tmp_out partition mismatch");
+    TORCH_CHECK(split_tmp_row_max.size(2) == num_partitions,
+                "split_tmp_row_max partition mismatch");
+    TORCH_CHECK(split_tmp_row_sum.size(2) == num_partitions,
+                "split_tmp_row_sum partition mismatch");
+
+    auto kernel = is_causal
+                      ? (void*)flash_attention_forward_kernel_paged<
+                            D, true, LOW_SMEM_CONTIG_FAST,
+                            LOW_SMEM_SCALAR_QK, false, true, true, KV_DTYPE>
+                      : (void*)flash_attention_forward_kernel_paged<
+                            D, true, LOW_SMEM_CONTIG_FAST,
+                            LOW_SMEM_SCALAR_QK, false, true, false, KV_DTYPE>;
+    cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize,
+                         smem);
+
+    if (is_causal) {
+        flash_attention_forward_kernel_paged<
+            D, true, LOW_SMEM_CONTIG_FAST, LOW_SMEM_SCALAR_QK, false, true, true,
+            KV_DTYPE>
+            <<<grid, block, smem, stream>>>(
+            reinterpret_cast<const __half*>(Q.data_ptr()),
+            K_cache.data_ptr(),
+            V_cache.data_ptr(),
+            reinterpret_cast<__half*>(Out.data_ptr()),
+            softmax_lse.data_ptr<float>(),
+            block_table.data_ptr<int>(),
+            seq_lens.data_ptr<int>(),
+            B,
+            H,
+            M,
+            N,
+            nullptr,
+            0,
+            0,
+            0,
+            0,
+            0,
+            page_block_size,
+            num_kv_heads,
+            k_block_stride,
+            k_token_stride,
+            k_head_stride,
+            v_block_stride,
+            v_token_stride,
+            v_head_stride,
+            softmax_scale,
+            k_scale,
+            v_scale,
+            window_size_left,
+            window_size_right,
+            split_tmp_out.data_ptr<float>(),
+            split_tmp_row_max.data_ptr<float>(),
+            split_tmp_row_sum.data_ptr<float>(),
+            split_kv_tiles
+        );
+    } else {
+        flash_attention_forward_kernel_paged<
+            D, true, LOW_SMEM_CONTIG_FAST, LOW_SMEM_SCALAR_QK, false, true, false,
+            KV_DTYPE>
+            <<<grid, block, smem, stream>>>(
+            reinterpret_cast<const __half*>(Q.data_ptr()),
+            K_cache.data_ptr(),
+            V_cache.data_ptr(),
+            reinterpret_cast<__half*>(Out.data_ptr()),
+            softmax_lse.data_ptr<float>(),
+            block_table.data_ptr<int>(),
+            seq_lens.data_ptr<int>(),
+            B,
+            H,
+            M,
+            N,
+            nullptr,
+            0,
+            0,
+            0,
+            0,
+            0,
+            page_block_size,
+            num_kv_heads,
+            k_block_stride,
+            k_token_stride,
+            k_head_stride,
+            v_block_stride,
+            v_token_stride,
+            v_head_stride,
+            softmax_scale,
+            k_scale,
+            v_scale,
+            window_size_left,
+            window_size_right,
+            split_tmp_out.data_ptr<float>(),
+            split_tmp_row_max.data_ptr<float>(),
+            split_tmp_row_sum.data_ptr<float>(),
+            split_kv_tiles
+        );
+    }
+
+    const dim3 merge_grid(grid_x, 1, B * H);
+    const dim3 merge_block(512);
+    flash_attention_forward_paged_splitkv_merge_kernel<D>
+        <<<merge_grid, merge_block, 0, stream>>>(
+            split_tmp_out.data_ptr<float>(),
+            split_tmp_row_max.data_ptr<float>(),
+            split_tmp_row_sum.data_ptr<float>(),
+            reinterpret_cast<__half*>(Out.data_ptr()),
+            softmax_lse.data_ptr<float>(),
+            B,
+            H,
+            M,
+            num_partitions);
 }
 
 template<int D, int KV_DTYPE>
@@ -1105,42 +1571,261 @@ void launcher_flash_attention_forward_paged(
     float v_scale,
     int window_size_left,
     int window_size_right,
-    cudaStream_t stream
+    cudaStream_t stream,
+    const int* bfla_mask_ptr = nullptr,
+    int bfla_mask_block_n = 0,
+    int64_t bfla_mask_stride_b = 0,
+    int64_t bfla_mask_stride_h = 0,
+    int64_t bfla_mask_stride_q = 0,
+    int64_t bfla_mask_stride_k = 0
 ) {
     if constexpr (D == 256 && KV_DTYPE == flash_v100::KV_CACHE_DTYPE_FP16) {
         const int M = Q.size(2);
         const int page_block_size = K_cache.size(1);
         const bool use_low_smem =
             M > 1 && page_block_size >= 16 && (page_block_size % 16) == 0
-            && env_flag_enabled("VLLM_FLASH_V100_PREFILL_D256_LOW_SMEM");
+            && env_flag_default_enabled(
+                "VLLM_FLASH_V100_PREFILL_D256_LOW_SMEM");
         if (use_low_smem) {
-            if (page_block_size == 16) {
-                launcher_flash_attention_forward_paged_impl<
-                    D, KV_DTYPE, true, true>(
-                    Q, K_cache, V_cache, Out, softmax_lse, block_table,
-                    seq_lens, softmax_scale, is_causal, k_scale, v_scale,
-                    window_size_left, window_size_right, stream);
+            const bool use_low_smem_contig_fast =
+                page_block_size == 16 ||
+                env_flag_enabled("VLLM_FLASH_V100_PREFILL_CONTIG_FAST");
+            const bool use_low_smem_scalar_qk =
+                env_flag_enabled("VLLM_FLASH_V100_PREFILL_D256_SCALAR_QK");
+            const bool use_low_smem_bm32 =
+                env_flag_enabled("VLLM_FLASH_V100_PREFILL_D256_BM32");
+            if (use_low_smem_contig_fast) {
+                if (use_low_smem_scalar_qk) {
+                    if (use_low_smem_bm32) {
+                        launcher_flash_attention_forward_paged_impl<
+                            D, KV_DTYPE, true, true, true, true>(
+                            Q, K_cache, V_cache, Out, softmax_lse, block_table,
+                            seq_lens, bfla_mask_ptr, bfla_mask_block_n,
+                            bfla_mask_stride_b, bfla_mask_stride_h,
+                            bfla_mask_stride_q, bfla_mask_stride_k,
+                            softmax_scale, is_causal, k_scale, v_scale,
+                            window_size_left, window_size_right, stream);
+                    } else {
+                        launcher_flash_attention_forward_paged_impl<
+                            D, KV_DTYPE, true, true, true, false>(
+                            Q, K_cache, V_cache, Out, softmax_lse, block_table,
+                            seq_lens, bfla_mask_ptr, bfla_mask_block_n,
+                            bfla_mask_stride_b, bfla_mask_stride_h,
+                            bfla_mask_stride_q, bfla_mask_stride_k,
+                            softmax_scale, is_causal, k_scale, v_scale,
+                            window_size_left, window_size_right, stream);
+                    }
+                } else {
+                    if (use_low_smem_bm32) {
+                        launcher_flash_attention_forward_paged_impl<
+                            D, KV_DTYPE, true, true, false, true>(
+                            Q, K_cache, V_cache, Out, softmax_lse, block_table,
+                            seq_lens, bfla_mask_ptr, bfla_mask_block_n,
+                            bfla_mask_stride_b, bfla_mask_stride_h,
+                            bfla_mask_stride_q, bfla_mask_stride_k,
+                            softmax_scale, is_causal, k_scale, v_scale,
+                            window_size_left, window_size_right, stream);
+                    } else {
+                        launcher_flash_attention_forward_paged_impl<
+                            D, KV_DTYPE, true, true, false, false>(
+                            Q, K_cache, V_cache, Out, softmax_lse, block_table,
+                            seq_lens, bfla_mask_ptr, bfla_mask_block_n,
+                            bfla_mask_stride_b, bfla_mask_stride_h,
+                            bfla_mask_stride_q, bfla_mask_stride_k,
+                            softmax_scale, is_causal, k_scale, v_scale,
+                            window_size_left, window_size_right, stream);
+                    }
+                }
             } else {
-                launcher_flash_attention_forward_paged_impl<
-                    D, KV_DTYPE, true, false>(
-                    Q, K_cache, V_cache, Out, softmax_lse, block_table,
-                    seq_lens, softmax_scale, is_causal, k_scale, v_scale,
-                    window_size_left, window_size_right, stream);
+                if (use_low_smem_scalar_qk) {
+                    if (use_low_smem_bm32) {
+                        launcher_flash_attention_forward_paged_impl<
+                            D, KV_DTYPE, true, false, true, true>(
+                            Q, K_cache, V_cache, Out, softmax_lse, block_table,
+                            seq_lens, bfla_mask_ptr, bfla_mask_block_n,
+                            bfla_mask_stride_b, bfla_mask_stride_h,
+                            bfla_mask_stride_q, bfla_mask_stride_k,
+                            softmax_scale, is_causal, k_scale, v_scale,
+                            window_size_left, window_size_right, stream);
+                    } else {
+                        launcher_flash_attention_forward_paged_impl<
+                            D, KV_DTYPE, true, false, true, false>(
+                            Q, K_cache, V_cache, Out, softmax_lse, block_table,
+                            seq_lens, bfla_mask_ptr, bfla_mask_block_n,
+                            bfla_mask_stride_b, bfla_mask_stride_h,
+                            bfla_mask_stride_q, bfla_mask_stride_k,
+                            softmax_scale, is_causal, k_scale, v_scale,
+                            window_size_left, window_size_right, stream);
+                    }
+                } else {
+                    if (use_low_smem_bm32) {
+                        launcher_flash_attention_forward_paged_impl<
+                            D, KV_DTYPE, true, false, false, true>(
+                            Q, K_cache, V_cache, Out, softmax_lse, block_table,
+                            seq_lens, bfla_mask_ptr, bfla_mask_block_n,
+                            bfla_mask_stride_b, bfla_mask_stride_h,
+                            bfla_mask_stride_q, bfla_mask_stride_k,
+                            softmax_scale, is_causal, k_scale, v_scale,
+                            window_size_left, window_size_right, stream);
+                    } else {
+                        launcher_flash_attention_forward_paged_impl<
+                            D, KV_DTYPE, true, false, false, false>(
+                            Q, K_cache, V_cache, Out, softmax_lse, block_table,
+                            seq_lens, bfla_mask_ptr, bfla_mask_block_n,
+                            bfla_mask_stride_b, bfla_mask_stride_h,
+                            bfla_mask_stride_q, bfla_mask_stride_k,
+                            softmax_scale, is_causal, k_scale, v_scale,
+                            window_size_left, window_size_right, stream);
+                    }
+                }
             }
         } else {
             launcher_flash_attention_forward_paged_impl<
-                D, KV_DTYPE, false, false>(
+                D, KV_DTYPE, false, false, false, false>(
                 Q, K_cache, V_cache, Out, softmax_lse, block_table, seq_lens,
+                bfla_mask_ptr, bfla_mask_block_n, bfla_mask_stride_b,
+                bfla_mask_stride_h, bfla_mask_stride_q, bfla_mask_stride_k,
                 softmax_scale, is_causal, k_scale, v_scale, window_size_left,
                 window_size_right, stream);
         }
     } else {
         launcher_flash_attention_forward_paged_impl<
-            D, KV_DTYPE, false, false>(
+            D, KV_DTYPE, false, false, false, false>(
             Q, K_cache, V_cache, Out, softmax_lse, block_table, seq_lens,
+            bfla_mask_ptr, bfla_mask_block_n, bfla_mask_stride_b,
+            bfla_mask_stride_h, bfla_mask_stride_q, bfla_mask_stride_k,
             softmax_scale, is_causal, k_scale, v_scale, window_size_left,
             window_size_right, stream);
     }
+}
+
+at::Tensor flash_attention_prefill_paged_splitkv(
+    const at::Tensor& q,
+    const at::Tensor& k_cache,
+    const at::Tensor& v_cache,
+    std::optional<at::Tensor>& out_,
+    const at::Tensor& block_table,
+    const at::Tensor& seq_lens,
+    const float softmax_scale,
+    const std::string& kv_cache_dtype,
+    const float k_scale,
+    const float v_scale,
+    const bool is_causal,
+    const int window_size_left,
+    const int window_size_right,
+    const int split_kv_tokens,
+    const int max_seq_len_hint
+) {
+    TORCH_CHECK(q.dtype() == torch::kFloat16, "q must be fp16");
+    const int kv_dtype_code = kv_cache_dtype_code_from_string(kv_cache_dtype);
+    TORCH_CHECK(kv_dtype_code == flash_v100::KV_CACHE_DTYPE_FP16,
+                "split-KV paged prefill supports fp16 KV cache only");
+    TORCH_CHECK(k_cache.dtype() == torch::kFloat16, "k_cache must be fp16");
+    TORCH_CHECK(v_cache.dtype() == torch::kFloat16, "v_cache must be fp16");
+    TORCH_CHECK(q.is_cuda() && k_cache.is_cuda() && v_cache.is_cuda(),
+                "Tensors must be on CUDA");
+    TORCH_CHECK(block_table.is_cuda() && seq_lens.is_cuda(),
+                "block_table and seq_lens must be CUDA tensors");
+    TORCH_CHECK(q.stride(-1) == 1 && k_cache.stride(-1) == 1 &&
+                    v_cache.stride(-1) == 1,
+                "Last dim must be contiguous");
+    TORCH_CHECK(k_cache.stride(1) % 8 == 0 && k_cache.stride(2) % 8 == 0 &&
+                    v_cache.stride(1) % 8 == 0 && v_cache.stride(2) % 8 == 0,
+                "Paged KV strides must be divisible by 8 half elements");
+
+    const int B = q.size(0);
+    const int H = q.size(1);
+    const int M = q.size(2);
+    const int D = q.size(3);
+    const int num_kv_heads = k_cache.size(2);
+    const int page_block_size = k_cache.size(1);
+
+    TORCH_CHECK(D == 256, "split-KV paged prefill supports D=256 only");
+    TORCH_CHECK(H % num_kv_heads == 0,
+                "num_heads must be divisible by num_kv_heads");
+    TORCH_CHECK(M > 1, "split-KV paged prefill requires prefill M > 1");
+    TORCH_CHECK(page_block_size >= 16 && (page_block_size % 16) == 0,
+                "split-KV paged prefill requires page block size multiple of 16");
+    TORCH_CHECK(window_size_left >= -1 && window_size_right >= -1,
+                "window sizes must be >= -1");
+
+    at::Tensor out_fp16 = out_.has_value() ? out_.value() : torch::zeros_like(q);
+    auto softmax_lse = torch::zeros({B, H, M},
+                                    torch::dtype(torch::kFloat32).device(q.device()));
+
+    auto stream = at::cuda::getCurrentCUDAStream().stream();
+    auto props = at::cuda::getCurrentDeviceProperties();
+    bool sm70 = props->major == 7 && props->minor == 0;
+    TORCH_CHECK(sm70, "Kernel supports only Volta GPUs.");
+
+    const bool use_low_smem_contig_fast =
+        page_block_size == 16 ||
+        env_flag_enabled("VLLM_FLASH_V100_PREFILL_CONTIG_FAST");
+    const bool use_low_smem_scalar_qk =
+        env_flag_enabled("VLLM_FLASH_V100_PREFILL_D256_SCALAR_QK");
+    const int block_n =
+        use_low_smem_scalar_qk
+            ? BLOCK_N_256_LOW_SMEM_SCALAR_QK
+            : BLOCK_N_256_LOW_SMEM;
+    const int split_tokens_rounded = std::max(split_kv_tokens, block_n);
+    const int split_kv_tiles =
+        std::max(1, (split_tokens_rounded + block_n - 1) / block_n);
+    const int max_hint = std::max(max_seq_len_hint, 1);
+    const int max_kv_tiles = std::max(1, (max_hint + block_n - 1) / block_n);
+    const int num_partitions =
+        std::max(1, (max_kv_tiles + split_kv_tiles - 1) / split_kv_tiles);
+
+    if (num_partitions <= 1) {
+        launcher_flash_attention_forward_paged<256, flash_v100::KV_CACHE_DTYPE_FP16>(
+            q, k_cache, v_cache, out_fp16, softmax_lse, block_table, seq_lens,
+            softmax_scale, is_causal, k_scale, v_scale, window_size_left,
+            window_size_right, stream);
+        return out_fp16;
+    }
+
+    auto tmp_options = torch::dtype(torch::kFloat32).device(q.device());
+    auto split_tmp_out =
+        torch::empty({B, H, num_partitions, M, D}, tmp_options);
+    auto split_tmp_row_max =
+        torch::empty({B, H, num_partitions, M}, tmp_options);
+    auto split_tmp_row_sum =
+        torch::empty({B, H, num_partitions, M}, tmp_options);
+
+    if (use_low_smem_contig_fast) {
+        if (use_low_smem_scalar_qk) {
+            launcher_flash_attention_forward_paged_splitkv_impl<
+                256, true, true>(
+                q, k_cache, v_cache, out_fp16, softmax_lse, split_tmp_out,
+                split_tmp_row_max, split_tmp_row_sum, block_table, seq_lens,
+                softmax_scale, is_causal, k_scale, v_scale, window_size_left,
+                window_size_right, split_kv_tokens, max_seq_len_hint, stream);
+        } else {
+            launcher_flash_attention_forward_paged_splitkv_impl<
+                256, true, false>(
+                q, k_cache, v_cache, out_fp16, softmax_lse, split_tmp_out,
+                split_tmp_row_max, split_tmp_row_sum, block_table, seq_lens,
+                softmax_scale, is_causal, k_scale, v_scale, window_size_left,
+                window_size_right, split_kv_tokens, max_seq_len_hint, stream);
+        }
+    } else {
+        if (use_low_smem_scalar_qk) {
+            launcher_flash_attention_forward_paged_splitkv_impl<
+                256, false, true>(
+                q, k_cache, v_cache, out_fp16, softmax_lse, split_tmp_out,
+                split_tmp_row_max, split_tmp_row_sum, block_table, seq_lens,
+                softmax_scale, is_causal, k_scale, v_scale, window_size_left,
+                window_size_right, split_kv_tokens, max_seq_len_hint, stream);
+        } else {
+            launcher_flash_attention_forward_paged_splitkv_impl<
+                256, false, false>(
+                q, k_cache, v_cache, out_fp16, softmax_lse, split_tmp_out,
+                split_tmp_row_max, split_tmp_row_sum, block_table, seq_lens,
+                softmax_scale, is_causal, k_scale, v_scale, window_size_left,
+                window_size_right, split_kv_tokens, max_seq_len_hint, stream);
+        }
+    }
+
+    return out_fp16;
 }
 
 at::Tensor flash_attention_prefill_paged(
@@ -1250,6 +1935,89 @@ at::Tensor flash_attention_prefill_paged(
 
     #undef LAUNCH_PAGED_BY_KV
     #undef LAUNCH_PAGED_TYPED
+
+    return out_fp16;
+}
+
+at::Tensor flash_attention_prefill_paged_bfla(
+    const at::Tensor& q,
+    const at::Tensor& k_cache,
+    const at::Tensor& v_cache,
+    std::optional<at::Tensor>& out_,
+    const at::Tensor& block_table,
+    const at::Tensor& seq_lens,
+    const at::Tensor& bfla_block_mask,
+    const int bfla_mask_block_n,
+    const float softmax_scale,
+    const std::string& kv_cache_dtype,
+    const float k_scale,
+    const float v_scale,
+    const bool is_causal,
+    const int window_size_left,
+    const int window_size_right
+) {
+    TORCH_CHECK(q.dtype() == torch::kFloat16, "q must be fp16");
+    const int kv_dtype_code = kv_cache_dtype_code_from_string(kv_cache_dtype);
+    TORCH_CHECK(kv_dtype_code == flash_v100::KV_CACHE_DTYPE_FP16,
+                "BFLA paged prefill supports fp16 KV cache only");
+    TORCH_CHECK(k_cache.dtype() == torch::kFloat16, "k_cache must be fp16");
+    TORCH_CHECK(v_cache.dtype() == torch::kFloat16, "v_cache must be fp16");
+    TORCH_CHECK(q.is_cuda() && k_cache.is_cuda() && v_cache.is_cuda(),
+                "Tensors must be on CUDA");
+    TORCH_CHECK(block_table.is_cuda() && seq_lens.is_cuda(),
+                "block_table and seq_lens must be CUDA tensors");
+    TORCH_CHECK(bfla_block_mask.is_cuda(),
+                "bfla_block_mask must be a CUDA tensor");
+    TORCH_CHECK(bfla_block_mask.dtype() == torch::kInt32,
+                "bfla_block_mask must be int32");
+    TORCH_CHECK(bfla_block_mask.dim() == 4,
+                "bfla_block_mask must have shape [B, Hkv, q_tiles, kv_tiles]");
+    TORCH_CHECK(q.stride(-1) == 1 && k_cache.stride(-1) == 1 &&
+                    v_cache.stride(-1) == 1,
+                "Last dim must be contiguous");
+    TORCH_CHECK(k_cache.stride(1) % 8 == 0 && k_cache.stride(2) % 8 == 0 &&
+                    v_cache.stride(1) % 8 == 0 && v_cache.stride(2) % 8 == 0,
+                "Paged KV strides must be divisible by 8 half elements");
+
+    const int B = q.size(0);
+    const int H = q.size(1);
+    const int M = q.size(2);
+    const int D = q.size(3);
+    const int num_kv_heads = k_cache.size(2);
+    const int page_block_size = k_cache.size(1);
+
+    TORCH_CHECK(D == 256, "BFLA paged prefill supports D=256 only");
+    TORCH_CHECK(H % num_kv_heads == 0,
+                "num_heads must be divisible by num_kv_heads");
+    TORCH_CHECK(M > 1, "BFLA paged prefill requires prefill M > 1");
+    TORCH_CHECK(page_block_size >= 16 && (page_block_size % 16) == 0,
+                "BFLA paged prefill requires page block size multiple of 16");
+    TORCH_CHECK(is_causal, "BFLA paged prefill supports causal attention only");
+    TORCH_CHECK(window_size_left == -1 && window_size_right == -1,
+                "BFLA paged prefill does not support sliding window");
+    TORCH_CHECK(bfla_mask_block_n > 0,
+                "bfla_mask_block_n must be positive");
+    TORCH_CHECK(B <= bfla_block_mask.size(0),
+                "bfla_block_mask batch dimension must cover q");
+    TORCH_CHECK(num_kv_heads <= bfla_block_mask.size(1),
+                "bfla_block_mask head dimension must cover KV heads");
+
+    at::Tensor out_fp16 = out_.has_value() ? out_.value() : torch::zeros_like(q);
+    auto softmax_lse = torch::zeros({B, H, M},
+                                    torch::dtype(torch::kFloat32).device(q.device()));
+
+    auto stream = at::cuda::getCurrentCUDAStream().stream();
+    auto props = at::cuda::getCurrentDeviceProperties();
+    bool sm70 = props->major == 7 && props->minor == 0;
+    TORCH_CHECK(sm70, "Kernel supports only Volta GPUs.");
+
+    launcher_flash_attention_forward_paged<256, flash_v100::KV_CACHE_DTYPE_FP16>(
+        q, k_cache, v_cache, out_fp16, softmax_lse, block_table, seq_lens,
+        softmax_scale, is_causal, k_scale, v_scale, window_size_left,
+        window_size_right, stream, bfla_block_mask.data_ptr<int>(),
+        bfla_mask_block_n, bfla_block_mask.stride(0),
+        bfla_block_mask.stride(1), bfla_block_mask.stride(2),
+        bfla_block_mask.stride(3));
 
     return out_fp16;
 }

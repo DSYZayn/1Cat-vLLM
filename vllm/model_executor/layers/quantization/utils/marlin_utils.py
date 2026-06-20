@@ -316,6 +316,14 @@ def marlin_permute_scales(
     return s
 
 
+def sm70_marlin_logical_scales(
+    s: torch.Tensor, size_k: int, size_n: int, group_size: int, is_a_8bit: bool = False
+) -> torch.Tensor:
+    """Return SM70 metadata in logical N-contiguous order."""
+    del size_k, group_size, is_a_8bit
+    return s.reshape((-1, size_n)).contiguous()
+
+
 def marlin_permute_bias(s: torch.Tensor) -> torch.Tensor:
     origin_shape = s.shape
     _, scale_perm_single = get_scale_perms()
@@ -343,6 +351,14 @@ def marlin_moe_permute_scales(
     for e in range(num_experts):
         output[e] = marlin_permute_scales(s[e], size_k, size_n, group_size, is_a_8bit)
     return output
+
+
+def sm70_marlin_moe_logical_scales(
+    s: torch.Tensor, size_k: int, size_n: int, group_size: int, is_a_8bit: bool = False
+) -> torch.Tensor:
+    """Return SM70 MoE metadata as [experts, groups, N] logical order."""
+    del size_k, group_size, is_a_8bit
+    return s.reshape((s.shape[0], -1, size_n)).contiguous()
 
 
 def marlin_zero_points(

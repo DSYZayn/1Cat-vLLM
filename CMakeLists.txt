@@ -463,6 +463,8 @@ if(VLLM_GPU_LANG STREQUAL "CUDA")
         PROPERTIES COMPILE_FLAGS "-static-global-template-stub=false")
     endif()
     list(APPEND VLLM_EXT_SRC "${MARLIN_SM70_SRCS}")
+    set_property(SOURCE csrc/torch_bindings.cpp APPEND PROPERTY
+      COMPILE_DEFINITIONS ENABLE_SM70_MARLIN=1)
     message(STATUS "Building SM70 Marlin kernels for archs: ${MARLIN_SM70_ARCHS}")
   elseif(MARLIN_SM70_ARCHS)
     message(STATUS "Skipping SM70 Marlin kernels in mixed Marlin arch build")

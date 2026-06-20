@@ -447,7 +447,10 @@ class Qwen3_5Model(Qwen3NextModel):
             ["hidden_states", "residual"], config.hidden_size
         )
 
-        if get_pp_group().is_last_rank:
+        self.is_pp_first_rank = get_pp_group().is_first_rank
+        self.is_pp_last_rank = get_pp_group().is_last_rank
+
+        if self.is_pp_last_rank:
             self.norm = Qwen3_5RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         else:
             self.norm = PPMissingLayer()

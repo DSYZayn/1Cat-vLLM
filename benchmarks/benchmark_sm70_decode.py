@@ -144,9 +144,9 @@ def _is_fp8_kv_cache_dtype(value: Any) -> bool:
     return isinstance(value, str) and value.startswith("fp8")
 
 
-def _fp8_tune_enabled(fp8_tune_raw: str | None) -> bool:
-    if fp8_tune_raw is not None:
-        return _atoi_nonzero(fp8_tune_raw)
+def _tune_enabled_default_true(raw: str | None) -> bool:
+    if raw is not None:
+        return _atoi_nonzero(raw)
     return True
 
 
@@ -161,7 +161,20 @@ def _sm70_tune_policy() -> dict[str, Any]:
     awq_tune0_pinned = awq_tune_raw == "0"
     awq_moe_safe_default_selector = awq_tune_raw is None or awq_tune0_pinned
     fp8_tune_raw = os.environ.get("VLLM_SM70_FP8_TUNE_SMALL_SHAPES")
-    fp8_dynamic_measure_enabled = _fp8_tune_enabled(fp8_tune_raw)
+    fp8_safe_fast_selector_raw = os.environ.get(
+        "VLLM_SM70_FP8_SAFE_FAST_SELECTOR"
+    )
+    fp8_preserve_splits_raw = os.environ.get(
+        "VLLM_SM70_FP8_PRESERVE_DEFAULT_SPLITS"
+    )
+    fp8_preserve_splits_only_raw = os.environ.get(
+        "VLLM_SM70_FP8_PRESERVE_DEFAULT_SPLITS_ONLY"
+    )
+    mxfp4_tune_raw = os.environ.get("VLLM_SM70_MXFP4_TUNE_SMALL_SHAPES")
+    nvfp4_tune_raw = os.environ.get("VLLM_SM70_NVFP4_TUNE_SMALL_SHAPES")
+    fp8_dynamic_measure_enabled = _tune_enabled_default_true(fp8_tune_raw)
+    mxfp4_dynamic_measure_enabled = _tune_enabled_default_true(mxfp4_tune_raw)
+    nvfp4_dynamic_measure_enabled = _tune_enabled_default_true(nvfp4_tune_raw)
     return {
         "VLLM_SM70_AWQ_TUNE_SMALL_SHAPES": awq_tune_raw,
         "VLLM_SM70_AWQ_PRESERVE_DEFAULT_SPLITS": awq_preserve_splits_raw,
@@ -169,6 +182,16 @@ def _sm70_tune_policy() -> dict[str, Any]:
             awq_preserve_splits_only_raw
         ),
         "VLLM_SM70_FP8_TUNE_SMALL_SHAPES": fp8_tune_raw,
+        "VLLM_SM70_FP8_SAFE_FAST_SELECTOR": fp8_safe_fast_selector_raw,
+        "VLLM_SM70_FP8_PRESERVE_DEFAULT_SPLITS": fp8_preserve_splits_raw,
+        "VLLM_SM70_FP8_PRESERVE_DEFAULT_SPLITS_ONLY": (
+            fp8_preserve_splits_only_raw
+        ),
+        "VLLM_SM70_FP8_DENSE_TUNE_MAX_M": os.environ.get(
+            "VLLM_SM70_FP8_DENSE_TUNE_MAX_M"
+        ),
+        "VLLM_SM70_MXFP4_TUNE_SMALL_SHAPES": mxfp4_tune_raw,
+        "VLLM_SM70_NVFP4_TUNE_SMALL_SHAPES": nvfp4_tune_raw,
         "awq_tune0_pinned_effective": awq_tune0_pinned,
         "awq_preserve_default_splits_effective": (
             awq_preserve_splits_raw is None
@@ -183,6 +206,26 @@ def _sm70_tune_policy() -> dict[str, Any]:
         "fp8_safe_default_selector_effective": (
             not fp8_dynamic_measure_enabled
         ),
+        "fp8_safe_fast_selector_effective": _atoi_nonzero(
+            fp8_safe_fast_selector_raw
+        ),
+        "fp8_preserve_default_splits_effective": (
+            fp8_preserve_splits_raw is None
+            or _atoi_nonzero(fp8_preserve_splits_raw)
+        ),
+        "fp8_preserve_default_splits_only_effective": _atoi_nonzero(
+            fp8_preserve_splits_only_raw
+        ),
+        "fp8_dense_tune_max_m_effective": _env_int(
+            "VLLM_SM70_FP8_DENSE_TUNE_MAX_M",
+            16,
+        ),
+        "mxfp4_safe_default_selector_effective": (
+            not mxfp4_dynamic_measure_enabled
+        ),
+        "nvfp4_safe_default_selector_effective": (
+            not nvfp4_dynamic_measure_enabled
+        ),
         "awq_dense_dynamic_measure_enabled": (
             awq_tune_raw is not None and _atoi_nonzero(awq_tune_raw)
         ),
@@ -190,6 +233,8 @@ def _sm70_tune_policy() -> dict[str, Any]:
             awq_tune_raw is not None and _atoi_nonzero(awq_tune_raw)
         ),
         "fp8_dynamic_measure_enabled": fp8_dynamic_measure_enabled,
+        "mxfp4_dynamic_measure_enabled": mxfp4_dynamic_measure_enabled,
+        "nvfp4_dynamic_measure_enabled": nvfp4_dynamic_measure_enabled,
         "generic_f16_dynamic_measure_enabled": (
             awq_tune_raw is None or _atoi_nonzero(awq_tune_raw)
         ),
@@ -198,10 +243,15 @@ def _sm70_tune_policy() -> dict[str, Any]:
             "F16 dynamic-measure tuning enabled; AWQ dense/MoE stays "
             "fixed-dispatch unless VLLM_SM70_AWQ_TUNE_SMALL_SHAPES is set "
             "nonzero. FP8 dense defaults to dynamic small-shape selection "
-            "unless VLLM_SM70_FP8_TUNE_SMALL_SHAPES=0. "
+            "unless VLLM_SM70_FP8_TUNE_SMALL_SHAPES=0. MXFP4/NVFP4 "
+            "TurboMind dense defaults to dynamic small-shape selection unless "
+            "their VLLM_SM70_*FP4_TUNE_SMALL_SHAPES knobs are set to 0. "
             "AWQ dynamic dense tuning preserves the heuristic/default split-K "
             "count by default so measured kernels do not change fp16 reduction "
-            "order. "
+            "order. FP8 safe-fast selector is an explicit diagnostic lane; it "
+            "uses dynamic dense selection with FP8-specific preserve-default "
+            "split controls and must pass output/hash gates before becoming a "
+            "default route. "
             "Accepted MoE safe-route evidence records these selector fields; "
             "older artifacts still need explicit tune0 pins."
         ),
@@ -214,8 +264,21 @@ def _sm70_turbomind_policy() -> dict[str, Any]:
     awq_tune0_pinned = awq_tune_raw == "0"
     awq_moe_safe_default_selector = awq_tune_raw is None or awq_tune0_pinned
     fp8_tune_raw = os.environ.get("VLLM_SM70_FP8_TUNE_SMALL_SHAPES")
-    fp8_safe_default_selector = not _fp8_tune_enabled(fp8_tune_raw)
+    fp8_safe_fast_selector = _env_bool(
+        "VLLM_SM70_FP8_SAFE_FAST_SELECTOR", False
+    )
+    mxfp4_tune_raw = os.environ.get("VLLM_SM70_MXFP4_TUNE_SMALL_SHAPES")
+    nvfp4_tune_raw = os.environ.get("VLLM_SM70_NVFP4_TUNE_SMALL_SHAPES")
+    fp8_safe_default_selector = not _tune_enabled_default_true(fp8_tune_raw)
+    mxfp4_safe_default_selector = not _tune_enabled_default_true(mxfp4_tune_raw)
+    nvfp4_safe_default_selector = not _tune_enabled_default_true(nvfp4_tune_raw)
     fp8_turbomind = _env_bool("VLLM_SM70_FP8_TURBOMIND", True)
+    fp8_dense_gated_silu = _env_bool(
+        "VLLM_SM70_FP8_DENSE_GATED_SILU",
+        True,
+    )
+    nvfp4_turbomind = _env_bool("VLLM_SM70_NVFP4_TURBOMIND", False)
+    mxfp4_turbomind = _env_bool("VLLM_SM70_MXFP4_TURBOMIND", False)
     fp8_dequant_fallback = _env_bool("VLLM_SM70_FP8_DEQUANT_FALLBACK", True)
     fp8_moe_dequant_fallback = _env_bool(
         "VLLM_SM70_FP8_MOE_DEQUANT_FALLBACK",
@@ -259,6 +322,18 @@ def _sm70_turbomind_policy() -> dict[str, Any]:
             "VLLM_SM70_FP8_TURBOMIND"
         ),
         "fp8_turbomind_effective": fp8_turbomind,
+        "VLLM_SM70_FP8_DENSE_GATED_SILU": os.environ.get(
+            "VLLM_SM70_FP8_DENSE_GATED_SILU"
+        ),
+        "fp8_dense_gated_silu_effective": fp8_dense_gated_silu,
+        "VLLM_SM70_NVFP4_TURBOMIND": os.environ.get(
+            "VLLM_SM70_NVFP4_TURBOMIND"
+        ),
+        "nvfp4_turbomind_effective": nvfp4_turbomind,
+        "VLLM_SM70_MXFP4_TURBOMIND": os.environ.get(
+            "VLLM_SM70_MXFP4_TURBOMIND"
+        ),
+        "mxfp4_turbomind_effective": mxfp4_turbomind,
         "VLLM_SM70_FP8_DEQUANT_FALLBACK": os.environ.get(
             "VLLM_SM70_FP8_DEQUANT_FALLBACK"
         ),
@@ -325,6 +400,20 @@ def _sm70_turbomind_policy() -> dict[str, Any]:
             "VLLM_SM70_AWQ_DENSE_TUNE_MAX_M",
             16,
         ),
+        "VLLM_SM70_MXFP4_DENSE_TUNE_MAX_M": os.environ.get(
+            "VLLM_SM70_MXFP4_DENSE_TUNE_MAX_M"
+        ),
+        "mxfp4_dense_tune_max_m_effective": _env_int(
+            "VLLM_SM70_MXFP4_DENSE_TUNE_MAX_M",
+            16,
+        ),
+        "VLLM_SM70_NVFP4_DENSE_TUNE_MAX_M": os.environ.get(
+            "VLLM_SM70_NVFP4_DENSE_TUNE_MAX_M"
+        ),
+        "nvfp4_dense_tune_max_m_effective": _env_int(
+            "VLLM_SM70_NVFP4_DENSE_TUNE_MAX_M",
+            16,
+        ),
         "VLLM_SM70_AWQ_MOE_TUNE_MAX_TOKENS": os.environ.get(
             "VLLM_SM70_AWQ_MOE_TUNE_MAX_TOKENS"
         ),
@@ -337,6 +426,39 @@ def _sm70_turbomind_policy() -> dict[str, Any]:
         ),
         "VLLM_SM70_FP8_TUNE_SMALL_SHAPES": fp8_tune_raw,
         "fp8_safe_default_selector_effective": fp8_safe_default_selector,
+        "VLLM_SM70_FP8_SAFE_FAST_SELECTOR": os.environ.get(
+            "VLLM_SM70_FP8_SAFE_FAST_SELECTOR"
+        ),
+        "fp8_safe_fast_selector_effective": fp8_safe_fast_selector,
+        "VLLM_SM70_FP8_PRESERVE_DEFAULT_SPLITS": os.environ.get(
+            "VLLM_SM70_FP8_PRESERVE_DEFAULT_SPLITS"
+        ),
+        "fp8_preserve_default_splits_effective": _env_bool(
+            "VLLM_SM70_FP8_PRESERVE_DEFAULT_SPLITS",
+            True,
+        ),
+        "VLLM_SM70_FP8_PRESERVE_DEFAULT_SPLITS_ONLY": os.environ.get(
+            "VLLM_SM70_FP8_PRESERVE_DEFAULT_SPLITS_ONLY"
+        ),
+        "fp8_preserve_default_splits_only_effective": _env_bool(
+            "VLLM_SM70_FP8_PRESERVE_DEFAULT_SPLITS_ONLY",
+            False,
+        ),
+        "VLLM_SM70_FP8_DENSE_TUNE_MAX_M": os.environ.get(
+            "VLLM_SM70_FP8_DENSE_TUNE_MAX_M"
+        ),
+        "fp8_dense_tune_max_m_effective": _env_int(
+            "VLLM_SM70_FP8_DENSE_TUNE_MAX_M",
+            16,
+        ),
+        "VLLM_SM70_MXFP4_TUNE_SMALL_SHAPES": mxfp4_tune_raw,
+        "mxfp4_safe_default_selector_effective": (
+            mxfp4_safe_default_selector
+        ),
+        "VLLM_SM70_NVFP4_TUNE_SMALL_SHAPES": nvfp4_tune_raw,
+        "nvfp4_safe_default_selector_effective": (
+            nvfp4_safe_default_selector
+        ),
         "VLLM_SM70_AWQ_MOE_DISABLE": os.environ.get(
             "VLLM_SM70_AWQ_MOE_DISABLE"
         ),

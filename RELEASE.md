@@ -1,3 +1,66 @@
+# 1Cat-vLLM 1.2.0
+
+1Cat-vLLM 1.2.0 is built on upstream vLLM
+`0.21.1rc1.dev438+g4ff865c38.d20260603.cu128`, with focused upgrades for
+Tesla V100 / SM70 serving, FlashAttention, Marlin/MoE, long-context execution,
+and memory policy.
+
+1. Updated vLLM base and runtime architecture
+   SM70/V100 optimizations are re-integrated with the updated backend,
+   quantization, attention, CUDA graph, serving, OpenAI API, Qwen hybrid model,
+   and MTP paths.
+
+2. Improved Flash-V100 attention backend
+   `FLASH_ATTN_V100` now covers prefill, decode, paged KV, CUDA graph, and
+   long-context decode on V100/SM70, providing a modern FlashAttention path for
+   Tesla V100.
+
+3. Enabled V100 Marlin path
+   In 0.0.3, Marlin required SM75+ and could not run on V100/SM70. 1.2.0 restores
+   the SM70 Marlin path and allows Marlin to reuse TurboMind MoE capability.
+
+4. Strengthened 35B MoE serving
+   Qwen3.6-35B-A3B-AWQ is now usable on V100. Marlin TP2 decode has been measured
+   at about `98-109 tok/s`.
+
+5. Stabilized long-context decode
+   Qwen3.6-27B-AWQ TP2 no-MTP decode remains nearly flat across 16K/32K/64K,
+   around `58.46-58.48 tok/s`, shifting the main long-context bottleneck toward
+   prefill/TTFT.
+
+6. Optimized long-context dense prefill
+   D=256 WMMA-QK is enabled by default. On 27B-AWQ TP2 with
+   `max_num_batched_tokens=16384`:
+   - 16K: `12.57s -> 10.33s`, about `+21.69%`
+   - 64K chunked: `75.83s -> 74.18s`, about `+2.23%`
+
+7. Optimized paged-prefix exact path
+   D=256 paged-prefix low-smem reduces shared memory from about `96.5KB/CTA` to
+   about `36KB/CTA`; 256K chunked prefill kernel-only improves from `59627ms` to
+   `52882ms`, about `+12.8%`.
+
+8. Reduced long-context scheduling and memory-access overhead
+   Added page-id/page-offset cache to reduce repeated block-table loads and
+   address calculations in the paged-prefix hot loop, improving chunked prefill
+   efficiency.
+
+9. Improved V100 long-context memory policy
+   Public profiles target 256K context with more conservative
+   `max_num_batched_tokens`, `max_num_seqs`, and KV cache allocation settings,
+   reducing memory pressure for long-context V100 serving.
+
+10. Added experimental BFLA sparse prefill
+    `VLLM_FLASH_V100_BFLA_PREFILL` is added as a default-off experimental path
+    for approximate sparse attention and ultra-long-context prefill acceleration:
+    - 9B-AWQ TP1 256K: `499.10s -> 79.08s`, about `6.31x`
+    - 27B-AWQ 128K: `244.01s -> 83.02s`, about `2.94x`
+    - Current recommended experimental operating point: `MIN_KV=32768`
+
+11. Consolidated SM70 route compatibility
+    AWQ, FP8, MTP, CUDA graph, compact allreduce, and Qwen GDN paths have been
+    tightened for V100 multi-quantization, graph compilation, and long-context
+    serving.
+
 # Releasing vLLM
 
 vLLM releases offer a reliable version of the code base, packaged into a binary format that can be conveniently accessed via [PyPI](https://pypi.org/project/vllm). These releases also serve as key milestones for the development team to communicate with the community about newly available features, improvements, and upcoming changes that could affect users, including potential breaking changes.

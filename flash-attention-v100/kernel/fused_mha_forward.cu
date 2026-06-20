@@ -8,6 +8,7 @@
 #include <c10/cuda/CUDAGuard.h>
 
 #include <cstdlib>
+#include <cstring>
 #include <mma.h>
 using namespace nvcuda::wmma;
 
@@ -50,11 +51,25 @@ using namespace nvcuda::wmma;
 #define BLOCK_N_256 64
 #define WARPS_256   16
 
-template<int D>
+#define BLOCK_M_256_LOW_SMEM 16
+#define BLOCK_N_256_LOW_SMEM 32
+#define WARPS_256_LOW_SMEM   16
+
+inline bool env_flag_enabled(const char* name) {
+    const char* raw = std::getenv(name);
+    return raw != nullptr && std::strcmp(raw, "0") != 0;
+}
+
+inline bool env_flag_enabled_default_on(const char* name) {
+    const char* raw = std::getenv(name);
+    return raw == nullptr || std::strcmp(raw, "0") != 0;
+}
+
+template<int D, bool LOW_SMEM = false>
 struct KernelConfig {
-    static constexpr int BLOCK_M = (D == 16) ? BLOCK_M_16 : (D == 32) ? BLOCK_M_32 : (D == 64) ? BLOCK_M_64 : (D == 128) ? BLOCK_M_128 : BLOCK_M_256;
-    static constexpr int BLOCK_N = (D == 16) ? BLOCK_N_16 : (D == 32) ? BLOCK_N_32 : (D == 64) ? BLOCK_N_64 : (D == 128) ? BLOCK_N_128 : BLOCK_N_256;
-    static constexpr int WARPS_PER_BLOCK = (D == 16) ? WARPS_16 : (D == 32) ? WARPS_32 : (D == 64) ? WARPS_64 : (D == 128) ? WARPS_128 : WARPS_256;
+    static constexpr int BLOCK_M = (D == 16) ? BLOCK_M_16 : (D == 32) ? BLOCK_M_32 : (D == 64) ? BLOCK_M_64 : (D == 128) ? BLOCK_M_128 : (LOW_SMEM ? BLOCK_M_256_LOW_SMEM : BLOCK_M_256);
+    static constexpr int BLOCK_N = (D == 16) ? BLOCK_N_16 : (D == 32) ? BLOCK_N_32 : (D == 64) ? BLOCK_N_64 : (D == 128) ? BLOCK_N_128 : (LOW_SMEM ? BLOCK_N_256_LOW_SMEM : BLOCK_N_256);
+    static constexpr int WARPS_PER_BLOCK = (D == 16) ? WARPS_16 : (D == 32) ? WARPS_32 : (D == 64) ? WARPS_64 : (D == 128) ? WARPS_128 : (LOW_SMEM ? WARPS_256_LOW_SMEM : WARPS_256);
 
     static constexpr int THREADS_PER_BLOCK = WARPS_PER_BLOCK * MAX_THREADS_PER_WARP;
     static constexpr int THREADS_PER_ROW   = THREADS_PER_BLOCK / BLOCK_M;
@@ -102,7 +117,7 @@ __device__ __forceinline__ void init_smem(char* smem_raw) {
     __syncthreads();
 }
 
-template<int D, bool IS_CAUSAL>
+template<int D, bool LOW_SMEM, bool IS_CAUSAL>
 __device__ __forceinline__ void compute_qk_scores_scalar_fp32(
     const __half* __restrict__ sQ,
     const __half* __restrict__ sK,
@@ -116,7 +131,7 @@ __device__ __forceinline__ void compute_qk_scores_scalar_fp32(
     const int window_size_left,
     const int window_size_right
 ) {
-    using Config = KernelConfig<D>;
+    using Config = KernelConfig<D, LOW_SMEM>;
     constexpr int THREADS_PER_BLOCK = Config::THREADS_PER_BLOCK;
     constexpr int Q_STRIDE = Config::Q_STRIDE;
     constexpr int KV_STRIDE = Config::KV_STRIDE;
@@ -161,8 +176,8 @@ __device__ __forceinline__ void compute_qk_scores_scalar_fp32(
     }
 }
 
-template<int D, bool IS_CAUSAL>
-__global__ void __launch_bounds__(KernelConfig<D>::THREADS_PER_BLOCK, 2)
+template<int D, bool LOW_SMEM, bool D256_WMMA_QK, bool IS_CAUSAL>
+__global__ void __launch_bounds__(KernelConfig<D, LOW_SMEM>::THREADS_PER_BLOCK, 2)
 flash_attention_forward_kernel(
     const __half* __restrict__ Q,
     const __half* __restrict__ K,
@@ -179,7 +194,7 @@ flash_attention_forward_kernel(
     const int window_size_left,
     const int window_size_right
 ) {
-    using Config = KernelConfig<D>;
+    using Config = KernelConfig<D, LOW_SMEM>;
     constexpr int BLOCK_M           = Config::BLOCK_M;
     constexpr int BLOCK_N           = Config::BLOCK_N;
     constexpr int THREADS_PER_BLOCK = Config::THREADS_PER_BLOCK;
@@ -308,8 +323,8 @@ flash_attention_forward_kernel(
         }
         __syncthreads();
 
-        if constexpr (D == 256) {
-            compute_qk_scores_scalar_fp32<D, IS_CAUSAL>(
+        if constexpr (D == 256 && !D256_WMMA_QK) {
+            compute_qk_scores_scalar_fp32<D, LOW_SMEM, IS_CAUSAL>(
                 sQ, sK, sS, valid_q_rows, valid_k_rows, start_row, start_col,
                 causal_q_offset, softmax_scale, window_size_left,
                 window_size_right);
@@ -374,9 +389,12 @@ flash_attention_forward_kernel(
                                           global_n <= global_q_pos + window_size_right;
                     }
 
-                    acc_frag.x[i] = (is_valid && is_causal_valid && is_window_valid)
-                        ? acc_frag.x[i] * softmax_scale_log2
-                        : NEG_INF;
+                    const float qk_scale =
+                        (D == 256) ? softmax_scale : softmax_scale_log2;
+                    acc_frag.x[i] =
+                        (is_valid && is_causal_valid && is_window_valid)
+                            ? acc_frag.x[i] * qk_scale
+                            : NEG_INF;
                 }
                 store_matrix_sync(sS + tile_m * S_STRIDE + tile_n, acc_frag, S_STRIDE, mem_row_major);
             }
@@ -776,7 +794,7 @@ flash_attention_qk_scores_kernel(
     __syncthreads();
 
     if constexpr (D == 256) {
-        compute_qk_scores_scalar_fp32<D, IS_CAUSAL>(
+        compute_qk_scores_scalar_fp32<D, false, IS_CAUSAL>(
             sQ, sK, sS, valid_q_rows, valid_k_rows, start_row, start_col,
             causal_q_offset, softmax_scale, -1, -1);
     } else {
@@ -862,8 +880,8 @@ flash_attention_qk_scores_kernel(
     }
 }
 
-template<int D>
-void launcher_flash_attention_forward(
+template<int D, bool LOW_SMEM, bool D256_WMMA_QK>
+void launcher_flash_attention_forward_impl(
     const torch::Tensor& Q,
     const torch::Tensor& K,
     const torch::Tensor& V,
@@ -876,7 +894,7 @@ void launcher_flash_attention_forward(
     int window_size_right,
     cudaStream_t stream
 ) {
-    using Config = KernelConfig<D>;
+    using Config = KernelConfig<D, LOW_SMEM>;
 
     const int B = Q.size(0);
     const int H = Q.size(1);
@@ -892,13 +910,14 @@ void launcher_flash_attention_forward(
     TORCH_CHECK(smem <= MAX_SMEM_PER_SM, "Shared memory exceeds 96KB: ", smem, " bytes");
 
     auto kernel = is_causal ?
-        (void*)flash_attention_forward_kernel<D, true> :
-        (void*)flash_attention_forward_kernel<D, false>;
+        (void*)flash_attention_forward_kernel<D, LOW_SMEM, D256_WMMA_QK, true> :
+        (void*)flash_attention_forward_kernel<D, LOW_SMEM, D256_WMMA_QK, false>;
 
     cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem);
 
     if (is_causal) {
-        flash_attention_forward_kernel<D, true><<<grid, block, smem, stream>>>(
+        flash_attention_forward_kernel<D, LOW_SMEM, D256_WMMA_QK, true>
+        <<<grid, block, smem, stream>>>(
             reinterpret_cast<const __half*>(Q.data_ptr()),
             reinterpret_cast<const __half*>(K.data_ptr()),
             reinterpret_cast<const __half*>(V.data_ptr()),
@@ -908,7 +927,8 @@ void launcher_flash_attention_forward(
             window_size_left, window_size_right
         );
     } else {
-        flash_attention_forward_kernel<D, false><<<grid, block, smem, stream>>>(
+        flash_attention_forward_kernel<D, LOW_SMEM, D256_WMMA_QK, false>
+        <<<grid, block, smem, stream>>>(
             reinterpret_cast<const __half*>(Q.data_ptr()),
             reinterpret_cast<const __half*>(K.data_ptr()),
             reinterpret_cast<const __half*>(V.data_ptr()),
@@ -918,6 +938,47 @@ void launcher_flash_attention_forward(
             window_size_left, window_size_right
         );
     }
+}
+
+template<int D>
+void launcher_flash_attention_forward(
+    const torch::Tensor& Q,
+    const torch::Tensor& K,
+    const torch::Tensor& V,
+    torch::Tensor& Out,
+    torch::Tensor& softmax_lse,
+    float softmax_scale,
+    bool is_causal,
+    bool scalar_pv,
+    int window_size_left,
+    int window_size_right,
+    cudaStream_t stream
+) {
+    if constexpr (D == 256) {
+        const bool use_wmma_qk =
+            env_flag_enabled_default_on("VLLM_FLASH_V100_DENSE_D256_WMMA_QK");
+        if (env_flag_enabled("VLLM_FLASH_V100_DENSE_D256_LOW_SMEM")) {
+            if (use_wmma_qk) {
+                launcher_flash_attention_forward_impl<D, true, true>(
+                    Q, K, V, Out, softmax_lse, softmax_scale, is_causal,
+                    scalar_pv, window_size_left, window_size_right, stream);
+            } else {
+                launcher_flash_attention_forward_impl<D, true, false>(
+                    Q, K, V, Out, softmax_lse, softmax_scale, is_causal,
+                    scalar_pv, window_size_left, window_size_right, stream);
+            }
+            return;
+        }
+        if (use_wmma_qk) {
+            launcher_flash_attention_forward_impl<D, false, true>(
+                Q, K, V, Out, softmax_lse, softmax_scale, is_causal,
+                scalar_pv, window_size_left, window_size_right, stream);
+            return;
+        }
+    }
+    launcher_flash_attention_forward_impl<D, false, false>(
+        Q, K, V, Out, softmax_lse, softmax_scale, is_causal, scalar_pv,
+        window_size_left, window_size_right, stream);
 }
 
 template<int D>

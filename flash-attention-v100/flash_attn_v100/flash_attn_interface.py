@@ -534,6 +534,47 @@ def flash_attn_func(
         raise
 
 
+def flash_attn_bhmd_func(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    dropout_p: float = 0.0,
+    softmax_scale: float = None,
+    causal: bool = False,
+    window_size: tuple = (-1, -1),
+    softcap: float = 0.0,
+    alibi_slopes: torch.Tensor = None,
+    return_attn_probs: bool = False,
+    out: Optional[torch.Tensor] = None,
+):
+    """Forward-only Flash-V100 dense attention for [B, H, T, D] tensors."""
+    if softmax_scale is None:
+        softmax_scale = q.shape[-1] ** -0.5
+    if dropout_p != 0.0:
+        raise NotImplementedError("dropout_p != 0.0 not supported")
+    if softcap != 0.0:
+        raise NotImplementedError("softcap != 0.0 not supported")
+    if alibi_slopes is not None:
+        raise NotImplementedError("alibi_slopes not supported")
+
+    window_size_left, window_size_right = window_size
+    out, lse, _, _ = _flash_attn_forward(
+        q,
+        k,
+        v,
+        out,
+        dropout_p,
+        softmax_scale,
+        causal,
+        window_size_left,
+        window_size_right,
+        softcap,
+        alibi_slopes,
+        return_attn_probs,
+    )
+    return out if not return_attn_probs else (out, lse, None)
+
+
 def flash_attn_qk_scores(
     q: torch.Tensor,
     k: torch.Tensor,
@@ -829,6 +870,107 @@ def flash_attn_prefill_paged(
     return out_.permute(0, 2, 1, 3).contiguous()
 
 
+def flash_attn_prefill_paged_bfla(
+    q: torch.Tensor,
+    k_cache: torch.Tensor,
+    v_cache: torch.Tensor,
+    block_table: torch.Tensor,
+    seq_lens: torch.Tensor,
+    bfla_block_mask: torch.Tensor,
+    bfla_mask_block_n: int,
+    softmax_scale: Optional[float] = None,
+    out: Optional[torch.Tensor] = None,
+    kv_cache_dtype: str = "auto",
+    k_scale: float = 1.0,
+    v_scale: float = 1.0,
+    causal: bool = True,
+    window_size: tuple = (-1, -1),
+):
+    if softmax_scale is None:
+        softmax_scale = q.shape[-1] ** -0.5
+
+    q = maybe_contiguous(q)
+    block_table = maybe_contiguous(block_table)
+    seq_lens = maybe_contiguous(seq_lens)
+    bfla_block_mask = maybe_contiguous(bfla_block_mask)
+    out = maybe_contiguous(out)
+    window_size_left, window_size_right = window_size
+    if window_size_left < -1 or window_size_right < -1:
+        raise ValueError(f"Invalid window_size={window_size}; values must be >= -1")
+
+    q_ = q.permute(0, 2, 1, 3).contiguous()
+    out_ = out.permute(0, 2, 1, 3).contiguous() if out is not None else None
+
+    out_ = flash_attn_v100_cuda.prefill_paged_bfla_fwd(
+        q_,
+        k_cache,
+        v_cache,
+        out_,
+        block_table,
+        seq_lens,
+        bfla_block_mask,
+        int(bfla_mask_block_n),
+        softmax_scale,
+        kv_cache_dtype,
+        float(k_scale),
+        float(v_scale),
+        causal,
+        int(window_size_left),
+        int(window_size_right),
+    )
+    return out_.permute(0, 2, 1, 3).contiguous()
+
+
+def flash_attn_prefill_paged_splitkv(
+    q: torch.Tensor,
+    k_cache: torch.Tensor,
+    v_cache: torch.Tensor,
+    block_table: torch.Tensor,
+    seq_lens: torch.Tensor,
+    softmax_scale: Optional[float] = None,
+    out: Optional[torch.Tensor] = None,
+    kv_cache_dtype: str = "auto",
+    k_scale: float = 1.0,
+    v_scale: float = 1.0,
+    causal: bool = True,
+    window_size: tuple = (-1, -1),
+    split_kv_tokens: int = 32768,
+    max_seq_len_hint: int = 0,
+):
+    if softmax_scale is None:
+        softmax_scale = q.shape[-1] ** -0.5
+
+    q = maybe_contiguous(q)
+    block_table = maybe_contiguous(block_table)
+    seq_lens = maybe_contiguous(seq_lens)
+    out = maybe_contiguous(out)
+    window_size_left, window_size_right = window_size
+    if window_size_left < -1 or window_size_right < -1:
+        raise ValueError(f"Invalid window_size={window_size}; values must be >= -1")
+
+    q_ = q.permute(0, 2, 1, 3).contiguous()
+    out_ = out.permute(0, 2, 1, 3).contiguous() if out is not None else None
+
+    out_ = flash_attn_v100_cuda.prefill_paged_splitkv_fwd(
+        q_,
+        k_cache,
+        v_cache,
+        out_,
+        block_table,
+        seq_lens,
+        softmax_scale,
+        kv_cache_dtype,
+        float(k_scale),
+        float(v_scale),
+        causal,
+        int(window_size_left),
+        int(window_size_right),
+        int(split_kv_tokens),
+        int(max_seq_len_hint),
+    )
+    return out_.permute(0, 2, 1, 3).contiguous()
+
+
 def flash_attn_prefill_paged_bhmd(
     q: torch.Tensor,
     k_cache: torch.Tensor,
@@ -882,5 +1024,7 @@ __all__ = [
     "flash_attn_turboquant_decode_paged",
     "flash_attn_turboquant_decode_paged_available",
     "flash_attn_prefill_paged",
+    "flash_attn_prefill_paged_bfla",
+    "flash_attn_prefill_paged_splitkv",
     "flash_attn_prefill_paged_bhmd",
 ]

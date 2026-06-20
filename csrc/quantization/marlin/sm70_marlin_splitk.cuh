@@ -16,138 +16,6 @@ struct Sm70SplitKPartition {
   int partition_k;
 };
 
-inline int sm70_marlin_auto_requested_split_k_from_tiles(int64_t size_k,
-                                        int64_t cta_tiles,
-                                        bool k_pressure_path) {
-  if (size_k < 4096 || size_k % kCtaK != 0) {
-    return 1;
-  }
-
-  if (k_pressure_path) {
-    if (cta_tiles <= 64) {
-      return 8;
-    }
-    if (cta_tiles <= 128) {
-      return 4;
-    }
-    if (cta_tiles <= 256) {
-      return 2;
-    }
-    return 1;
-  }
-
-  if (cta_tiles <= 16) {
-    return 8;
-  }
-  if (cta_tiles <= 32) {
-    return 4;
-  }
-  if (cta_tiles <= 64) {
-    return 2;
-  }
-  return 1;
-}
-
-inline int sm70_marlin_dense_auto_requested_split_k(
-    int64_t size_m, int64_t size_n, int64_t size_k, Sm70CtaGeometry geometry) {
-  if (size_k < 4096 || size_k % kCtaK != 0) {
-    return 1;
-  }
-
-  if (size_k == 4096) {
-    if (size_n == 1024) {
-      if (size_m >= 2048) {
-        return 1;
-      }
-      if (size_m >= 1024) {
-        return 2;
-      }
-      if (size_m >= 64) {
-        return 8;
-      }
-      if (size_m >= 24) {
-        return 4;
-      }
-      return 8;
-    }
-
-    if (size_n >= 8192) {
-      if (size_m >= 48) {
-        return 1;
-      }
-      if (size_m >= 16) {
-        return 2;
-      }
-      return size_m == 1 ? 8 : 2;
-    }
-
-    if (size_n >= 4096) {
-      if (size_m >= 1024) {
-        return 1;
-      }
-      if (size_m >= 48) {
-        return 4;
-      }
-      return size_m <= 16 ? 8 : 4;
-    }
-  }
-
-  if (size_k >= 8192 && size_n <= 256) {
-    if (size_m >= 4096) {
-      return 2;
-    }
-    if (size_m >= 2048) {
-      return 4;
-    }
-    return 8;
-  }
-
-  if (size_k >= 8192 && size_n >= 4096) {
-    if (size_m >= 1024) {
-      return 1;
-    }
-    if (size_m >= 48) {
-      return 4;
-    }
-    return 8;
-  }
-
-  int64_t const m_tiles = (size_m + geometry.cta_m - 1) / geometry.cta_m;
-  int64_t const n_tiles = size_n / geometry.cta_n;
-  int64_t const cta_tiles = m_tiles * (n_tiles > 0 ? n_tiles : 1);
-  bool const k_pressure_path = size_k >= 8192 && size_n <= 256;
-  return sm70_marlin_auto_requested_split_k_from_tiles(size_k, cta_tiles, k_pressure_path);
-}
-
-inline int sm70_marlin_moe_auto_stage_requested_split_k(
-    int64_t tokens, int64_t size_n, int64_t size_k, int64_t top_k,
-    Sm70CtaGeometry geometry) {
-  int64_t const effective_m = tokens * top_k;
-  int64_t const m_tiles =
-      (effective_m + geometry.cta_m - 1) / geometry.cta_m;
-  int64_t const n_tiles = size_n / geometry.cta_n;
-  int64_t const cta_tiles = m_tiles * (n_tiles > 0 ? n_tiles : 1);
-  if (size_k % kCtaK != 0) {
-    return 1;
-  }
-  if (size_k == 2048) {
-    return cta_tiles <= 64 ? 2 : 1;
-  }
-  if (size_k < 4096) {
-    return 1;
-  }
-  if (cta_tiles <= 16) {
-    return 8;
-  }
-  if (cta_tiles <= 32) {
-    return 4;
-  }
-  if (cta_tiles <= 128) {
-    return 2;
-  }
-  return 1;
-}
-
 CUTLASS_HOST_DEVICE
 int sm70_splitk_ceil_div_int(int numerator, int denominator) {
   return (numerator + denominator - 1) / denominator;
@@ -158,13 +26,13 @@ int sm70_splitk_min_int(int lhs, int rhs) {
   return lhs < rhs ? lhs : rhs;
 }
 
-template <int GroupSize>
+template <int GroupSize, int CtaK = kCtaK>
 CUTLASS_HOST_DEVICE int sm70_splitk_group_tiles() {
   if constexpr (GroupSize > 0) {
-    if constexpr (GroupSize >= kCtaK) {
-      static_assert(GroupSize % kCtaK == 0,
+    if constexpr (GroupSize >= CtaK) {
+      static_assert(GroupSize % CtaK == 0,
                     "SM70 Marlin split-K group size must be CTA_K aligned.");
-      return GroupSize / kCtaK;
+      return GroupSize / CtaK;
     } else {
       return 1;
     }
@@ -174,8 +42,8 @@ CUTLASS_HOST_DEVICE int sm70_splitk_group_tiles() {
 }
 
 CUTLASS_HOST_DEVICE
-int sm70_active_split_k(int k, int requested_split_k) {
-  int const total_tiles = k / kCtaK;
+int sm70_active_split_k(int k, int requested_split_k, int cta_k = kCtaK) {
+  int const total_tiles = k / cta_k;
   if (total_tiles <= 0) {
     return 0;
   }
@@ -207,16 +75,16 @@ int sm70_splitk_partition_tile_count(int remaining_tiles,
   return sm70_splitk_min_int(partition_tiles, max_current_tiles);
 }
 
-template <int GroupSize>
+template <int GroupSize, int CtaK = kCtaK>
 CUTLASS_HOST_DEVICE Sm70SplitKPartition sm70_splitk_partition(
     int k, int requested_split_k, int partition_idx) {
-  int const active_split_k = sm70_active_split_k(k, requested_split_k);
+  int const active_split_k = sm70_active_split_k(k, requested_split_k, CtaK);
   if (partition_idx >= active_split_k) {
     return {0, 0};
   }
 
-  int const group_tiles = sm70_splitk_group_tiles<GroupSize>();
-  int remaining_tiles = k / kCtaK;
+  int const group_tiles = sm70_splitk_group_tiles<GroupSize, CtaK>();
+  int remaining_tiles = k / CtaK;
   int start_tiles = 0;
   for (int idx = 0; idx < partition_idx; ++idx) {
     int const partition_tiles = sm70_splitk_partition_tile_count(
@@ -227,7 +95,7 @@ CUTLASS_HOST_DEVICE Sm70SplitKPartition sm70_splitk_partition(
 
   int const partition_tiles = sm70_splitk_partition_tile_count(
       remaining_tiles, active_split_k - partition_idx, group_tiles);
-  return {start_tiles * kCtaK, partition_tiles * kCtaK};
+  return {start_tiles * CtaK, partition_tiles * CtaK};
 }
 
 template <typename Traits>

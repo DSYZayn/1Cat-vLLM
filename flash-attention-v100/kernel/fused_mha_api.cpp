@@ -36,4 +36,12 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
         "prefill_paged_fwd",
         &flash_attention_prefill_paged,
         "FlashAttention prefill over paged KV cache (Volta)");
+    m.def(
+        "prefill_paged_bfla_fwd",
+        &flash_attention_prefill_paged_bfla,
+        "BFLA sparse FlashAttention prefill over paged KV cache (Volta)");
+    m.def(
+        "prefill_paged_splitkv_fwd",
+        &flash_attention_prefill_paged_splitkv,
+        "FlashAttention split-KV prefill over paged KV cache (Volta)");
 }

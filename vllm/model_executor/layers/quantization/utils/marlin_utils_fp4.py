@@ -11,9 +11,9 @@ from vllm.model_executor.layers.quantization.utils.marlin_utils import (
     get_marlin_input_dtype,
     marlin_make_workspace_new,
     marlin_permute_bias,
-    marlin_permute_scales,
     marlin_quant_input,
     should_use_atomic_add_reduce,
+    sm70_marlin_logical_scales,
 )
 from vllm.platforms import current_platform
 from vllm.scalar_type import scalar_types
@@ -24,7 +24,14 @@ logger = init_logger(__name__)
 
 
 def is_fp4_marlin_supported():
-    return current_platform.is_cuda() and current_platform.has_device_capability(75)
+    if not current_platform.is_cuda():
+        return False
+    if current_platform.has_device_capability(75):
+        return True
+    return (
+        current_platform.is_device_capability((7, 0))
+        and ops.sm70_marlin_available()
+    )
 
 
 def _nvfp4_compute_scale_factor(
@@ -43,9 +50,9 @@ def _nvfp4_compute_scale_factor(
     ws_float = marlin_scales.float() * (2**7)
     nonzero_mask = ws_float > 0
     if nonzero_mask.any():
-        max_val = ws_float[nonzero_mask].max()
-        if max_val < 448 * (2**7):
-            sf = (448 * (2**7) / max_val).log2().floor().exp2()
+        min_val = ws_float[nonzero_mask].min()
+        if min_val < 2:
+            sf = (2 / min_val).log2().ceil().exp2()
             return sf.item()
     return 1.0
 
@@ -105,9 +112,7 @@ def nvfp4_marlin_process_scales(
     if scale_factor > 1.0:
         marlin_scales = (marlin_scales.float() * scale_factor).to(torch.half)
 
-    marlin_scales = marlin_scales * (2**7)
-    marlin_scales[marlin_scales < 2] = 0
-    marlin_scales = marlin_scales.view(torch.int16) << 1
+    marlin_scales = (marlin_scales * (2**7)).view(torch.int16) << 1
     marlin_scales = marlin_scales.view(torch.float8_e4m3fn)
     marlin_scales = marlin_scales[:, 1::2].contiguous()
 
@@ -249,7 +254,7 @@ def prepare_fp4_layer_for_marlin(
         weight_scale = weight_scale.view(torch.float8_e8m0fnu)
 
     weight_scale = weight_scale.to(param_dtype)
-    weight_scale = marlin_permute_scales(
+    weight_scale = sm70_marlin_logical_scales(
         s=weight_scale,
         size_k=part_size_k,
         size_n=part_size_n,
@@ -371,7 +376,7 @@ def prepare_nvfp4_moe_layer_for_marlin(
 
         for i in range(E):
             scale = scales[i].T
-            marlin_scales = marlin_permute_scales(
+            marlin_scales = sm70_marlin_logical_scales(
                 s=scale,
                 size_k=size_k,
                 size_n=size_n,
@@ -471,7 +476,7 @@ def prepare_moe_fp4_layer_for_marlin(
         for i in range(e):
             scale = scales[i].T
 
-            marlin_scales = marlin_permute_scales(
+            marlin_scales = sm70_marlin_logical_scales(
                 s=scale,
                 size_k=size_k,
                 size_n=size_n,
@@ -601,7 +606,7 @@ def prepare_moe_mxfp4_layer_for_marlin(
 
         for i in range(e):
             scale = scales[i].T
-            marlin_scales = marlin_permute_scales(
+            marlin_scales = sm70_marlin_logical_scales(
                 s=scale,
                 size_k=size_k,
                 size_n=size_n,
@@ -675,7 +680,7 @@ def rand_marlin_weight_nvfp4_like(weight, group_size, input_dtype=None):
         is_a_8bit=is_a_8bit,
     )
 
-    marlin_scales = marlin_permute_scales(
+    marlin_scales = sm70_marlin_logical_scales(
         s=scales.T.to(weight.dtype),
         size_k=size_k,
         size_n=size_n,
@@ -738,7 +743,7 @@ def rand_marlin_weight_mxfp4_like(weight, group_size, input_dtype=None):
         is_a_8bit=is_a_8bit,
     )
 
-    marlin_scales = marlin_permute_scales(
+    marlin_scales = sm70_marlin_logical_scales(
         s=scales.T.to(weight.dtype),
         size_k=size_k,
         size_n=size_n,

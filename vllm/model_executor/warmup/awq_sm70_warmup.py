@@ -6,13 +6,14 @@ from __future__ import annotations
 
 from collections.abc import Iterable
 from pathlib import Path
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 import torch
 
 import vllm.envs as envs
 from vllm import _sm70_ops as sm70_ops
 from vllm.logger import init_logger
+from vllm.model_executor.layers.quantization import sm70_turbomind as sm70_tm
 
 if TYPE_CHECKING:
     from vllm.v1.worker.gpu_worker import Worker
@@ -37,9 +38,38 @@ def _resolve_lut_path(device: torch.device) -> str | None:
     )
 
 
-def _load_lut_cache(device: torch.device) -> int:
+def _lut_cache_disabled_for_dynamic_quant_dispatch(
+    has_awq_dense: bool,
+    has_fp8_dense: bool,
+    fp4_kinds: set[str],
+) -> bool:
+    awq_no_preserve = (
+        has_awq_dense
+        and envs.VLLM_SM70_AWQ_TUNE_SMALL_SHAPES
+        and not envs.VLLM_SM70_AWQ_PRESERVE_DEFAULT_SPLITS
+        and not envs.VLLM_SM70_AWQ_PRESERVE_DEFAULT_SPLITS_ONLY
+    )
+    fp8_dynamic = has_fp8_dense and envs.VLLM_SM70_FP8_TUNE_SMALL_SHAPES
+    mxfp4_dynamic = (
+        "mxfp4" in fp4_kinds and envs.VLLM_SM70_MXFP4_TUNE_SMALL_SHAPES
+    )
+    nvfp4_dynamic = (
+        "nvfp4" in fp4_kinds and envs.VLLM_SM70_NVFP4_TUNE_SMALL_SHAPES
+    )
+    return awq_no_preserve or fp8_dynamic or mxfp4_dynamic or nvfp4_dynamic
+
+
+def _load_lut_cache(device: torch.device, skip_import: bool = False) -> int:
     path = _resolve_lut_path(device)
     if path is None or not hasattr(torch.ops._C, "sm70_gemm_import_cache"):
+        return 0
+    if skip_import:
+        logger.info(
+            "Skipping SM70 GEMM LUT import for dynamic quant dispatch "
+            "(path=%s, device=%s).",
+            path,
+            device,
+        )
         return 0
     if not Path(path).exists():
         logger.info(
@@ -54,9 +84,17 @@ def _load_lut_cache(device: torch.device) -> int:
         return 0
 
 
-def _save_lut_cache(device: torch.device) -> int:
+def _save_lut_cache(device: torch.device, skip_export: bool = False) -> int:
     path = _resolve_lut_path(device)
     if path is None or not hasattr(torch.ops._C, "sm70_gemm_export_cache"):
+        return 0
+    if skip_export:
+        logger.info(
+            "Skipping SM70 GEMM LUT export for dynamic quant dispatch "
+            "(path=%s, device=%s).",
+            path,
+            device,
+        )
         return 0
     device_hint = torch.empty(0, dtype=torch.uint8, device=device)
     try:
@@ -151,19 +189,38 @@ def _iter_unique_fp8_dense_layers(
 
         k_dim = int(layer.weight.shape[0])
         n_dim = int(layer.output_size_per_partition)
-        key = (k_dim, n_dim, False)
-        if key not in seen:
-            seen.add(key)
-            yield layer, False
+        if not getattr(layer, "sm70_fp8_gated_silu_primary", False):
+            key = (k_dim, n_dim, False)
+            if key not in seen:
+                seen.add(key)
+                yield layer, False
 
         if not getattr(layer, "sm70_fp8_gated_silu", False):
             continue
-        gated_n_dim = int(layer.sm70_fp8_gated_silu_weight.shape[1])
+        if getattr(layer, "sm70_fp8_gated_silu_primary", False):
+            gated_n_dim = int(layer.weight.shape[1])
+        else:
+            gated_n_dim = int(layer.sm70_fp8_gated_silu_weight.shape[1])
         key = (k_dim, gated_n_dim, True)
         if key in seen:
             continue
         seen.add(key)
         yield layer, True
+
+
+def _iter_unique_fp4_dense_layers(model: torch.nn.Module) -> Iterable[Any]:
+    seen: set[tuple[str, int, int, int]] = set()
+    for layer in model.modules():
+        state = getattr(layer, sm70_tm.STATE_ATTR, None)
+        if state is None or state.op_kind not in ("mxfp4", "nvfp4"):
+            continue
+        k_dim = int(state.weight.shape[0])
+        n_dim = int(state.output_size)
+        key = (state.op_kind, k_dim, n_dim, int(state.group_size))
+        if key in seen:
+            continue
+        seen.add(key)
+        yield state
 
 
 def _is_awq_moe_sm70_layer(layer: torch.nn.Module) -> bool:
@@ -244,10 +301,16 @@ def _warmup_fp8_dense_layers(
     calls = 0
     for layer, gated_silu in dense_layers:
         if gated_silu:
-            weight = layer.sm70_fp8_gated_silu_weight
-            scales = layer.sm70_fp8_gated_silu_scales
-            k_ld = int(layer.sm70_fp8_gated_silu_k_ld)
-            q_ld = int(layer.sm70_fp8_gated_silu_q_ld)
+            if getattr(layer, "sm70_fp8_gated_silu_primary", False):
+                weight = layer.weight
+                scales = layer.weight_scale_inv
+                k_ld = int(layer.sm70_fp8_k_ld)
+                q_ld = int(layer.sm70_fp8_q_ld)
+            else:
+                weight = layer.sm70_fp8_gated_silu_weight
+                scales = layer.sm70_fp8_gated_silu_scales
+                k_ld = int(layer.sm70_fp8_gated_silu_k_ld)
+                q_ld = int(layer.sm70_fp8_gated_silu_q_ld)
             n_dim = int(weight.shape[1]) // 2
         else:
             weight = layer.weight
@@ -264,6 +327,50 @@ def _warmup_fp8_dense_layers(
             sm70_ops.fp8_gemm_sm70_out(
                 out, x, weight, scales, 128, k_ld, q_ld, gated_silu
             )
+            calls += 1
+    return calls
+
+
+def _warmup_fp4_dense_layers(
+    dense_layers: list[Any],
+    m_values: list[int],
+) -> int:
+    calls = 0
+    for state in dense_layers:
+        device = state.weight.device
+        k_dim = int(state.weight.shape[0])
+        n_dim = int(state.output_size)
+        for m_dim in m_values:
+            x = torch.empty((m_dim, k_dim), dtype=torch.float16, device=device)
+            out = torch.empty((m_dim, n_dim), dtype=torch.float16, device=device)
+            if state.op_kind == "mxfp4":
+                if not hasattr(torch.ops._C, "mxfp4_gemm_sm70_out"):
+                    continue
+                sm70_ops.mxfp4_gemm_sm70_out(
+                    out,
+                    x,
+                    state.weight,
+                    state.scales,
+                    int(state.group_size),
+                    int(state.k_ld),
+                    int(state.q_ld),
+                    False,
+                )
+            elif state.op_kind == "nvfp4":
+                if not hasattr(torch.ops._C, "nvfp4_gemm_sm70_out"):
+                    continue
+                sm70_ops.nvfp4_gemm_sm70_out(
+                    out,
+                    x,
+                    state.weight,
+                    state.scales,
+                    int(state.group_size),
+                    int(state.k_ld),
+                    int(state.q_ld),
+                    False,
+                )
+            else:
+                continue
             calls += 1
     return calls
 
@@ -486,11 +593,20 @@ def sm70_awq_warmup(worker: Worker) -> None:
     model = worker.get_model()
     dense_layers = list(_iter_unique_dense_layers(model))
     fp8_dense_layers = list(_iter_unique_fp8_dense_layers(model))
+    fp4_dense_layers = list(_iter_unique_fp4_dense_layers(model))
     moe_layers = list(_iter_unique_moe_layers(model))
-    if not dense_layers and not fp8_dense_layers and not moe_layers:
+    if not (
+        dense_layers or fp8_dense_layers or fp4_dense_layers or moe_layers
+    ):
         return
 
-    imported_records = _load_lut_cache(device)
+    fp4_kinds = {str(state.op_kind) for state in fp4_dense_layers}
+    skip_lut_cache = _lut_cache_disabled_for_dynamic_quant_dispatch(
+        bool(dense_layers),
+        bool(fp8_dense_layers),
+        fp4_kinds,
+    )
+    imported_records = _load_lut_cache(device, skip_import=skip_lut_cache)
     if imported_records > 0:
         logger.info(
             "Loaded SM70 GEMM LUT (%d records) for device %s.",
@@ -503,11 +619,12 @@ def sm70_awq_warmup(worker: Worker) -> None:
     lut_path = _resolve_lut_path(device)
 
     logger.info(
-        "Warming up SM70 AWQ/FP8 accepted routes (%d AWQ dense layer shapes, "
-        "%d FP8 dense layer shapes, %d MoE layer shapes, dense_m=%s, "
-        "moe_tokens=%s, lut_path=%s).",
+        "Warming up SM70 TurboMind accepted routes (%d AWQ dense layer "
+        "shapes, %d FP8 dense layer shapes, %d FP4 dense layer shapes, "
+        "%d MoE layer shapes, dense_m=%s, moe_tokens=%s, lut_path=%s).",
         len(dense_layers),
         len(fp8_dense_layers),
+        len(fp4_dense_layers),
         len(moe_layers),
         m_values,
         moe_token_counts,
@@ -516,20 +633,23 @@ def sm70_awq_warmup(worker: Worker) -> None:
     with torch.inference_mode():
         dense_calls = _warmup_dense_layers(dense_layers, m_values)
         fp8_dense_calls = _warmup_fp8_dense_layers(fp8_dense_layers, m_values)
+        fp4_dense_calls = _warmup_fp4_dense_layers(fp4_dense_layers, m_values)
         moe_stage_calls = _warmup_moe_dense_stage_layers(
             moe_layers, moe_token_counts
         )
         single_token_calls = _warmup_moe_single_token_layers(moe_layers)
     torch.cuda.synchronize(device)
     logger.info(
-        "SM70 AWQ warmup finished (%d AWQ dense calls, %d FP8 dense calls, "
-        "%d MoE stage calls, %d single-token active-expert calls).",
+        "SM70 TurboMind warmup finished (%d AWQ dense calls, %d FP8 dense "
+        "calls, %d FP4 dense calls, %d MoE stage calls, "
+        "%d single-token active-expert calls).",
         dense_calls,
         fp8_dense_calls,
+        fp4_dense_calls,
         moe_stage_calls,
         single_token_calls,
     )
-    exported_records = _save_lut_cache(device)
+    exported_records = _save_lut_cache(device, skip_export=skip_lut_cache)
     if exported_records > 0:
         logger.info(
             "Saved SM70 GEMM LUT (%d records) for device %s.",

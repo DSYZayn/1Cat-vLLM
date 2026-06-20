@@ -190,6 +190,44 @@ if hasattr(torch.ops._C, "mxfp4_sm70_prepare"):
         return [tm_weight, tm_scales, meta]
 
 
+def nvfp4_sm70_prepare(
+    qweight: torch.Tensor,
+    scales: torch.Tensor,
+    group_size: int,
+    interleave_gated_silu: bool = False,
+) -> list[torch.Tensor]:
+    return _op("nvfp4_sm70_prepare")(
+        qweight, scales, group_size, interleave_gated_silu
+    )
+
+
+if hasattr(torch.ops._C, "nvfp4_sm70_prepare"):
+
+    @register_fake("_C::nvfp4_sm70_prepare")
+    def _nvfp4_sm70_prepare_fake(
+        qweight: torch.Tensor,
+        scales: torch.Tensor,
+        group_size: int,
+        interleave_gated_silu: bool,
+    ) -> list[torch.Tensor]:
+        del group_size, interleave_gated_silu
+        k = qweight.size(0)
+        n = qweight.size(1)
+        num_groups = scales.size(0)
+        tm_weight = torch.empty(
+            (k, n // 8),
+            dtype=torch.int32,
+            device=qweight.device,
+        )
+        tm_scales = torch.empty(
+            (num_groups, n),
+            dtype=torch.float16,
+            device=qweight.device,
+        )
+        meta = torch.empty((2,), dtype=torch.int64, device=qweight.device)
+        return [tm_weight, tm_scales, meta]
+
+
 def sm70_f16_prepare(weight: torch.Tensor) -> list[torch.Tensor]:
     return _op("sm70_f16_prepare")(weight)
 
@@ -313,6 +351,37 @@ if hasattr(torch.ops._C, "mxfp4_gemm_sm70_out"):
 
     @register_fake("_C::mxfp4_gemm_sm70_out")
     def _mxfp4_gemm_sm70_out_fake(
+        out: torch.Tensor,
+        input: torch.Tensor,
+        qweight: torch.Tensor,
+        scales: torch.Tensor,
+        group_size: int,
+        k_ld: int,
+        q_ld: int,
+        gated_silu: bool,
+    ) -> None:
+        return None
+
+
+def nvfp4_gemm_sm70_out(
+    out: torch.Tensor,
+    input: torch.Tensor,
+    qweight: torch.Tensor,
+    scales: torch.Tensor,
+    group_size: int,
+    k_ld: int,
+    q_ld: int,
+    gated_silu: bool = False,
+) -> None:
+    _op("nvfp4_gemm_sm70_out")(
+        out, input, qweight, scales, group_size, k_ld, q_ld, gated_silu
+    )
+
+
+if hasattr(torch.ops._C, "nvfp4_gemm_sm70_out"):
+
+    @register_fake("_C::nvfp4_gemm_sm70_out")
+    def _nvfp4_gemm_sm70_out_fake(
         out: torch.Tensor,
         input: torch.Tensor,
         qweight: torch.Tensor,

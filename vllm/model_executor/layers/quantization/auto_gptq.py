@@ -451,8 +451,9 @@ class AutoGPTQLinearMethod(LinearMethodBase):
         )
 
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
-        if sm70_tm.is_exact_sm70_cuda(
-            layer.qweight, envs.VLLM_SM70_GPTQ_TURBOMIND
+        if sm70_tm.should_prepare_turbomind(
+            layer.qweight,
+            envs.VLLM_SM70_GPTQ_TURBOMIND,
         ):
             unsupported = []
             if self.quant_config.weight_bits != 4:

@@ -80,6 +80,7 @@ _flash_v100_prefill_compare_count = 0
 _flash_v100_decode_compare_count = 0
 _flash_v100_prefill_dump_count = 0
 _flash_v100_decode_dump_count = 0
+_tq_continuation_workspace_reserved_bytes = 0
 
 # Continuation prefill: for small continuation chunks (q_len ≤ threshold),
 # use the TQ decode kernel directly instead of full-dequant + flash_attn.
@@ -405,6 +406,44 @@ class TurboQuantAttentionImpl(AttentionImpl["TurboQuantMetadata"]):
         vllm_config = get_current_vllm_config()
         self.max_num_kv_splits = (
             vllm_config.attention_config.tq_max_kv_splits_for_cuda_graph
+        )
+        self._continuation_workspace_tokens = _env_int(
+            "VLLM_SM70_TURBOQUANT_CONTINUATION_WORKSPACE_TOKENS", 0
+        )
+        if self._continuation_workspace_tokens <= 0:
+            self._continuation_workspace_tokens = int(
+                vllm_config.model_config.max_model_len
+            )
+
+    def _reserve_continuation_prefill_workspace(self) -> None:
+        if not is_workspace_manager_initialized():
+            return
+        if os.getenv("VLLM_SM70_TURBOQUANT_RESERVE_WORKSPACE", "1") == "0":
+            return
+
+        max_cached_len = self._continuation_workspace_tokens
+        if max_cached_len <= 0:
+            return
+
+        buf_shape = (1, self.num_kv_heads, max_cached_len, self.head_size)
+        required_bytes = 2 * math.prod(buf_shape) * torch.float16.itemsize
+
+        global _tq_continuation_workspace_reserved_bytes
+        if required_bytes <= _tq_continuation_workspace_reserved_bytes:
+            return
+
+        current_workspace_manager().get_simultaneous(
+            (buf_shape, torch.float16),
+            (buf_shape, torch.float16),
+        )
+        _tq_continuation_workspace_reserved_bytes = required_bytes
+        logger.info(
+            "TURBOQUANT reserved %.2f MiB continuation-prefill workspace "
+            "(tokens=%d, kv_heads=%d, head_dim=%d).",
+            required_bytes / (1024**2),
+            max_cached_len,
+            self.num_kv_heads,
+            self.head_size,
         )
 
     def _flash_attn_varlen(
@@ -745,6 +784,7 @@ class TurboQuantAttentionImpl(AttentionImpl["TurboQuantMetadata"]):
         maps it to the mirror centroid with identical distortion).
         """
         if not hasattr(layer, "_tq_cached"):
+            self._reserve_continuation_prefill_workspace()
             D = self.head_size
 
             # Pure Hadamard: orthonormal + symmetric (H = H^T), enabling
@@ -1041,8 +1081,6 @@ class TurboQuantAttentionImpl(AttentionImpl["TurboQuantMetadata"]):
         # For continuation chunks (seq_len > q_len), we must attend to
         # previously cached K/V from the TQ cache, not just the current
         # chunk's raw K/V.
-        Hk = key.shape[1]
-        use_gqa = Hk < Hq
         query_start_loc = attn_metadata.query_start_loc
         num_reqs = query_start_loc.shape[0] - 1
 
@@ -1353,7 +1391,9 @@ class TurboQuantAttentionImpl(AttentionImpl["TurboQuantMetadata"]):
         if self.use_flash_v100_tq_decode:
             global _logged_flash_v100_tq_decode
             if output_buf is None:
-                output_buf = torch.empty(B, Hq, D, dtype=query.dtype, device=query.device)
+                output_buf = torch.empty(
+                    B, Hq, D, dtype=query.dtype, device=query.device
+                )
             q_float = query.float()
             if PiT is None:
                 PiT = Pi.T.contiguous()

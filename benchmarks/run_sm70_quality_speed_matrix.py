@@ -122,6 +122,34 @@ def _load_generation_config(model: str) -> dict[str, Any]:
     }
 
 
+def _parse_scalar(value: str) -> Any:
+    lowered = value.lower()
+    if lowered in ("true", "false"):
+        return lowered == "true"
+    if lowered in ("none", "null"):
+        return None
+    if value.startswith(("{", "[")):
+        return json.loads(value)
+    try:
+        return int(value)
+    except ValueError:
+        pass
+    try:
+        return float(value)
+    except ValueError:
+        return value
+
+
+def _parse_engine_args(values: list[str]) -> dict[str, Any]:
+    parsed: dict[str, Any] = {}
+    for value in values:
+        if "=" not in value:
+            raise ValueError(f"Expected KEY=VALUE for --engine-arg, got {value!r}")
+        key, raw = value.split("=", 1)
+        parsed[key.replace("-", "_")] = _parse_scalar(raw)
+    return parsed
+
+
 def _make_exact_prompt_token_ids(tokenizer: Any, target_len: int) -> list[int]:
     base = (
         "SM70 V100 benchmark prompt. The model should continue with stable, "
@@ -137,14 +165,19 @@ def _make_exact_prompt_token_ids(tokenizer: Any, target_len: int) -> list[int]:
     return token_ids[:target_len]
 
 
-def _make_chat_prompt(tokenizer: Any, content: str) -> str:
+def _make_chat_prompt(
+    tokenizer: Any,
+    content: str,
+    *,
+    enable_thinking: bool,
+) -> str:
     messages = [{"role": "user", "content": content}]
     try:
         return tokenizer.apply_chat_template(
             messages,
             tokenize=False,
             add_generation_prompt=True,
-            enable_thinking=True,
+            enable_thinking=enable_thinking,
         )
     except TypeError:
         return tokenizer.apply_chat_template(
@@ -335,10 +368,12 @@ def _run_worker(args: argparse.Namespace) -> int:
         "max_num_batched_tokens": args.max_num_batched_tokens,
         "max_num_seqs": 1,
         "gpu_memory_utilization": args.gpu_memory_utilization,
-        "attention_backend": "FLASH_ATTN_V100",
         "seed": args.seed,
         "disable_log_stats": False,
     }
+    if args.attention_backend.lower() != "none":
+        llm_kwargs["attention_backend"] = args.attention_backend
+    llm_kwargs.update(_parse_engine_args(args.engine_arg))
     if args.speculative_tokens > 0:
         llm_kwargs["speculative_config"] = {
             "method": "mtp",
@@ -410,7 +445,11 @@ def _run_worker(args: argparse.Namespace) -> int:
 
     quality_records = []
     for prompt in quality_prompts:
-        chat_prompt = _make_chat_prompt(tokenizer, prompt["content"])
+        chat_prompt = _make_chat_prompt(
+            tokenizer,
+            prompt["content"],
+            enable_thinking=args.enable_thinking,
+        )
         for repeat_idx in range(args.quality_repeat):
             request = llm.generate([chat_prompt], official_sampling)[0]
             text, token_ids, q_finish_reason, q_stop_reason = _output_record(
@@ -427,7 +466,11 @@ def _run_worker(args: argparse.Namespace) -> int:
                 "tail": text[-1000:],
             })
 
-    det_prompt = _make_chat_prompt(tokenizer, DETERMINISM_PROMPT)
+    det_prompt = _make_chat_prompt(
+        tokenizer,
+        DETERMINISM_PROMPT,
+        enable_thinking=args.enable_thinking,
+    )
     det_sampling = SamplingParams(
         max_tokens=256,
         temperature=0.0,
@@ -496,6 +539,7 @@ def _run_worker(args: argparse.Namespace) -> int:
                 "seed": args.sampling_seed,
                 "max_tokens": args.quality_max_tokens,
                 "ignore_eos": False,
+                "enable_thinking": args.enable_thinking,
             },
             "records": quality_records,
             "determinism": {
@@ -700,6 +744,8 @@ def _run_matrix(args: argparse.Namespace) -> int:
                 str(args.max_num_batched_tokens),
                 "--gpu-memory-utilization",
                 str(args.gpu_memory_utilization),
+                "--attention-backend",
+                args.attention_backend,
                 "--speed-input-len",
                 str(args.speed_input_len),
                 "--speed-output-len",
@@ -717,6 +763,10 @@ def _run_matrix(args: argparse.Namespace) -> int:
                 "--out",
                 str(out_path),
             ]
+            if not args.enable_thinking:
+                cmd.append("--disable-thinking")
+            for engine_arg in args.engine_arg:
+                cmd.extend(["--engine-arg", engine_arg])
             for prompt_id in args.quality_prompt_id or []:
                 cmd.extend(["--quality-prompt-id", prompt_id])
             print(f"[matrix] running {case_name}", flush=True)
@@ -764,6 +814,7 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--max-model-len", type=int, default=262144)
     parser.add_argument("--max-num-batched-tokens", type=int, default=8096)
     parser.add_argument("--gpu-memory-utilization", type=float, default=0.88)
+    parser.add_argument("--attention-backend", default="FLASH_ATTN_V100")
     parser.add_argument("--speed-input-len", type=int, default=4096)
     parser.add_argument("--speed-output-len", type=int, default=1024)
     parser.add_argument("--quality-max-tokens", type=int, default=2048)
@@ -772,6 +823,11 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--sampling-seed", type=int, default=20260617)
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--speculative-tokens", type=int, default=0)
+    parser.add_argument("--disable-thinking",
+                        action="store_false",
+                        dest="enable_thinking")
+    parser.set_defaults(enable_thinking=True)
+    parser.add_argument("--engine-arg", action="append", default=[])
     parser.add_argument("--out", type=Path)
     return parser.parse_args()
 

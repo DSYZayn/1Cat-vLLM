@@ -8,6 +8,18 @@
 #include <torch/library.h>
 #include <torch/version.h>
 
+namespace {
+
+bool sm70_marlin_available() {
+#ifdef ENABLE_SM70_MARLIN
+  return true;
+#else
+  return false;
+#endif
+}
+
+}  // namespace
+
 // Note on op signatures:
 // The X_meta signatures are for the meta functions corresponding to op X.
 // They must be kept in sync with the signature for X. Generally, only
@@ -122,6 +134,9 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, ops) {
   // conditionally compiled so impl registration is in source file
 
   // Marlin Optimized Quantized GEMM (supports GPTQ, AWQ, FP8, NVFP4, MXFP4).
+  ops.def("sm70_marlin_available() -> bool");
+  ops.impl("sm70_marlin_available", &sm70_marlin_available);
+
   ops.def(
       "marlin_gemm(Tensor a, Tensor? c_or_none, Tensor b_q_weight, "
       "Tensor? b_bias_or_none,Tensor b_scales, "
@@ -175,6 +190,11 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, ops) {
       "int group_size, bool interleave_gated_silu) -> Tensor[]");
   ops.impl("mxfp4_sm70_prepare", torch::kCUDA, &mxfp4_sm70_prepare);
 
+  ops.def(
+      "nvfp4_sm70_prepare(Tensor _kernel, Tensor _scaling_factors, "
+      "int group_size, bool interleave_gated_silu) -> Tensor[]");
+  ops.impl("nvfp4_sm70_prepare", torch::kCUDA, &nvfp4_sm70_prepare);
+
   ops.def("sm70_f16_prepare(Tensor _kernel) -> Tensor[]");
   ops.impl("sm70_f16_prepare", torch::kCUDA, &sm70_f16_prepare);
 
@@ -203,6 +223,12 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, ops) {
       "Tensor _scaling_factors, int group_size, int k_ld, int q_ld, "
       "bool gated_silu) -> ()");
   ops.impl("mxfp4_gemm_sm70_out", torch::kCUDA, &mxfp4_gemm_sm70_out);
+
+  ops.def(
+      "nvfp4_gemm_sm70_out(Tensor(a!) out, Tensor _in_feats, Tensor _kernel, "
+      "Tensor _scaling_factors, int group_size, int k_ld, int q_ld, "
+      "bool gated_silu) -> ()");
+  ops.impl("nvfp4_gemm_sm70_out", torch::kCUDA, &nvfp4_gemm_sm70_out);
 
   ops.def(
       "fp8_gemm_sm70_out_auto(Tensor(a!) out, Tensor _in_feats, "

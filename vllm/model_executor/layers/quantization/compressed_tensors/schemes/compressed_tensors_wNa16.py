@@ -79,7 +79,10 @@ class CompressedTensorsWNA16(CompressedTensorsScheme):
 
     @classmethod
     def get_min_capability(cls) -> int:
-        if envs.VLLM_SM70_COMPRESSED_TENSORS_TURBOMIND:
+        if (
+            sm70_tm.use_turbomind(envs.VLLM_SM70_COMPRESSED_TENSORS_TURBOMIND)
+            or sm70_tm.forces_marlin()
+        ):
             return 70
         # Turing and up
         return 75
@@ -224,7 +227,7 @@ class CompressedTensorsWNA16(CompressedTensorsScheme):
     # Checkpoints are serialized in compressed-tensors format, which is
     # different from the format the kernel may want. Handle repacking here.
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
-        if sm70_tm.is_exact_sm70_cuda(
+        if sm70_tm.should_prepare_turbomind(
             layer.weight_packed,
             envs.VLLM_SM70_COMPRESSED_TENSORS_TURBOMIND,
         ):

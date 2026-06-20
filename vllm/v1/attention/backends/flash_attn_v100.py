@@ -11,6 +11,7 @@ plus Flash-decode runs do not count as the final SM70 FlashAttention route.
 from __future__ import annotations
 
 import atexit
+from collections.abc import Callable
 import inspect
 import json
 import os
@@ -40,10 +41,13 @@ def _sm70_profile_trace(message: str, *args: object) -> None:
 
 # Lazy imports: only resolve optional CUDA extensions when needed.
 _flash_attn_func = None
+_flash_attn_bhmd_func = None
 _flash_attn_decode_paged = None
 _flash_attn_decode_paged_wmma = None
 _flash_attn_prefill_paged = None
 _flash_attn_prefill_paged_bhmd = None
+_flash_attn_prefill_paged_bfla = None
+_flash_attn_prefill_paged_splitkv = None
 _flash_attn_turboquant_decode_paged = None
 _flash_attn_turboquant_decode_checked = False
 _paged_kv_utils = None
@@ -52,6 +56,9 @@ _warned_decode_fallback = False
 _warned_decode_strict_fallback = False
 _logged_prefill_flash = False
 _logged_prefill_prefix_flash = False
+_logged_prefill_prefix_contig_dense = False
+_logged_prefill_prefix_bfla = False
+_logged_prefill_prefix_splitkv = False
 _logged_prefill_paged_cache = False
 _logged_prefill_smallq_decode = False
 _logged_prefill_triton_safe = False
@@ -243,8 +250,10 @@ def _callable_accepts_keyword(fn: object, name: str) -> bool:
 
 def _get_flash_ops():
     """Lazy-load flash_attn_v100 ops if available."""
-    global _flash_attn_func, _flash_attn_decode_paged, _flash_attn_prefill_paged
+    global _flash_attn_func, _flash_attn_bhmd_func
+    global _flash_attn_decode_paged, _flash_attn_prefill_paged
     global _flash_attn_decode_paged_wmma, _flash_attn_prefill_paged_bhmd
+    global _flash_attn_prefill_paged_bfla, _flash_attn_prefill_paged_splitkv
     if (
         _flash_attn_func is None
         or _flash_attn_decode_paged is None
@@ -252,12 +261,14 @@ def _get_flash_ops():
     ):
         try:
             from flash_attn_v100 import (
+                flash_attn_bhmd_func,
                 flash_attn_decode_paged,
                 flash_attn_func,
                 flash_attn_prefill_paged,
             )
 
             _flash_attn_func = flash_attn_func
+            _flash_attn_bhmd_func = flash_attn_bhmd_func
             _flash_attn_decode_paged = flash_attn_decode_paged
             _flash_attn_prefill_paged = flash_attn_prefill_paged
             try:
@@ -272,23 +283,41 @@ def _get_flash_ops():
                 _flash_attn_prefill_paged_bhmd = flash_attn_prefill_paged_bhmd
             except ImportError:
                 _flash_attn_prefill_paged_bhmd = None
+            try:
+                from flash_attn_v100 import flash_attn_prefill_paged_bfla
+
+                _flash_attn_prefill_paged_bfla = flash_attn_prefill_paged_bfla
+            except ImportError:
+                _flash_attn_prefill_paged_bfla = None
+            try:
+                from flash_attn_v100 import flash_attn_prefill_paged_splitkv
+
+                _flash_attn_prefill_paged_splitkv = flash_attn_prefill_paged_splitkv
+            except ImportError:
+                _flash_attn_prefill_paged_splitkv = None
         except ImportError:
             _flash_attn_func = None
+            _flash_attn_bhmd_func = None
             _flash_attn_decode_paged = None
             _flash_attn_decode_paged_wmma = None
             _flash_attn_prefill_paged = None
             _flash_attn_prefill_paged_bhmd = None
+            _flash_attn_prefill_paged_bfla = None
+            _flash_attn_prefill_paged_splitkv = None
     return (
         _flash_attn_func,
+        _flash_attn_bhmd_func,
         _flash_attn_decode_paged,
         _flash_attn_decode_paged_wmma,
         _flash_attn_prefill_paged,
         _flash_attn_prefill_paged_bhmd,
+        _flash_attn_prefill_paged_bfla,
+        _flash_attn_prefill_paged_splitkv,
     )
 
 
 def flash_v100_dense_prefill_available() -> bool:
-    flash_attn_func, _, _, _, _ = _get_flash_ops()
+    flash_attn_func, _, _, _, _, _, _, _ = _get_flash_ops()
     return flash_attn_func is not None
 
 
@@ -304,7 +333,7 @@ def flash_v100_dense_prefill(
     window_size: tuple[int, int] = (-1, -1),
 ) -> torch.Tensor:
     """Run Flash-V100 dense raw-QKV prefill without backend metadata coupling."""
-    flash_attn_func, _, _, _, _ = _get_flash_ops()
+    flash_attn_func, _, _, _, _, _, _, _ = _get_flash_ops()
     if flash_attn_func is None:
         raise RuntimeError("flash_attn_v100 dense prefill op is unavailable")
 
@@ -616,6 +645,349 @@ def _dequantize_fp8_contiguous_kv(
     key = key.view(fp8_dtype).to(torch.float16) * k_scale
     value = value.view(fp8_dtype).to(torch.float16) * v_scale
     return key, value
+
+
+def _contiguous_paged_start_block(
+    key_cache: torch.Tensor,
+    block_table_row: torch.Tensor,
+    seq_len: int,
+    block_size: int,
+    attn_metadata: TritonAttentionMetadata,
+    seq_idx: int,
+) -> tuple[int, int] | None:
+    if seq_len <= 0 or block_size <= 0:
+        return None
+    num_blocks = (seq_len + block_size - 1) // block_size
+    if num_blocks <= 0 or num_blocks > int(block_table_row.shape[0]):
+        return None
+
+    cache_key = (
+        int(seq_idx),
+        int(seq_len),
+        int(block_size),
+        int(block_table_row.data_ptr()),
+        int(key_cache.data_ptr()),
+    )
+    contig_cache = getattr(attn_metadata, "flash_v100_contig_dense_cache", None)
+    if contig_cache is None:
+        contig_cache = {}
+        attn_metadata.flash_v100_contig_dense_cache = contig_cache
+
+    start_block = contig_cache.get(cache_key)
+    if start_block is None:
+        blocks_cpu = block_table_row[:num_blocks].detach().cpu()
+        if int(blocks_cpu[0].item()) < 0:
+            contig_cache[cache_key] = -1
+            return None
+        if num_blocks > 1:
+            expected = blocks_cpu[0] + torch.arange(
+                num_blocks,
+                dtype=blocks_cpu.dtype,
+                device=blocks_cpu.device,
+            )
+            if not bool(torch.equal(blocks_cpu, expected)):
+                contig_cache[cache_key] = -1
+                return None
+        start_block = int(blocks_cpu[0].item())
+        contig_cache[cache_key] = start_block
+
+    if start_block < 0:
+        return None
+    if start_block + num_blocks > int(key_cache.shape[0]):
+        return None
+
+    return start_block, num_blocks
+
+
+def _contiguous_paged_kv_view(
+    key_cache: torch.Tensor,
+    value_cache: torch.Tensor,
+    block_table_row: torch.Tensor,
+    seq_len: int,
+    block_size: int,
+    attn_metadata: TritonAttentionMetadata,
+    seq_idx: int,
+    allow_copy: bool,
+) -> tuple[torch.Tensor, torch.Tensor] | None:
+    """Return a dense [1, N, Hkv, D] K/V view for physically contiguous pages."""
+    if key_cache.dtype != torch.float16 or value_cache.dtype != torch.float16:
+        return None
+    if key_cache.shape != value_cache.shape:
+        return None
+    if (
+        not allow_copy
+        and (not key_cache.is_contiguous() or not value_cache.is_contiguous())
+    ):
+        return None
+
+    start_info = _contiguous_paged_start_block(
+        key_cache,
+        block_table_row,
+        seq_len,
+        block_size,
+        attn_metadata,
+        seq_idx,
+    )
+    if start_info is None:
+        return None
+    start_block, num_blocks = start_info
+
+    num_kv_heads = key_cache.shape[2]
+    head_dim = key_cache.shape[3]
+    end_block = start_block + num_blocks
+    key_block_slice = key_cache[start_block:end_block]
+    value_block_slice = value_cache[start_block:end_block]
+    key_flat = key_block_slice.reshape(-1, num_kv_heads, head_dim)
+    value_flat = value_block_slice.reshape(-1, num_kv_heads, head_dim)
+    return (
+        key_flat[:seq_len].unsqueeze(0),
+        value_flat[:seq_len].unsqueeze(0),
+    )
+
+
+def _contiguous_paged_kv_bhmd(
+    key_cache: torch.Tensor,
+    value_cache: torch.Tensor,
+    block_table_row: torch.Tensor,
+    seq_len: int,
+    block_size: int,
+    attn_metadata: TritonAttentionMetadata,
+    seq_idx: int,
+) -> tuple[torch.Tensor, torch.Tensor] | None:
+    """Return dense [1, Hkv, N, D] K/V tensors for contiguous paged cache."""
+    if key_cache.dtype != torch.float16 or value_cache.dtype != torch.float16:
+        return None
+    if key_cache.shape != value_cache.shape:
+        return None
+
+    start_info = _contiguous_paged_start_block(
+        key_cache,
+        block_table_row,
+        seq_len,
+        block_size,
+        attn_metadata,
+        seq_idx,
+    )
+    if start_info is None:
+        return None
+    start_block, num_blocks = start_info
+
+    num_kv_heads = key_cache.shape[2]
+    head_dim = key_cache.shape[3]
+    end_block = start_block + num_blocks
+    key_blocks = key_cache[start_block:end_block]
+    value_blocks = value_cache[start_block:end_block]
+    key_bhmd = (
+        key_blocks.permute(2, 0, 1, 3)
+        .reshape(1, num_kv_heads, -1, head_dim)[:, :, :seq_len, :]
+        .contiguous()
+    )
+    value_bhmd = (
+        value_blocks.permute(2, 0, 1, 3)
+        .reshape(1, num_kv_heads, -1, head_dim)[:, :, :seq_len, :]
+        .contiguous()
+    )
+    return key_bhmd, value_bhmd
+
+
+def _cdiv_int(a: int, b: int) -> int:
+    return (a + b - 1) // b
+
+
+def _build_bfla_block_mask_for_seq(
+    q_seq: torch.Tensor,
+    key_cache: torch.Tensor,
+    block_table_row: torch.Tensor,
+    *,
+    seq_len: int,
+    block_size: int,
+    mask_block_n: int,
+    softmax_scale: float,
+) -> torch.Tensor | None:
+    """Build [1, Hkv, q_tiles, kv_tiles] sparse prefill mask."""
+    if q_seq.ndim != 4 or q_seq.shape[0] != 1:
+        return None
+    if key_cache.dtype != torch.float16 or q_seq.dtype != torch.float16:
+        return None
+    if mask_block_n <= 0:
+        return None
+
+    pool_mode = envs.VLLM_FLASH_V100_BFLA_POOL.lower()
+    flat_group_tokens = 64
+    use_flat64 = pool_mode == "flat64"
+    if use_flat64 and mask_block_n % flat_group_tokens != 0:
+        return None
+
+    q_len = int(q_seq.shape[1])
+    num_query_heads = int(q_seq.shape[2])
+    head_dim = int(q_seq.shape[3])
+    num_kv_heads = int(key_cache.shape[2])
+    if q_len <= 1 or seq_len < q_len:
+        return None
+    if num_query_heads % num_kv_heads != 0:
+        return None
+
+    q_blocks = _cdiv_int(q_len, mask_block_n)
+    kv_tiles = _cdiv_int(seq_len, mask_block_n)
+    if q_blocks <= 0 or kv_tiles <= 0:
+        return None
+
+    def pool_blocks(x: torch.Tensor) -> torch.Tensor:
+        if use_flat64:
+            groups = mask_block_n // flat_group_tokens
+            return (
+                x.view(
+                    x.shape[0],
+                    groups,
+                    flat_group_tokens,
+                    x.shape[2],
+                    x.shape[3],
+                )
+                .permute(3, 0, 1, 2, 4)
+                .reshape(
+                    x.shape[2],
+                    x.shape[0],
+                    groups,
+                    flat_group_tokens * x.shape[3],
+                )
+            )
+        if pool_mode == "center":
+            return x[:, min(mask_block_n // 2, x.shape[1] - 1)].permute(1, 0, 2)
+        if pool_mode == "maxabs":
+            idx = torch.argmax(x.abs(), dim=1, keepdim=True)
+            return torch.gather(x, 1, idx).squeeze(1).permute(1, 0, 2)
+        return x.mean(dim=1).permute(1, 0, 2)
+
+    q_req = q_seq.squeeze(0)
+    q_pad = torch.zeros(
+        (q_blocks * mask_block_n, num_query_heads, head_dim),
+        device=q_seq.device,
+        dtype=q_seq.dtype,
+    )
+    q_pad[:q_len].copy_(q_req)
+    q_low = pool_blocks(q_pad.view(q_blocks, mask_block_n, num_query_heads, head_dim))
+
+    num_pages = _cdiv_int(seq_len, block_size)
+    pages = block_table_row[:num_pages].to(torch.long)
+    k_req = key_cache.index_select(0, pages).reshape(-1, num_kv_heads, head_dim)
+    k_req = k_req[:seq_len]
+    k_pad = torch.zeros(
+        (kv_tiles * mask_block_n, num_kv_heads, head_dim),
+        device=q_seq.device,
+        dtype=key_cache.dtype,
+    )
+    k_pad[:seq_len].copy_(k_req)
+    k_low = pool_blocks(k_pad.view(kv_tiles, mask_block_n, num_kv_heads, head_dim))
+
+    num_queries_per_kv = num_query_heads // num_kv_heads
+    keep_per_kv = torch.zeros(
+        (num_kv_heads, q_blocks, kv_tiles),
+        device=q_seq.device,
+        dtype=torch.bool,
+    )
+    context_len = seq_len - q_len
+    q_block_end = (
+        context_len
+        + (torch.arange(q_blocks, device=q_seq.device) + 1) * mask_block_n
+        - 1
+    )
+    q_block_end = torch.clamp(q_block_end, max=seq_len - 1)
+    k_block_start = torch.arange(kv_tiles, device=q_seq.device) * mask_block_n
+    causal = k_block_start[None, :] <= q_block_end[:, None]
+
+    threshold = float(envs.VLLM_FLASH_V100_BFLA_THRESHOLD)
+    keep_mass = float(envs.VLLM_FLASH_V100_BFLA_KEEP_MASS)
+    keep_ratio = float(envs.VLLM_FLASH_V100_BFLA_KEEP_RATIO)
+    min_keep_blocks = int(envs.VLLM_FLASH_V100_BFLA_MIN_KEEP_BLOCKS)
+    for kv_h in range(num_kv_heads):
+        q_h0 = kv_h * num_queries_per_kv
+        q_h1 = q_h0 + num_queries_per_kv
+        if use_flat64:
+            group_scores = torch.einsum(
+                "hqgf,krf->hqkgr", q_low[q_h0:q_h1], k_low[kv_h]
+            )
+            scores = group_scores.amax(dim=(-1, -2))
+        else:
+            scores = torch.einsum("hqd,kd->hqk", q_low[q_h0:q_h1], k_low[kv_h])
+        scores = scores.masked_fill(~causal[None, :, :], float("-inf"))
+        probs = torch.softmax(scores.float() * softmax_scale, dim=-1)
+        keep = (probs > threshold).any(dim=0)
+
+        if keep_mass >= 1.0:
+            keep |= causal
+        elif keep_mass > 0:
+            sorted_probs, sorted_idx = torch.sort(probs.float(), dim=-1, descending=True)
+            cumsum = torch.cumsum(sorted_probs, dim=-1)
+            mass_keep_sorted = cumsum <= keep_mass
+            mass_keep_sorted[..., 0] = True
+            first_over = torch.argmax(
+                (cumsum >= keep_mass).to(torch.int32), dim=-1, keepdim=True
+            )
+            mass_keep_sorted.scatter_(-1, first_over, True)
+            mass_keep = torch.zeros_like(probs, dtype=torch.bool)
+            mass_keep.scatter_(-1, sorted_idx, mass_keep_sorted)
+            keep |= mass_keep.any(dim=0)
+
+        if keep_ratio > 0 or min_keep_blocks > 0:
+            topk = max(min_keep_blocks, int(kv_tiles * keep_ratio))
+            topk = max(1, min(topk, kv_tiles))
+            _, topk_idx = torch.topk(scores.float(), k=topk, dim=-1)
+            topk_keep = torch.zeros_like(scores, dtype=torch.bool)
+            topk_keep.scatter_(-1, topk_idx, True)
+            keep |= topk_keep.any(dim=0)
+        keep_per_kv[kv_h] = keep
+
+    keep_per_kv &= causal[None, :, :]
+    q_tile_abs = (
+        context_len + torch.arange(q_blocks, device=q_seq.device) * mask_block_n
+    ) // mask_block_n
+    k_idx = torch.arange(kv_tiles, device=q_seq.device)
+    local_blocks = max(0, int(envs.VLLM_FLASH_V100_BFLA_LOCAL_BLOCKS))
+    local = (k_idx[None, :] <= q_tile_abs[:, None]) & (
+        k_idx[None, :] >= q_tile_abs[:, None] - local_blocks
+    )
+    keep_per_kv |= local[None, :, :]
+    keep_per_kv[:, :, 0] = True
+
+    spec_stride = int(envs.VLLM_FLASH_V100_BFLA_SPEC_STRIDE)
+    if spec_stride > 0:
+        dropped = causal[None, :, :] & ~keep_per_kv
+        q_idx = torch.arange(q_blocks, device=q_seq.device, dtype=torch.int64)[:, None]
+        k_idx_i64 = torch.arange(kv_tiles, device=q_seq.device, dtype=torch.int64)[
+            None, :
+        ]
+        stride_keep = (
+            (q_idx * 131 + k_idx_i64 * 17 + int(envs.VLLM_FLASH_V100_BFLA_SPEC_SEED))
+            % spec_stride
+        ) == 0
+        keep_per_kv |= dropped & stride_keep[None, :, :]
+
+    spec_prob = float(envs.VLLM_FLASH_V100_BFLA_SPEC_PROB)
+    if spec_prob > 0:
+        prob = max(0.0, min(spec_prob, 1.0))
+        dropped = causal[None, :, :] & ~keep_per_kv
+        if prob >= 1.0:
+            keep_per_kv |= dropped
+        else:
+            q_idx = torch.arange(q_blocks, device=q_seq.device, dtype=torch.int64)[
+                None, :, None
+            ]
+            k_idx_i64 = torch.arange(kv_tiles, device=q_seq.device, dtype=torch.int64)[
+                None, None, :
+            ]
+            h_idx = torch.arange(num_kv_heads, device=q_seq.device, dtype=torch.int64)[
+                :, None, None
+            ]
+            hashed = (
+                (q_idx + 1) * 1103515245
+                + (k_idx_i64 + 1) * 12345
+                + (h_idx + 1) * 2654435761
+                + int(envs.VLLM_FLASH_V100_BFLA_SPEC_SEED)
+            ) & 0x7FFFFFFF
+            random_keep = (hashed % 1000000) < int(prob * 1000000)
+            keep_per_kv |= dropped & random_keep
+
+    return keep_per_kv.to(torch.int32).unsqueeze(0).contiguous()
 
 
 def _torch_attention_reference(
@@ -1301,10 +1673,13 @@ class FlashAttnV100Impl(TritonAttentionImpl):
         super().__init__(*args, **kwargs)
         (
             self.flash_attn_func,
+            self.flash_attn_bhmd_func,
             self.flash_attn_decode_paged,
             self.flash_attn_decode_paged_wmma,
             self.flash_attn_prefill_paged,
             self.flash_attn_prefill_paged_bhmd,
+            self.flash_attn_prefill_paged_bfla,
+            self.flash_attn_prefill_paged_splitkv,
         ) = _get_flash_ops()
         # V100 FA2 kernels consume fp16 Q. FP8 KV cache support is implemented
         # as storage compression only, with K/V dequantized inside FA2 kernels.
@@ -1331,6 +1706,37 @@ class FlashAttnV100Impl(TritonAttentionImpl):
             and paged_prefill_enable != "0"
             and not paged_prefill_disable
         )
+        self.use_flash_v100_prefill_splitkv = (
+            self.flash_attn_prefill_paged_splitkv is not None
+            and envs.VLLM_FLASH_V100_PREFILL_SPLIT_KV
+            and self.use_flash_v100_prefill_paged
+        )
+        self.use_flash_v100_prefill_bfla = (
+            self.flash_attn_prefill_paged_bfla is not None
+            and envs.VLLM_FLASH_V100_BFLA_PREFILL
+            and self.use_flash_v100_prefill_paged
+        )
+        self.use_flash_v100_prefill_contig_dense = (
+            self.flash_attn_func is not None
+            and self.use_flash_v100_prefill_paged
+            and envs.VLLM_FLASH_V100_PREFILL_CONTIG_DENSE
+        )
+        self.prefill_contig_dense_min_q = (
+            envs.VLLM_FLASH_V100_PREFILL_CONTIG_DENSE_MIN_Q
+        )
+        self.prefill_contig_dense_min_kv = (
+            envs.VLLM_FLASH_V100_PREFILL_CONTIG_DENSE_MIN_KV
+        )
+        self.prefill_contig_dense_allow_copy = (
+            envs.VLLM_FLASH_V100_PREFILL_CONTIG_DENSE_ALLOW_COPY
+        )
+        self.prefill_split_kv_tokens = envs.VLLM_FLASH_V100_PREFILL_SPLIT_KV_TOKENS
+        self.prefill_split_kv_min_q = envs.VLLM_FLASH_V100_PREFILL_SPLIT_KV_MIN_Q
+        self.prefill_split_kv_max_q = envs.VLLM_FLASH_V100_PREFILL_SPLIT_KV_MAX_Q
+        self.prefill_split_kv_min_kv = envs.VLLM_FLASH_V100_PREFILL_SPLIT_KV_MIN_KV
+        self.prefill_bfla_min_q = envs.VLLM_FLASH_V100_BFLA_MIN_Q
+        self.prefill_bfla_min_kv = envs.VLLM_FLASH_V100_BFLA_MIN_KV
+        self.prefill_bfla_mask_block_n = envs.VLLM_FLASH_V100_BFLA_MASK_BLOCK_N
         self.use_prefill_paged_cache = (
             os.getenv("VLLM_FLASH_V100_PREFILL_USE_PAGED_CACHE", "0") == "1"
         )
@@ -3290,6 +3696,117 @@ class FlashAttnV100Impl(TritonAttentionImpl):
         )
         return output
 
+    def _should_use_prefill_splitkv(
+        self,
+        *,
+        q_len: int,
+        seq_len: int,
+        head_dim: int,
+        key_cache: torch.Tensor,
+        causal: bool,
+    ) -> bool:
+        if not self.use_flash_v100_prefill_splitkv:
+            return False
+        if self.flash_attn_prefill_paged_splitkv is None:
+            return False
+        if not causal:
+            return False
+        if head_dim != 256:
+            return False
+        if key_cache.dtype != torch.float16:
+            return False
+        if q_len < self.prefill_split_kv_min_q:
+            return False
+        if self.prefill_split_kv_max_q > 0 and q_len > self.prefill_split_kv_max_q:
+            return False
+        if seq_len < self.prefill_split_kv_min_kv:
+            return False
+        return seq_len > self.prefill_split_kv_tokens
+
+    def _should_use_prefill_bfla(
+        self,
+        *,
+        q_len: int,
+        seq_len: int,
+        head_dim: int,
+        key_cache: torch.Tensor,
+        causal: bool,
+        window_size: tuple[int, int],
+    ) -> bool:
+        if not self.use_flash_v100_prefill_bfla:
+            return False
+        if self.flash_attn_prefill_paged_bfla is None:
+            return False
+        if not causal or window_size != (-1, -1):
+            return False
+        if head_dim != 256:
+            return False
+        if key_cache.dtype != torch.float16:
+            return False
+        if q_len < self.prefill_bfla_min_q:
+            return False
+        if seq_len < self.prefill_bfla_min_kv:
+            return False
+        return self.prefill_bfla_mask_block_n > 0
+
+    def _should_use_prefill_contig_dense(
+        self,
+        *,
+        q_len: int,
+        seq_len: int,
+        head_dim: int,
+        key_cache: torch.Tensor,
+        causal: bool,
+        window_size: tuple[int, int],
+    ) -> bool:
+        if not self.use_flash_v100_prefill_contig_dense:
+            return False
+        if not causal or window_size != (-1, -1):
+            return False
+        if head_dim != 256:
+            return False
+        if key_cache.dtype != torch.float16:
+            return False
+        if q_len < self.prefill_contig_dense_min_q:
+            return False
+        return seq_len >= self.prefill_contig_dense_min_kv
+
+    def _run_prefill_paged_call(
+        self,
+        *,
+        route: str,
+        q_len: int,
+        seq_len: int,
+        heads_q: int,
+        heads_kv: int,
+        head_dim: int,
+        block_size: int,
+        fn: Callable[[], torch.Tensor],
+    ) -> torch.Tensor:
+        if not envs.VLLM_FLASH_V100_PREFILL_CHUNK_PROFILE:
+            return fn()
+
+        start_event = torch.cuda.Event(enable_timing=True)
+        end_event = torch.cuda.Event(enable_timing=True)
+        start_event.record()
+        out = fn()
+        end_event.record()
+        torch.cuda.synchronize()
+        logger.info(
+            "FLASH_ATTN_V100 prefill chunk profile: route=%s q_len=%d "
+            "seq_len=%d heads_q=%d heads_kv=%d head_dim=%d block_size=%d "
+            "elapsed_ms=%.3f",
+            route,
+            q_len,
+            seq_len,
+            heads_q,
+            heads_kv,
+            head_dim,
+            block_size,
+            float(start_event.elapsed_time(end_event)),
+        )
+        return out
+
     def _flash_v100_prefill_with_prefix(
         self,
         layer: torch.nn.Module,
@@ -3302,6 +3819,9 @@ class FlashAttnV100Impl(TritonAttentionImpl):
     ) -> torch.Tensor:
         """Prefill path for prefix/chunked context via gathered contiguous KV."""
         global _logged_dflash_prefix_dump
+        global _logged_prefill_prefix_bfla
+        global _logged_prefill_prefix_contig_dense
+        global _logged_prefill_prefix_splitkv
         global _logged_prefill_compare, _logged_prefill_smallq_decode
         causal = getattr(attn_metadata, "causal", True)
         window_size = self._flash_v100_window_size(causal)
@@ -3376,24 +3896,231 @@ class FlashAttnV100Impl(TritonAttentionImpl):
                 continue
 
             if self.use_flash_v100_prefill_paged:
-                out_seq = self.flash_attn_prefill_paged(
-                    query[start:end].unsqueeze(0),
-                    key_cache,
-                    value_cache,
-                    attn_metadata.block_table[i : i + 1],
-                    attn_metadata.seq_lens[i : i + 1],
-                    softmax_scale=self.scale,
-                    kv_cache_dtype=self.kv_cache_dtype,
-                    k_scale=float(layer._k_scale_float),
-                    v_scale=float(layer._v_scale_float),
+                q_len = end - start
+                seq_len = int(seq_lens[i].item())
+                q_seq = query[start:end].unsqueeze(0)
+                bfla_block_mask = None
+                use_bfla = self._should_use_prefill_bfla(
+                    q_len=q_len,
+                    seq_len=seq_len,
+                    head_dim=head_dim,
+                    key_cache=key_cache,
                     causal=causal,
                     window_size=window_size,
                 )
+                if use_bfla:
+                    bfla_block_mask = _build_bfla_block_mask_for_seq(
+                        q_seq,
+                        key_cache,
+                        attn_metadata.block_table[i],
+                        seq_len=seq_len,
+                        block_size=block_size,
+                        mask_block_n=self.prefill_bfla_mask_block_n,
+                        softmax_scale=self.scale,
+                    )
+                contig_dense_kv = None
+                contig_dense_kv_bhmd = None
+                if bfla_block_mask is None and self._should_use_prefill_contig_dense(
+                    q_len=q_len,
+                    seq_len=seq_len,
+                    head_dim=head_dim,
+                    key_cache=key_cache,
+                    causal=causal,
+                    window_size=window_size,
+                ):
+                    if (
+                        self.prefill_contig_dense_allow_copy
+                        and self.flash_attn_bhmd_func is not None
+                    ):
+                        contig_dense_kv_bhmd = _contiguous_paged_kv_bhmd(
+                            key_cache,
+                            value_cache,
+                            attn_metadata.block_table[i],
+                            seq_len,
+                            block_size,
+                            attn_metadata,
+                            i,
+                        )
+                    if contig_dense_kv_bhmd is None:
+                        contig_dense_kv = _contiguous_paged_kv_view(
+                            key_cache,
+                            value_cache,
+                            attn_metadata.block_table[i],
+                            seq_len,
+                            block_size,
+                            attn_metadata,
+                            i,
+                            self.prefill_contig_dense_allow_copy,
+                        )
+                use_splitkv = self._should_use_prefill_splitkv(
+                    q_len=q_len,
+                    seq_len=seq_len,
+                    head_dim=head_dim,
+                    key_cache=key_cache,
+                    causal=causal,
+                )
+                if bfla_block_mask is not None:
+                    if not _logged_prefill_prefix_bfla:
+                        logger.info(
+                            "FLASH_ATTN_V100 prefix prefill BFLA sparse path "
+                            "active (min_q=%d min_kv=%d mask_block_n=%d "
+                            "keep_mass=%.4f local_blocks=%d pool=%s).",
+                            self.prefill_bfla_min_q,
+                            self.prefill_bfla_min_kv,
+                            self.prefill_bfla_mask_block_n,
+                            envs.VLLM_FLASH_V100_BFLA_KEEP_MASS,
+                            envs.VLLM_FLASH_V100_BFLA_LOCAL_BLOCKS,
+                            envs.VLLM_FLASH_V100_BFLA_POOL,
+                        )
+                        _logged_prefill_prefix_bfla = True
+                    _record_route("prefill_prefix_bfla")
+                    out_seq = self._run_prefill_paged_call(
+                        route="prefill_prefix_bfla",
+                        q_len=q_len,
+                        seq_len=seq_len,
+                        heads_q=query.shape[1],
+                        heads_kv=num_kv_heads,
+                        head_dim=head_dim,
+                        block_size=block_size,
+                        fn=lambda: self.flash_attn_prefill_paged_bfla(
+                            q_seq,
+                            key_cache,
+                            value_cache,
+                            attn_metadata.block_table[i : i + 1],
+                            attn_metadata.seq_lens[i : i + 1],
+                            bfla_block_mask,
+                            self.prefill_bfla_mask_block_n,
+                            softmax_scale=self.scale,
+                            kv_cache_dtype=self.kv_cache_dtype,
+                            k_scale=float(layer._k_scale_float),
+                            v_scale=float(layer._v_scale_float),
+                            causal=causal,
+                            window_size=window_size,
+                        ),
+                    )
+                elif contig_dense_kv_bhmd is not None:
+                    if not _logged_prefill_prefix_contig_dense:
+                        logger.info(
+                            "FLASH_ATTN_V100 prefix prefill contiguous dense "
+                            "BHMD path active (min_q=%d min_kv=%d allow_copy=%s).",
+                            self.prefill_contig_dense_min_q,
+                            self.prefill_contig_dense_min_kv,
+                            str(self.prefill_contig_dense_allow_copy),
+                        )
+                        _logged_prefill_prefix_contig_dense = True
+                    k_bhmd, v_bhmd = contig_dense_kv_bhmd
+                    q_bhmd = q_seq.permute(0, 2, 1, 3).contiguous()
+                    _record_route("prefill_prefix_contig_dense_bhmd")
+                    out_bhmd = self._run_prefill_paged_call(
+                        route="prefill_prefix_contig_dense_bhmd",
+                        q_len=q_len,
+                        seq_len=seq_len,
+                        heads_q=query.shape[1],
+                        heads_kv=num_kv_heads,
+                        head_dim=head_dim,
+                        block_size=block_size,
+                        fn=lambda: self.flash_attn_bhmd_func(
+                            q_bhmd,
+                            k_bhmd,
+                            v_bhmd,
+                            causal=causal,
+                            softmax_scale=self.scale,
+                            window_size=window_size,
+                        ),
+                    )
+                    out_view[start:end].copy_(out_bhmd.squeeze(0).permute(1, 0, 2))
+                    continue
+                elif contig_dense_kv is not None:
+                    if not _logged_prefill_prefix_contig_dense:
+                        logger.info(
+                            "FLASH_ATTN_V100 prefix prefill contiguous dense "
+                            "path active (min_q=%d min_kv=%d).",
+                            self.prefill_contig_dense_min_q,
+                            self.prefill_contig_dense_min_kv,
+                        )
+                        _logged_prefill_prefix_contig_dense = True
+                    k_dense, v_dense = contig_dense_kv
+                    _record_route("prefill_prefix_contig_dense")
+                    out_seq = self._run_prefill_paged_call(
+                        route="prefill_prefix_contig_dense",
+                        q_len=q_len,
+                        seq_len=seq_len,
+                        heads_q=query.shape[1],
+                        heads_kv=num_kv_heads,
+                        head_dim=head_dim,
+                        block_size=block_size,
+                        fn=lambda: self.flash_attn_func(
+                            q_seq,
+                            k_dense,
+                            v_dense,
+                            causal=causal,
+                            softmax_scale=self.scale,
+                            window_size=window_size,
+                        ),
+                    )
+                elif use_splitkv:
+                    if not _logged_prefill_prefix_splitkv:
+                        logger.info(
+                            "FLASH_ATTN_V100 prefix prefill split-KV path active "
+                            "(split_kv_tokens=%d min_q=%d max_q=%d min_kv=%d).",
+                            self.prefill_split_kv_tokens,
+                            self.prefill_split_kv_min_q,
+                            self.prefill_split_kv_max_q,
+                            self.prefill_split_kv_min_kv,
+                        )
+                        _logged_prefill_prefix_splitkv = True
+                    _record_route("prefill_prefix_splitkv")
+                    out_seq = self._run_prefill_paged_call(
+                        route="prefill_prefix_splitkv",
+                        q_len=q_len,
+                        seq_len=seq_len,
+                        heads_q=query.shape[1],
+                        heads_kv=num_kv_heads,
+                        head_dim=head_dim,
+                        block_size=block_size,
+                        fn=lambda: self.flash_attn_prefill_paged_splitkv(
+                            q_seq,
+                            key_cache,
+                            value_cache,
+                            attn_metadata.block_table[i : i + 1],
+                            attn_metadata.seq_lens[i : i + 1],
+                            softmax_scale=self.scale,
+                            kv_cache_dtype=self.kv_cache_dtype,
+                            k_scale=float(layer._k_scale_float),
+                            v_scale=float(layer._v_scale_float),
+                            causal=causal,
+                            window_size=window_size,
+                            split_kv_tokens=self.prefill_split_kv_tokens,
+                            max_seq_len_hint=seq_len,
+                        ),
+                    )
+                else:
+                    out_seq = self._run_prefill_paged_call(
+                        route="prefill_prefix_paged",
+                        q_len=q_len,
+                        seq_len=seq_len,
+                        heads_q=query.shape[1],
+                        heads_kv=num_kv_heads,
+                        head_dim=head_dim,
+                        block_size=block_size,
+                        fn=lambda: self.flash_attn_prefill_paged(
+                            q_seq,
+                            key_cache,
+                            value_cache,
+                            attn_metadata.block_table[i : i + 1],
+                            attn_metadata.seq_lens[i : i + 1],
+                            softmax_scale=self.scale,
+                            kv_cache_dtype=self.kv_cache_dtype,
+                            k_scale=float(layer._k_scale_float),
+                            v_scale=float(layer._v_scale_float),
+                            causal=causal,
+                            window_size=window_size,
+                        ),
+                    )
                 need_dense_debug = (
                     (debug_compare and not _logged_prefill_compare) or dflash_dump
                 )
                 if need_dense_debug:
-                    seq_len = int(seq_lens[i].item())
                     k_cont, v_cont = _extract_contiguous_kv_from_paged_cache(
                         kv_cache=kv_cache,
                         block_table=attn_metadata.block_table[i : i + 1],
@@ -3662,6 +4389,12 @@ class FlashAttnV100Backend(TritonAttentionBackend):
     @staticmethod
     def get_name() -> str:
         return "FLASH_ATTN_V100"
+
+    @staticmethod
+    def get_supported_kernel_block_sizes():
+        if envs.VLLM_FLASH_V100_KERNEL_BLOCK_SIZE16:
+            return [16]
+        return TritonAttentionBackend.get_supported_kernel_block_sizes()
 
     @classmethod
     def supports_non_causal(cls) -> bool:

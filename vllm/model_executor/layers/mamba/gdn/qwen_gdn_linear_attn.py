@@ -70,6 +70,7 @@ from vllm.utils.torch_utils import (
 from vllm.v1.attention.backends.gdn_attn import (
     GDNAttentionMetadata,
     gdn_spec_metadata_tensors,
+    get_registered_gdn_spec_metadata_tensors,
 )
 from vllm.v1.attention.backends.utils import compute_causal_conv1d_metadata
 
@@ -151,6 +152,16 @@ def _sm70_flashqla_decode_warmup_enabled() -> bool:
     return raw.strip().lower() not in ("0", "false", "no", "off", "")
 
 
+def _sm70_mixed_qkv_decode_layout(mixed_qkv: torch.Tensor) -> str:
+    if mixed_qkv.dim() != 2 or mixed_qkv.stride(1) != 1:
+        return "unsupported"
+    if mixed_qkv.stride(0) < mixed_qkv.shape[1]:
+        return "unsupported"
+    if mixed_qkv.stride(0) == mixed_qkv.shape[1]:
+        return "compact"
+    return "row_strided"
+
+
 def _sm70_gdn_prefill_profile_start() -> float | None:
     if not _sm70_gdn_prefill_profile_enabled():
         return None
@@ -209,7 +220,11 @@ def _sm70_log_flashqla_decode_route(
         return
     if torch.compiler.is_compiling():
         return
-    key = f"{os.getpid()}:{stage}:{decision}:{reason}:{layer_name}"
+    mixed_layout = _sm70_mixed_qkv_decode_layout(mixed_qkv)
+    key = (
+        f"{os.getpid()}:{stage}:{decision}:{reason}:"
+        f"{mixed_layout}:{layer_name}"
+    )
     count = _SM70_FLASHQLA_DECODE_ROUTE_DEBUG_COUNTS.get(key, 0)
     if count >= 1:
         return
@@ -228,7 +243,8 @@ def _sm70_log_flashqla_decode_route(
         "SM70 FlashQLA GDN decode route debug: layer=%s stage=%s "
         "decision=%s reason=%s capture=%s tokens=%s "
         "mixed_shape=%s mixed_dtype=%s mixed_stride=%s "
-        "mixed_contiguous=%s state_indices=%s",
+        "mixed_contiguous=%s mixed_layout=%s logical_width=%s "
+        "row_stride=%s state_indices=%s",
         layer_name,
         stage,
         decision,
@@ -239,6 +255,9 @@ def _sm70_log_flashqla_decode_route(
         mixed_qkv.dtype,
         tuple(mixed_qkv.stride()),
         mixed_qkv.is_contiguous(),
+        mixed_layout,
+        mixed_qkv.shape[1] if mixed_qkv.dim() == 2 else None,
+        mixed_qkv.stride(0) if mixed_qkv.dim() == 2 else None,
         state_desc,
     )
 
@@ -247,8 +266,9 @@ def _sm70_dump_gdn_core_tensor(
     label: str,
     layer_name: LayerNameType,
     tensor: torch.Tensor,
+    source: str = "core",
 ) -> None:
-    _sm70_gdn_graph_buffer_copy(label, layer_name, tensor, "core")
+    _sm70_gdn_graph_buffer_copy(label, layer_name, tensor, source)
     if torch.cuda.is_current_stream_capturing():
         return
     dump_dir = os.getenv("VLLM_SM70_DUMP_GDN_CORE_DIR")
@@ -290,6 +310,11 @@ def _sm70_dump_gdn_core_tensor(
             "label": label,
             "layer_name": str(layer_name),
             "shape": tuple(tensor.shape),
+            "stride": tuple(tensor.stride()),
+            "storage_offset": int(tensor.storage_offset()),
+            "data_ptr": int(tensor.data_ptr()),
+            "is_contiguous": bool(tensor.is_contiguous()),
+            "source": source,
             "dtype": str(tensor.dtype),
             "tensor": tensor.detach().cpu(),
         },
@@ -356,6 +381,36 @@ def _sm70_qwen_gdn_has_active_spec_decode(
     )
 
 
+def _sm70_qwen_gdn_metadata_has_active_spec(
+    attn_metadata: GDNAttentionMetadata | None,
+) -> bool:
+    return (
+        attn_metadata is not None
+        and attn_metadata.spec_sequence_masks is not None
+        and attn_metadata.num_spec_decodes > 0
+    )
+
+
+def _sm70_assert_standard_core_not_active_spec(
+    layer_name: LayerNameType,
+    attn_metadata: GDNAttentionMetadata | None,
+) -> None:
+    if os.getenv("VLLM_SM70_QWEN_GDN_ASSERT_NO_ACTIVE_SPEC_STANDARD") != "1":
+        return
+    if not envs.VLLM_SM70_QWEN_GDN_SPEC_CORE_OP:
+        return
+    if not _sm70_qwen_gdn_metadata_has_active_spec(attn_metadata):
+        return
+    raise RuntimeError(
+        "SM70 Qwen GDN active spec decode reached "
+        "qwen_gdn_attention_core_standard while "
+        "VLLM_SM70_QWEN_GDN_SPEC_CORE_OP=1 "
+        f"(layer={layer_name}, "
+        f"num_spec_decodes={attn_metadata.num_spec_decodes}, "
+        f"num_spec_decode_tokens={attn_metadata.num_spec_decode_tokens})"
+    )
+
+
 def _sm70_qwen_gdn_full_forward_enabled(
     layer_name: LayerNameType,
     *,
@@ -363,13 +418,19 @@ def _sm70_qwen_gdn_full_forward_enabled(
     disabled: bool,
     auto_enabled: bool,
 ) -> bool:
+    del layer_name
     if disabled:
         return False
     if force_enabled:
         return True
-    if not auto_enabled:
-        return False
-    return _sm70_qwen_gdn_has_active_spec_decode(layer_name)
+    # Same compile-time constraint as the split spec-core boundary: this guard
+    # is evaluated while the Qwen GDN layer is being compiled, and the first
+    # trace commonly comes from a profile/prefill batch without active spec
+    # metadata.  If we re-check per-batch active metadata here, the quality
+    # guard is captured as disabled and active verifier replays fall through to
+    # the split path.  The caller only sets auto_enabled for MTP engines, so
+    # no-MTP decode still keeps the lightweight standard path.
+    return auto_enabled
 
 
 def _sm70_qwen_gdn_input_core_boundary_enabled() -> bool:
@@ -383,7 +444,15 @@ def _sm70_qwen_gdn_spec_core_enabled(
     *,
     auto_enabled: bool,
 ) -> bool:
-    return auto_enabled and _sm70_qwen_gdn_has_active_spec_decode(layer_name)
+    del layer_name
+    # This guard is evaluated while the Qwen GDN layer is being compiled.  A
+    # per-replay Python active-spec check can be captured from an ordinary
+    # decode/profile batch and then reused for the active MTP verifier graph,
+    # sending verifier rows through the standard recurrent core.  Keep the
+    # compile-time branch stable when the MTP engine explicitly arms this
+    # boundary; the custom op itself inspects runtime metadata and falls back
+    # to standard semantics for non-active batches.
+    return auto_enabled
 
 
 def _qwen_gdn_run_recurrent_core(
@@ -537,17 +606,32 @@ def _qwen_gdn_metadata_tensors(
     torch.Tensor,
     torch.Tensor,
 ]:
+    resolved_layer_name = _resolve_layer_name(layer_name)
     try:
         forward_context = get_forward_context()
     except AssertionError:
-        return gdn_spec_metadata_tensors(None, device)
+        return get_registered_gdn_spec_metadata_tensors(resolved_layer_name, device)
     attn_metadata_raw = forward_context.attn_metadata
     if not isinstance(attn_metadata_raw, dict):
-        return gdn_spec_metadata_tensors(None, device)
-    attn_metadata = attn_metadata_raw.get(_resolve_layer_name(layer_name))
+        return get_registered_gdn_spec_metadata_tensors(resolved_layer_name, device)
+    attn_metadata = attn_metadata_raw.get(resolved_layer_name)
     if not isinstance(attn_metadata, GDNAttentionMetadata):
-        return gdn_spec_metadata_tensors(None, device)
-    return gdn_spec_metadata_tensors(attn_metadata, device)
+        return get_registered_gdn_spec_metadata_tensors(resolved_layer_name, device)
+    tensors = gdn_spec_metadata_tensors(attn_metadata, device)
+    missing_core_spec_tensors = (
+        tensors[2].numel() == 0 or tensors[3].numel() == 0 or tensors[7].numel() == 0
+    )
+    if missing_core_spec_tensors:
+        registered_tensors = get_registered_gdn_spec_metadata_tensors(
+            resolved_layer_name, device
+        )
+        if (
+            registered_tensors[2].numel() > 0
+            and registered_tensors[3].numel() > 0
+            and registered_tensors[7].numel() > 0
+        ):
+            return registered_tensors
+    return tensors
 
 
 def _qwen_gdn_non_spec_metadata_tensors(
@@ -581,6 +665,8 @@ def _sm70_gdn_graph_buffer_copy(
     tensor: torch.Tensor,
     source: str,
 ) -> None:
+    if torch.compiler.is_compiling():
+        return
     dump_dir = os.getenv("VLLM_SM70_DUMP_GDN_GRAPH_DIR")
     if os.getenv("VLLM_SM70_DUMP_GDN_GRAPH_BUFFERS") != "1" or not dump_dir:
         return
@@ -617,6 +703,13 @@ def _sm70_gdn_graph_buffer_copy(
 
     key = f"{os.getpid()}:{source}:{layer_name}:{label}:{shape}"
     buffer = _SM70_GDN_GRAPH_BUFFERS.get(key)
+    tensor_meta = {
+        "input_shape": shape,
+        "input_stride": tuple(tensor.stride()),
+        "input_storage_offset": int(tensor.storage_offset()),
+        "input_data_ptr": int(tensor.data_ptr()),
+        "input_is_contiguous": bool(tensor.is_contiguous()),
+    }
     if (
         buffer is None
         or tuple(buffer.shape) != shape
@@ -633,7 +726,10 @@ def _sm70_gdn_graph_buffer_copy(
             "shape": shape,
             "dtype": str(tensor.dtype),
             "pid": os.getpid(),
+            **tensor_meta,
         }
+    else:
+        _SM70_GDN_GRAPH_META[key].update(tensor_meta)
     buffer.copy_(tensor)
 
 
@@ -900,6 +996,10 @@ def _sm70_gdn_projection_dump_impl(
                     "label": label,
                     "layer_name": str(layer_name),
                     "shape": tuple(tensor.shape),
+                    "stride": tuple(tensor.stride()),
+                    "storage_offset": int(tensor.storage_offset()),
+                    "data_ptr": int(tensor.data_ptr()),
+                    "is_contiguous": bool(tensor.is_contiguous()),
                     "dtype": str(tensor.dtype),
                     "tensor": tensor.detach().cpu(),
                 },
@@ -2423,7 +2523,7 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
         if (
             not mixed_qkv.is_cuda
             or mixed_qkv.dtype != torch.float16
-            or not mixed_qkv.is_contiguous()
+            or _sm70_mixed_qkv_decode_layout(mixed_qkv) == "unsupported"
         ):
             reason = "mixed_qkv_contract"
             _sm70_log_flashqla_decode_route(
@@ -2628,8 +2728,15 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
         output: torch.Tensor,
         num_tokens: int,
     ) -> torch.Tensor:
+        layer_name = _encode_layer_name(self.prefix)
         proj_out = self._compute_output_projection(core_attn_out, z, num_tokens)
         output[:num_tokens] = proj_out
+        _sm70_gdn_graph_buffer_copy(
+            "proj_output_after_write",
+            layer_name,
+            output[:num_tokens],
+            "proj",
+        )
         return proj_out
 
     def forward_hip(
@@ -3040,29 +3147,41 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
         finally:
             conv_state_line.zero_()
 
-        dummy_decode_inputs = [
-            torch.randn(1, conv_weights.shape[0], device=device, dtype=dtype)
-        ]
         qkvz_width = conv_weights.shape[0] + self.value_dim // self.tp_size
-        if qkvz_width > conv_weights.shape[0]:
-            # The real no-MTP decode path slices qkv out of qkvz, so the
-            # logical [1, qkv_dim] tensor has row stride qkvz_width.
-            dummy_qkvz = torch.randn(1, qkvz_width, device=device, dtype=dtype)
-            dummy_decode_inputs.append(dummy_qkvz[:, : conv_weights.shape[0]])
         try:
-            for dummy_decode_in in dummy_decode_inputs:
-                # The update Triton kernel specializes on num_cache_lines and
-                # input strides, so warm both full KV cache and projection-slice
-                # stride instead of only a compact [1, qkv_dim] tensor.
-                causal_conv1d_update(
-                    dummy_decode_in,
-                    conv_state,
-                    conv_weights,
-                    self.conv1d.bias,
-                    self.activation,
-                    conv_state_indices=cache_indices,
-                    validate_data=True,
+            for decode_tokens in (1, 2):
+                dummy_decode_inputs = [
+                    torch.randn(
+                        decode_tokens,
+                        conv_weights.shape[0],
+                        device=device,
+                        dtype=dtype,
+                    )
+                ]
+                if qkvz_width > conv_weights.shape[0]:
+                    # The real no-MTP decode path slices qkv out of qkvz, so the
+                    # logical [T, qkv_dim] tensor has row stride qkvz_width.
+                    dummy_qkvz = torch.randn(
+                        decode_tokens, qkvz_width, device=device, dtype=dtype
+                    )
+                    dummy_decode_inputs.append(dummy_qkvz[:, : conv_weights.shape[0]])
+                decode_cache_indices = torch.zeros(
+                    decode_tokens, device=device, dtype=torch.int32
                 )
+                for dummy_decode_in in dummy_decode_inputs:
+                    # The update Triton kernel specializes on num_cache_lines and
+                    # input strides, so warm both full KV cache and
+                    # projection-slice stride instead of only a compact tensor.
+                    causal_conv1d_update(
+                        dummy_decode_in,
+                        conv_state,
+                        conv_weights,
+                        self.conv1d.bias,
+                        self.activation,
+                        conv_state_indices=decode_cache_indices,
+                        validate_data=True,
+                    )
+                    conv_state_line.zero_()
         except Exception:
             logger.warning(
                 "SM70 GDN causal-conv update warmup failed for layer %s. "
@@ -3427,128 +3546,89 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
                 chunk_offsets,
             )
 
-        decode_tokens = 1
-        dummy_decode_mixed_qkv = torch.zeros(
-            decode_tokens,
-            qkv_or_qkvz.shape[-1] - v_dim,
-            device=device,
-            dtype=dtype,
-        )
-        dummy_decode_a = torch.zeros(
-            decode_tokens, num_v_heads, device=device, dtype=dtype
-        )
-        dummy_decode_b = torch.zeros(
-            decode_tokens, num_v_heads, device=device, dtype=dtype
-        )
-        dummy_decode_state = torch.zeros(
-            1,
-            num_v_heads,
-            self.head_v_dim,
-            self.head_k_dim,
-            device=device,
-            dtype=state_dtype,
-        )
-        dummy_decode_out = torch.empty(
-            decode_tokens,
-            1,
-            num_v_heads,
-            self.head_v_dim,
-            device=device,
-            dtype=dtype,
-        )
-        dummy_decode_indices = torch.zeros(
-            decode_tokens, device=device, dtype=torch.int32
-        )
-        dummy_decode_query_start_loc = torch.arange(
-            decode_tokens + 1, device=device, dtype=torch.int32
-        )
-        trace_decode_warmup = _sm70_profile_trace_enabled()
-        mixed_decode_warmup_start = time.perf_counter()
-        if trace_decode_warmup:
-            logger.info(
-                "SM70 profile trace: GDN mixed-QKV decode warmup enter "
-                "layer=%s tokens=%d mixed_shape=%s",
-                self.prefix,
-                decode_tokens,
-                tuple(dummy_decode_mixed_qkv.shape),
-            )
-        try:
-            fused_sigmoid_gating_delta_rule_update_mixed_qkv_out(
-                A_log=self.A_log,
-                a=dummy_decode_a,
-                b=dummy_decode_b,
-                dt_bias=self.dt_bias,
-                mixed_qkv=dummy_decode_mixed_qkv,
-                num_q_heads=self.num_k_heads // self.tp_size,
-                num_v_heads=num_v_heads,
-                head_k_dim=self.head_k_dim,
-                head_v_dim=self.head_v_dim,
-                scale=self.head_k_dim**-0.5,
-                initial_state=dummy_decode_state,
-                out=dummy_decode_out,
-                cu_seqlens=dummy_decode_query_start_loc,
-                ssm_state_indices=dummy_decode_indices,
-                use_qk_l2norm_in_kernel=True,
-            )
-        except Exception:
-            logger.warning(
-                "GDN mixed-QKV decode warmup failed for layer %s. "
-                "First inference may JIT "
-                "fused_sigmoid_gating_delta_rule_update_kernel.",
-                self.prefix,
-                exc_info=True,
-            )
-        else:
-            if trace_decode_warmup:
-                torch.cuda.synchronize()
-                logger.info(
-                    "SM70 profile trace: GDN mixed-QKV decode warmup exit "
-                    "layer=%s elapsed_ms=%.3f",
-                    self.prefix,
-                    (time.perf_counter() - mixed_decode_warmup_start) * 1000.0,
+        decode_qkv_dim = qkv_or_qkvz.shape[-1] - v_dim
+        for decode_tokens in (1, 2):
+            dummy_decode_views = [
+                torch.zeros(
+                    decode_tokens,
+                    decode_qkv_dim,
+                    device=device,
+                    dtype=dtype,
                 )
-            logger.debug(
-                "GDN mixed-QKV decode warmup completed for layer %s",
-                self.prefix,
-            )
-        if self._can_use_flashqla_decode(
-            dummy_decode_mixed_qkv,
-            dummy_decode_indices,
-            decode_tokens,
-            layer_name=_encode_layer_name(self.prefix),
-            stage="warmup",
-        ):
-            if not _sm70_flashqla_decode_warmup_enabled():
+            ]
+            if qkv_or_qkvz.shape[-1] > decode_qkv_dim:
+                dummy_decode_qkvz = torch.zeros(
+                    decode_tokens,
+                    qkv_or_qkvz.shape[-1],
+                    device=device,
+                    dtype=dtype,
+                )
+                dummy_decode_views.append(dummy_decode_qkvz[:, :decode_qkv_dim])
+            for dummy_decode_mixed_qkv in dummy_decode_views:
+                dummy_decode_a = torch.zeros(
+                    decode_tokens, num_v_heads, device=device, dtype=dtype
+                )
+                dummy_decode_b = torch.zeros(
+                    decode_tokens, num_v_heads, device=device, dtype=dtype
+                )
+                dummy_decode_state = torch.zeros(
+                    1,
+                    num_v_heads,
+                    self.head_v_dim,
+                    self.head_k_dim,
+                    device=device,
+                    dtype=state_dtype,
+                )
+                dummy_decode_out = torch.empty(
+                    decode_tokens,
+                    1,
+                    num_v_heads,
+                    self.head_v_dim,
+                    device=device,
+                    dtype=dtype,
+                )
+                dummy_decode_indices = torch.zeros(
+                    decode_tokens, device=device, dtype=torch.int32
+                )
+                dummy_decode_query_start_loc = torch.arange(
+                    decode_tokens + 1, device=device, dtype=torch.int32
+                )
+                trace_decode_warmup = _sm70_profile_trace_enabled()
+                mixed_decode_warmup_start = time.perf_counter()
                 if trace_decode_warmup:
                     logger.info(
-                        "SM70 profile trace: GDN FlashQLA decode warmup skip "
-                        "layer=%s reason=disabled",
-                        self.prefix,
-                    )
-            else:
-                flashqla_decode_warmup_start = time.perf_counter()
-                if trace_decode_warmup:
-                    logger.info(
-                        "SM70 profile trace: GDN FlashQLA decode warmup enter "
-                        "layer=%s tokens=%d",
+                        "SM70 profile trace: GDN mixed-QKV decode warmup enter "
+                        "layer=%s tokens=%d mixed_shape=%s mixed_stride=%s "
+                        "layout=%s",
                         self.prefix,
                         decode_tokens,
+                        tuple(dummy_decode_mixed_qkv.shape),
+                        tuple(dummy_decode_mixed_qkv.stride()),
+                        _sm70_mixed_qkv_decode_layout(dummy_decode_mixed_qkv),
                     )
                 try:
-                    self._forward_core_decode_flashqla(
-                        mixed_qkv=dummy_decode_mixed_qkv,
+                    fused_sigmoid_gating_delta_rule_update_mixed_qkv_out(
+                        A_log=self.A_log,
                         a=dummy_decode_a,
                         b=dummy_decode_b,
-                        ssm_state=dummy_decode_state,
-                        state_indices=dummy_decode_indices,
-                        num_decode_tokens=decode_tokens,
+                        dt_bias=self.dt_bias,
+                        mixed_qkv=dummy_decode_mixed_qkv,
+                        num_q_heads=self.num_k_heads // self.tp_size,
+                        num_v_heads=num_v_heads,
+                        head_k_dim=self.head_k_dim,
+                        head_v_dim=self.head_v_dim,
+                        scale=self.head_k_dim**-0.5,
+                        initial_state=dummy_decode_state,
+                        out=dummy_decode_out,
                         cu_seqlens=dummy_decode_query_start_loc,
-                        core_attn_out=dummy_decode_out.squeeze(1),
+                        ssm_state_indices=dummy_decode_indices,
+                        use_qk_l2norm_in_kernel=True,
                     )
                 except Exception:
                     logger.warning(
-                        "GDN FlashQLA decode warmup failed for layer %s. "
-                        "First inference may JIT flash_qla_sm70_gdn.",
+                        "GDN mixed-QKV decode warmup failed for layer %s. "
+                        "First inference may JIT "
+                        "fused_sigmoid_gating_delta_rule_update_kernel.",
                         self.prefix,
                         exc_info=True,
                     )
@@ -3556,28 +3636,86 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
                     if trace_decode_warmup:
                         torch.cuda.synchronize()
                         logger.info(
-                            "SM70 profile trace: GDN FlashQLA decode warmup "
+                            "SM70 profile trace: GDN mixed-QKV decode warmup "
                             "exit layer=%s elapsed_ms=%.3f",
                             self.prefix,
-                            (
-                                time.perf_counter()
-                                - flashqla_decode_warmup_start
-                            )
+                            (time.perf_counter() - mixed_decode_warmup_start)
                             * 1000.0,
                         )
                     logger.debug(
-                        "GDN FlashQLA decode warmup completed for layer %s",
+                        "GDN mixed-QKV decode warmup completed for layer %s",
                         self.prefix,
                     )
-        del (
-            dummy_decode_mixed_qkv,
-            dummy_decode_a,
-            dummy_decode_b,
-            dummy_decode_state,
-            dummy_decode_out,
-            dummy_decode_indices,
-            dummy_decode_query_start_loc,
-        )
+                if self._can_use_flashqla_decode(
+                    dummy_decode_mixed_qkv,
+                    dummy_decode_indices,
+                    decode_tokens,
+                    layer_name=_encode_layer_name(self.prefix),
+                    stage="warmup",
+                ):
+                    if not _sm70_flashqla_decode_warmup_enabled():
+                        if trace_decode_warmup:
+                            logger.info(
+                                "SM70 profile trace: GDN FlashQLA decode "
+                                "warmup skip layer=%s reason=disabled",
+                                self.prefix,
+                            )
+                    else:
+                        flashqla_decode_warmup_start = time.perf_counter()
+                        if trace_decode_warmup:
+                            logger.info(
+                                "SM70 profile trace: GDN FlashQLA decode "
+                                "warmup enter layer=%s tokens=%d layout=%s",
+                                self.prefix,
+                                decode_tokens,
+                                _sm70_mixed_qkv_decode_layout(
+                                    dummy_decode_mixed_qkv
+                                ),
+                            )
+                        try:
+                            self._forward_core_decode_flashqla(
+                                mixed_qkv=dummy_decode_mixed_qkv,
+                                a=dummy_decode_a,
+                                b=dummy_decode_b,
+                                ssm_state=dummy_decode_state,
+                                state_indices=dummy_decode_indices,
+                                num_decode_tokens=decode_tokens,
+                                cu_seqlens=dummy_decode_query_start_loc,
+                                core_attn_out=dummy_decode_out.squeeze(1),
+                            )
+                        except Exception:
+                            logger.warning(
+                                "GDN FlashQLA decode warmup failed for layer %s. "
+                                "First inference may JIT flash_qla_sm70_gdn.",
+                                self.prefix,
+                                exc_info=True,
+                            )
+                        else:
+                            if trace_decode_warmup:
+                                torch.cuda.synchronize()
+                                logger.info(
+                                    "SM70 profile trace: GDN FlashQLA decode "
+                                    "warmup exit layer=%s elapsed_ms=%.3f",
+                                    self.prefix,
+                                    (
+                                        time.perf_counter()
+                                        - flashqla_decode_warmup_start
+                                    )
+                                    * 1000.0,
+                                )
+                            logger.debug(
+                                "GDN FlashQLA decode warmup completed for layer %s",
+                                self.prefix,
+                            )
+                del (
+                    dummy_decode_a,
+                    dummy_decode_b,
+                    dummy_decode_state,
+                    dummy_decode_out,
+                    dummy_decode_indices,
+                    dummy_decode_query_start_loc,
+                )
+            del dummy_decode_views
 
         torch.accelerator.empty_cache()
 
@@ -4425,13 +4563,6 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
         b = b[:num_decode_tokens]
         a = a[:num_decode_tokens]
         state_indices = non_spec_state_indices_tensor[:num_decode_tokens]
-        if (
-            self.enable_flashqla_decode
-            and mixed_qkv.is_cuda
-            and mixed_qkv.dtype == torch.float16
-            and not mixed_qkv.is_contiguous()
-        ):
-            mixed_qkv = mixed_qkv.contiguous()
         _sm70_gdn_graph_buffer_copy("state_indices", layer_name, state_indices, "state")
         _sm70_gdn_graph_buffer_copy_state_slice(
             "pre_conv_state",
@@ -4695,13 +4826,16 @@ def qwen_gdn_attention_core(
         candidate = attn_metadata_raw.get(layer_name)
         if isinstance(candidate, GDNAttentionMetadata):
             attn_metadata = candidate
+    _sm70_assert_standard_core_not_active_spec(layer_name, attn_metadata)
     if conv_state_cache.numel() == 0 and ssm_state_cache.numel() == 0:
         kv_cache = getattr(self, "kv_cache", None)
         if kv_cache is not None and kv_cache[0].numel() > 0:
             conv_state_cache, ssm_state_cache = kv_cache[0], kv_cache[1]
-    _sm70_dump_gdn_core_tensor("input_qkv", layer_name, qkv_or_qkvz)
-    _sm70_dump_gdn_core_tensor("input_b", layer_name, b_or_ba)
-    _sm70_dump_gdn_core_tensor("input_a", layer_name, a_or_z_out)
+    _sm70_dump_gdn_core_tensor(
+        "input_qkv", layer_name, qkv_or_qkvz, "core_generic"
+    )
+    _sm70_dump_gdn_core_tensor("input_b", layer_name, b_or_ba, "core_generic")
+    _sm70_dump_gdn_core_tensor("input_a", layer_name, a_or_z_out, "core_generic")
     restore_query_start_loc = False
     restore_state_indices = False
     if attn_metadata is not None and non_spec_query_start_loc.numel() > 0:
@@ -4744,7 +4878,9 @@ def qwen_gdn_attention_core(
             attn_metadata.non_spec_state_indices_tensor = (
                 old_non_spec_state_indices_tensor
             )
-    _sm70_dump_gdn_core_tensor("core_out", layer_name, core_attn_out)
+    _sm70_dump_gdn_core_tensor(
+        "core_out", layer_name, core_attn_out, "core_generic"
+    )
 
 
 def qwen_gdn_attention_core_standard_spec(
@@ -4777,9 +4913,11 @@ def qwen_gdn_attention_core_standard_spec(
         kv_cache = getattr(self, "kv_cache", None)
         if kv_cache is not None and kv_cache[0].numel() > 0:
             conv_state_cache, ssm_state_cache = kv_cache[0], kv_cache[1]
-    _sm70_dump_gdn_core_tensor("input_qkv", layer_name, mixed_qkv)
-    _sm70_dump_gdn_core_tensor("input_b", layer_name, b)
-    _sm70_dump_gdn_core_tensor("input_a", layer_name, a)
+    _sm70_dump_gdn_core_tensor(
+        "input_qkv", layer_name, mixed_qkv, "core_standard_spec"
+    )
+    _sm70_dump_gdn_core_tensor("input_b", layer_name, b, "core_standard_spec")
+    _sm70_dump_gdn_core_tensor("input_a", layer_name, a, "core_standard_spec")
     _sm70_dump_gdn_spec_metadata_graph_buffers(
         layer_name,
         non_spec_query_start_loc=non_spec_query_start_loc,
@@ -4820,7 +4958,9 @@ def qwen_gdn_attention_core_standard_spec(
             kv_cache=(conv_state_cache, ssm_state_cache),
             layer_name=layer_name,
         )
-        _sm70_dump_gdn_core_tensor("core_out", layer_name, core_attn_out)
+        _sm70_dump_gdn_core_tensor(
+            "core_out", layer_name, core_attn_out, "core_standard_spec"
+        )
         return
 
     restore_fields: dict[str, object] = {}
@@ -4850,7 +4990,9 @@ def qwen_gdn_attention_core_standard_spec(
         if attn_metadata is not None:
             for name, value in restore_fields.items():
                 setattr(attn_metadata, name, value)
-    _sm70_dump_gdn_core_tensor("core_out", layer_name, core_attn_out)
+    _sm70_dump_gdn_core_tensor(
+        "core_out", layer_name, core_attn_out, "core_standard_spec"
+    )
 
 
 def qwen_gdn_attention_core_spec_commit(
@@ -4886,21 +5028,102 @@ def qwen_gdn_attention_core_spec_commit(
         candidate = attn_metadata_raw.get(layer_name)
         if isinstance(candidate, GDNAttentionMetadata):
             attn_metadata = candidate
-    if attn_metadata is None or attn_metadata.num_spec_decodes <= 0:
-        raise RuntimeError(
-            "qwen_gdn_attention_core_spec_commit requires active GDN "
-            "spec-decode metadata"
-        )
-    if (
+    fallback_to_standard = (
+        attn_metadata is None
+        or attn_metadata.num_spec_decodes <= 0
+        or attn_metadata.spec_sequence_masks is None
+    )
+    if fallback_to_standard:
+        restore_fields: dict[str, object] = {}
+
+        def _patch_metadata(name: str, value: object) -> None:
+            if attn_metadata is None:
+                return
+            restore_fields[name] = getattr(attn_metadata, name)
+            setattr(attn_metadata, name, value)
+
+        if (
+            attn_metadata is not None
+            and attn_metadata.num_spec_decodes <= 0
+            and attn_metadata.spec_sequence_masks is not None
+        ):
+            _patch_metadata("spec_sequence_masks", None)
+            _patch_metadata("spec_token_indx", None)
+            _patch_metadata("non_spec_token_indx", None)
+            _patch_metadata("spec_query_start_loc", None)
+            _patch_metadata("spec_state_indices_tensor", None)
+            _patch_metadata("num_accepted_tokens", None)
+        try:
+            qwen_gdn_attention_core_standard(
+                mixed_qkv,
+                b,
+                a,
+                core_attn_out,
+                conv_state_cache,
+                ssm_state_cache,
+                non_spec_query_start_loc,
+                non_spec_state_indices_tensor,
+                layer_name,
+            )
+        finally:
+            if attn_metadata is not None:
+                for name, value in restore_fields.items():
+                    setattr(attn_metadata, name, value)
+        return core_attn_out
+    pure_spec_decode = attn_metadata.num_prefills == 0 and attn_metadata.num_decodes == 0
+    metadata_source = "core_spec_commit"
+    missing_core_spec_tensors = (
         spec_query_start_loc.numel() == 0
         or spec_state_indices_tensor.numel() == 0
-        or spec_token_indx.numel() == 0
-        or spec_sequence_masks.numel() == 0
         or num_accepted_tokens.numel() == 0
-    ):
+    )
+    missing_mixed_spec_tensors = (not pure_spec_decode) and (
+        spec_token_indx.numel() == 0
+        or spec_sequence_masks.numel() == 0
+    )
+    if missing_core_spec_tensors or missing_mixed_spec_tensors:
+        metadata_tensors = gdn_spec_metadata_tensors(attn_metadata, mixed_qkv.device)
+        metadata_missing_core_spec_tensors = (
+            metadata_tensors[2].numel() == 0
+            or metadata_tensors[3].numel() == 0
+            or metadata_tensors[7].numel() == 0
+        )
+        metadata_missing_mixed_spec_tensors = (not pure_spec_decode) and (
+            metadata_tensors[4].numel() == 0
+            or metadata_tensors[6].numel() == 0
+        )
+        if (
+            not metadata_missing_core_spec_tensors
+            and not metadata_missing_mixed_spec_tensors
+        ):
+            (
+                non_spec_query_start_loc,
+                non_spec_state_indices_tensor,
+                spec_query_start_loc,
+                spec_state_indices_tensor,
+                spec_token_indx,
+                non_spec_token_indx,
+                spec_sequence_masks,
+                num_accepted_tokens,
+            ) = metadata_tensors
+            missing_core_spec_tensors = False
+            missing_mixed_spec_tensors = False
+            metadata_source = "core_spec_commit_metadata_fallback"
+    if missing_core_spec_tensors or missing_mixed_spec_tensors:
         raise RuntimeError(
             "qwen_gdn_attention_core_spec_commit missing graph-visible "
-            "spec metadata tensors"
+            "spec metadata tensors "
+            f"(pure_spec_decode={pure_spec_decode}, "
+            f"spec_query_start_loc_shape={tuple(spec_query_start_loc.shape)}, "
+            "spec_state_indices_tensor_shape="
+            f"{tuple(spec_state_indices_tensor.shape)}, "
+            f"spec_token_indx_shape={tuple(spec_token_indx.shape)}, "
+            f"spec_sequence_masks_shape={tuple(spec_sequence_masks.shape)}, "
+            f"num_accepted_tokens_shape={tuple(num_accepted_tokens.shape)}, "
+            f"num_prefills={attn_metadata.num_prefills}, "
+            f"num_decodes={attn_metadata.num_decodes}, "
+            f"num_spec_decodes={attn_metadata.num_spec_decodes}, "
+            f"num_spec_decode_tokens={attn_metadata.num_spec_decode_tokens})"
         )
     if spec_state_indices_tensor.shape[0] < attn_metadata.num_spec_decodes:
         raise RuntimeError(
@@ -4917,9 +5140,11 @@ def qwen_gdn_attention_core_spec_commit(
         if kv_cache is not None and kv_cache[0].numel() > 0:
             conv_state_cache, ssm_state_cache = kv_cache[0], kv_cache[1]
 
-    _sm70_dump_gdn_core_tensor("input_qkv", layer_name, mixed_qkv)
-    _sm70_dump_gdn_core_tensor("input_b", layer_name, b)
-    _sm70_dump_gdn_core_tensor("input_a", layer_name, a)
+    _sm70_dump_gdn_core_tensor(
+        "input_qkv", layer_name, mixed_qkv, metadata_source
+    )
+    _sm70_dump_gdn_core_tensor("input_b", layer_name, b, metadata_source)
+    _sm70_dump_gdn_core_tensor("input_a", layer_name, a, metadata_source)
     _sm70_dump_gdn_spec_metadata_graph_buffers(
         layer_name,
         non_spec_query_start_loc=non_spec_query_start_loc,
@@ -4976,7 +5201,9 @@ def qwen_gdn_attention_core_spec_commit(
             use_qk_l2norm_in_kernel=True,
         )
         core_attn_out[: mixed_qkv.shape[0]] = core_attn_out_spec.squeeze(0)
-        _sm70_dump_gdn_core_tensor("core_out", layer_name, core_attn_out)
+        _sm70_dump_gdn_core_tensor(
+            "core_out", layer_name, core_attn_out, metadata_source
+        )
         return core_attn_out
 
     restore_fields: dict[str, object] = {}
@@ -5017,7 +5244,9 @@ def qwen_gdn_attention_core_spec_commit(
     finally:
         for name, value in restore_fields.items():
             setattr(attn_metadata, name, value)
-    _sm70_dump_gdn_core_tensor("core_out", layer_name, core_attn_out)
+    _sm70_dump_gdn_core_tensor(
+        "core_out", layer_name, core_attn_out, metadata_source
+    )
     return core_attn_out
 
 
@@ -5045,9 +5274,11 @@ def qwen_gdn_attention_core_standard(
         kv_cache = getattr(self, "kv_cache", None)
         if kv_cache is not None and kv_cache[0].numel() > 0:
             conv_state_cache, ssm_state_cache = kv_cache[0], kv_cache[1]
-    _sm70_dump_gdn_core_tensor("input_qkv", layer_name, mixed_qkv)
-    _sm70_dump_gdn_core_tensor("input_b", layer_name, b)
-    _sm70_dump_gdn_core_tensor("input_a", layer_name, a)
+    _sm70_dump_gdn_core_tensor(
+        "input_qkv", layer_name, mixed_qkv, "core_standard"
+    )
+    _sm70_dump_gdn_core_tensor("input_b", layer_name, b, "core_standard")
+    _sm70_dump_gdn_core_tensor("input_a", layer_name, a, "core_standard")
     mixed_qkv_decode_requested = (
         self.enable_sm70_fused_sigmoid_mixed_qkv
         and mixed_qkv.is_cuda
@@ -5077,7 +5308,9 @@ def qwen_gdn_attention_core_standard(
             kv_cache=(conv_state_cache, ssm_state_cache),
             layer_name=layer_name,
         )
-        _sm70_dump_gdn_core_tensor("core_out", layer_name, core_attn_out)
+        _sm70_dump_gdn_core_tensor(
+            "core_out", layer_name, core_attn_out, "core_standard"
+        )
         return
 
     restore_query_start_loc = False
@@ -5113,7 +5346,9 @@ def qwen_gdn_attention_core_standard(
             attn_metadata.non_spec_state_indices_tensor = (
                 old_non_spec_state_indices_tensor
             )
-    _sm70_dump_gdn_core_tensor("core_out", layer_name, core_attn_out)
+    _sm70_dump_gdn_core_tensor(
+        "core_out", layer_name, core_attn_out, "core_standard"
+    )
 
 
 def qwen_gdn_attention_core_context(
@@ -5171,9 +5406,11 @@ def qwen_gdn_attention_core_003_spec(
         kv_cache = getattr(self, "kv_cache", None)
         if kv_cache is not None and kv_cache[0].numel() > 0:
             conv_state_cache, ssm_state_cache = kv_cache[0], kv_cache[1]
-    _sm70_dump_gdn_core_tensor("input_qkv", layer_name, mixed_qkv)
-    _sm70_dump_gdn_core_tensor("input_b", layer_name, b)
-    _sm70_dump_gdn_core_tensor("input_a", layer_name, a)
+    _sm70_dump_gdn_core_tensor(
+        "input_qkv", layer_name, mixed_qkv, "core_003_spec"
+    )
+    _sm70_dump_gdn_core_tensor("input_b", layer_name, b, "core_003_spec")
+    _sm70_dump_gdn_core_tensor("input_a", layer_name, a, "core_003_spec")
     self._forward_core(
         mixed_qkv=mixed_qkv,
         b=b,
@@ -5181,7 +5418,9 @@ def qwen_gdn_attention_core_003_spec(
         core_attn_out=core_attn_out,
         kv_cache=(conv_state_cache, ssm_state_cache),
     )
-    _sm70_dump_gdn_core_tensor("core_out", layer_name, core_attn_out)
+    _sm70_dump_gdn_core_tensor(
+        "core_out", layer_name, core_attn_out, "core_003_spec"
+    )
     return core_attn_out
 
 

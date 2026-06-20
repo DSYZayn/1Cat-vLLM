@@ -6,11 +6,15 @@ from typing import Literal
 
 import torch
 
+from vllm import envs
+
 U4_GROUP_SIZES = (32, 64, 128)
 GPTQ_GROUP_SIZES = (128,)
 COMPRESSED_UINT4_GROUP_SIZES = (32, 128)
 MXFP4_GROUP_SIZE = 32
+NVFP4_GROUP_SIZE = 16
 STATE_ATTR = "_sm70_turbomind_linear"
+SM70QuantBackend = Literal["auto", "marlin", "turbomind"]
 
 
 @dataclass
@@ -21,13 +25,41 @@ class SM70TurboMindLinearState:
     k_ld: int
     q_ld: int
     output_size: int
-    op_kind: Literal["uint4", "mxfp4"]
+    op_kind: Literal["uint4", "mxfp4", "nvfp4"]
+
+
+def quant_backend() -> SM70QuantBackend:
+    return envs.get_sm70_quant_backend()
+
+
+def use_turbomind(default_enabled: bool) -> bool:
+    return envs.use_sm70_turbomind(default_enabled)
+
+
+def forces_marlin() -> bool:
+    return envs.force_sm70_marlin()
 
 
 def is_exact_sm70_cuda(tensor: torch.Tensor, enabled: bool) -> bool:
     if not enabled or not tensor.is_cuda:
         return False
     return torch.cuda.get_device_capability(tensor.device) == (7, 0)
+
+
+def should_prepare_turbomind(
+    tensor: torch.Tensor,
+    default_enabled: bool,
+) -> bool:
+    return is_exact_sm70_cuda(tensor, use_turbomind(default_enabled))
+
+
+def should_prepare_turbomind_or_marlin(
+    tensor: torch.Tensor,
+    default_enabled: bool,
+) -> bool:
+    return is_exact_sm70_cuda(
+        tensor, use_turbomind(default_enabled) or forces_marlin()
+    )
 
 
 def _get_u4_slices(x: torch.Tensor, dtype: torch.dtype) -> list[torch.Tensor]:
@@ -89,7 +121,7 @@ def _store_state(
     meta: torch.Tensor,
     group_size: int,
     output_size: int,
-    op_kind: Literal["uint4", "mxfp4"],
+    op_kind: Literal["uint4", "mxfp4", "nvfp4"],
 ) -> None:
     state = SM70TurboMindLinearState(
         weight=weight,
@@ -206,6 +238,36 @@ def prepare_mxfp4_linear(
     )
 
 
+def prepare_nvfp4_linear(
+    layer: torch.nn.Module,
+    interleave_gated_silu: bool = False,
+) -> None:
+    if not hasattr(torch.ops._C, "nvfp4_sm70_prepare"):
+        raise RuntimeError(
+            "VLLM_SM70_NVFP4_TURBOMIND=1 requires a build with CUDA arch 7.0 "
+            "and the SM70 TurboMind NVFP4 extension."
+        )
+    from vllm import _sm70_ops as sm70_ops
+
+    qweight = unpack_mxfp4_weight(layer.weight.data)
+    scales = (
+        layer.weight_scale.data.t().to(torch.float32)
+        * layer.weight_global_scale.to(torch.float32)
+    ).to(torch.float16).contiguous()
+    tm_weight, tm_scales, meta = sm70_ops.nvfp4_sm70_prepare(
+        qweight, scales, NVFP4_GROUP_SIZE, interleave_gated_silu
+    )
+    _store_state(
+        layer,
+        tm_weight,
+        tm_scales,
+        meta,
+        NVFP4_GROUP_SIZE,
+        qweight.size(1),
+        "nvfp4",
+    )
+
+
 def apply_prepared_linear(
     layer: torch.nn.Module,
     x: torch.Tensor,
@@ -233,6 +295,16 @@ def apply_prepared_linear(
         )
     elif state.op_kind == "mxfp4":
         sm70_ops.mxfp4_gemm_sm70_out(
+            out,
+            reshaped_x,
+            state.weight,
+            state.scales,
+            state.group_size,
+            state.k_ld,
+            state.q_ld,
+        )
+    elif state.op_kind == "nvfp4":
+        sm70_ops.nvfp4_gemm_sm70_out(
             out,
             reshaped_x,
             state.weight,

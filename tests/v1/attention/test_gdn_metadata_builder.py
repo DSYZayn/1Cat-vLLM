@@ -625,6 +625,32 @@ def test_align_active_mtp_rollover_contract_near_block_boundary(
     assert accepted_tokens.data_ptr() == meta.num_accepted_tokens.data_ptr()
 
 
+def test_gdn_state_contract_debug_assert_rejects_pad_accepted_slot(
+    monkeypatch,
+):
+    monkeypatch.setenv("VLLM_SM70_GDN_STATE_CONTRACT_ASSERT", "1")
+
+    with pytest.raises(AssertionError, match="accepted slot points"):
+        build_gdn_spec_decode_state_contract(
+            block_table_tensor=torch.tensor(
+                [[10, 11, 12, 13, PAD_SLOT_ID]],
+                dtype=torch.int32,
+                device=DEVICE,
+            ),
+            seq_lens=torch.tensor([36], dtype=torch.int32, device=DEVICE),
+            block_size=BLOCK_SIZE,
+            num_spec=4,
+            spec_sequence_masks_cpu=torch.tensor(
+                [True], dtype=torch.bool, device="cpu"
+            ),
+            num_accepted_tokens=torch.tensor(
+                [5], dtype=torch.int32, device=DEVICE
+            ),
+            current_state_block_ids=None,
+            is_mamba_cache_all=False,
+        )
+
+
 def test_spec_commit_pure_decode_consumes_padded_graph_rows_without_metadata_patch(
     monkeypatch,
     local_gdn_model,
@@ -791,7 +817,7 @@ def test_spec_commit_pure_decode_consumes_padded_graph_rows_without_metadata_pat
     assert live_meta.num_accepted_tokens is not padded_accepted
 
 
-def test_sm70_qwen_gdn_full_forward_auto_is_active_spec_scoped(
+def test_sm70_qwen_gdn_full_forward_auto_is_mtp_engine_scoped(
     monkeypatch,
     local_gdn_model,
 ):
@@ -811,7 +837,7 @@ def test_sm70_qwen_gdn_full_forward_auto_is_active_spec_scoped(
         auto_enabled=False,
     )
     with set_forward_context({"layer.0": regular_meta}, regular_builder.vllm_config):
-        assert not _sm70_qwen_gdn_full_forward_enabled(
+        assert _sm70_qwen_gdn_full_forward_enabled(
             "layer.0",
             force_enabled=False,
             disabled=False,
@@ -823,7 +849,7 @@ def test_sm70_qwen_gdn_full_forward_auto_is_active_spec_scoped(
         cudagraph_runtime_mode=CUDAGraphMode.NONE,
         is_dummy_run=True,
     ):
-        assert not _sm70_qwen_gdn_full_forward_enabled(
+        assert _sm70_qwen_gdn_full_forward_enabled(
             "layer.0",
             force_enabled=False,
             disabled=False,
@@ -835,7 +861,7 @@ def test_sm70_qwen_gdn_full_forward_auto_is_active_spec_scoped(
         cudagraph_runtime_mode=CUDAGraphMode.FULL,
         is_dummy_run=True,
     ):
-        assert not _sm70_qwen_gdn_full_forward_enabled(
+        assert _sm70_qwen_gdn_full_forward_enabled(
             "layer.0",
             force_enabled=False,
             disabled=False,
@@ -931,6 +957,96 @@ def test_sm70_qwen_gdn_003_spec_core_route_has_priority(
     empty_cache = torch.empty(0)
 
     with set_forward_context({"layer.0": spec_meta}, spec_builder.vllm_config):
+        out = _qwen_gdn_run_recurrent_core(
+            FakeSelf(),
+            mixed_qkv=mixed_qkv,
+            b=b,
+            a=a,
+            core_attn_out=core_attn_out,
+            layer_name="layer.0",
+            conv_state_cache=empty_cache,
+            ssm_state_cache=empty_cache,
+        )
+
+    assert out is core_attn_out
+    assert calls == ["layer.0"]
+
+
+def test_sm70_qwen_gdn_spec_commit_route_is_compile_stable(
+    monkeypatch,
+    local_gdn_model,
+):
+    regular_builder = _create_gdn_builder(local_gdn_model)
+    regular_meta = _build(
+        regular_builder,
+        BatchSpec(seq_lens=[40], query_lens=[1]),
+    )
+
+    class FakeSelf:
+        auto_sm70_qwen_gdn_003_spec_core = False
+        auto_sm70_qwen_gdn_spec_core = True
+        auto_sm70_qwen_gdn_full_forward = False
+
+    calls: list[str] = []
+
+    def fake_spec_commit(
+        mixed_qkv,
+        b,
+        a,
+        core_attn_out,
+        conv_state_cache,
+        ssm_state_cache,
+        non_spec_query_start_loc,
+        non_spec_state_indices_tensor,
+        spec_query_start_loc,
+        spec_state_indices_tensor,
+        spec_token_indx,
+        non_spec_token_indx,
+        spec_sequence_masks,
+        num_accepted_tokens,
+        layer_name,
+    ):
+        del (
+            mixed_qkv,
+            b,
+            a,
+            conv_state_cache,
+            ssm_state_cache,
+            non_spec_query_start_loc,
+            non_spec_state_indices_tensor,
+            spec_query_start_loc,
+            spec_state_indices_tensor,
+            spec_token_indx,
+            non_spec_token_indx,
+            spec_sequence_masks,
+            num_accepted_tokens,
+        )
+        calls.append(str(layer_name))
+        return core_attn_out
+
+    def fail_fallback(*args, **kwargs):
+        raise AssertionError("SPEC_CORE_OP route must stay on spec_commit")
+
+    monkeypatch.setattr(
+        torch.ops.vllm,
+        "qwen_gdn_attention_core_spec_commit",
+        fake_spec_commit,
+        raising=False,
+    )
+    monkeypatch.setattr(
+        torch.ops.vllm,
+        "qwen_gdn_attention_core_standard",
+        fail_fallback,
+        raising=False,
+    )
+
+    mixed_qkv = torch.zeros(1, 8)
+    b = torch.zeros(1, 2)
+    a = torch.zeros(1, 2)
+    core_attn_out = torch.zeros(1, 2, 4)
+    empty_cache = torch.empty(0)
+
+    with set_forward_context({"layer.0": regular_meta}, regular_builder.vllm_config):
         out = _qwen_gdn_run_recurrent_core(
             FakeSelf(),
             mixed_qkv=mixed_qkv,
