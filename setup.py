@@ -180,7 +180,9 @@ def bundle_flash_attn_v100(build_lib: str) -> None:
         return
 
     env = os.environ.copy()
-    env.setdefault("TORCH_CUDA_ARCH_LIST", "7.0")
+    env["TORCH_CUDA_ARCH_LIST"] = os.environ.get(
+        "FLASH_ATTN_V100_CUDA_ARCH_LIST", "7.0"
+    )
     subprocess.check_call(
         [sys.executable, "setup.py", "build_ext", "--inplace"],
         cwd=FLASH_ATTN_V100_ROOT,
@@ -1154,8 +1156,9 @@ if _is_hip():
 if _is_cuda():
     if _cuda_arch_at_least(8, 0):
         ext_modules.append(CMakeExtension(name="vllm.vllm_flash_attn._vllm_fa2_C"))
-        if USE_PRECOMPILED_EXTENSIONS or (
-            CUDA_HOME and get_nvcc_cuda_version() >= Version("12.3")
+        if _cuda_arch_at_least(9, 0) and (
+            USE_PRECOMPILED_EXTENSIONS
+            or (CUDA_HOME and get_nvcc_cuda_version() >= Version("12.3"))
         ):
             # FA3 requires CUDA 12.3 or later
             ext_modules.append(CMakeExtension(name="vllm.vllm_flash_attn._vllm_fa3_C"))

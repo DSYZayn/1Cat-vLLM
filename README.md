@@ -310,7 +310,8 @@ Build wheels:
 export CUDA_HOME=/usr/local/cuda-12.8
 export PATH=$CUDA_HOME/bin:$PATH
 export LD_LIBRARY_PATH=$CUDA_HOME/lib64:${LD_LIBRARY_PATH:-}
-export TORCH_CUDA_ARCH_LIST="7.0"
+export TORCH_CUDA_ARCH_LIST="7.0;8.0"
+export FLASH_ATTN_V100_CUDA_ARCH_LIST="7.0"
 export MAX_JOBS=12
 export NVCC_THREADS=1
 

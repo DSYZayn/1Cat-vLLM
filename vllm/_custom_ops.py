@@ -18,6 +18,7 @@ from vllm.utils.math_utils import cdiv
 logger = init_logger(__name__)
 
 current_platform.import_kernels()
+_repetition_penalties_cuda_unavailable = False
 
 if TYPE_CHECKING:
 
@@ -384,6 +385,15 @@ def apply_repetition_penalties_cuda(
     )
 
 
+def _is_missing_cuda_kernel_error(exc: RuntimeError) -> bool:
+    message = str(exc).lower()
+    return (
+        "no kernel image is available for execution on the device" in message
+        or "no kernel image for device" in message
+        or "invalid device function" in message
+    )
+
+
 def apply_repetition_penalties(
     logits: torch.Tensor,
     prompt_mask: torch.Tensor,
@@ -398,22 +408,32 @@ def apply_repetition_penalties(
         output_mask: A boolean tensor indicating which tokens appear in the output.
         repetition_penalties: The repetition penalties of shape (num_seqs, ).
     """
-    use_cuda_kernel = logits.is_cuda and logits.is_contiguous()
-    if (
-        use_cuda_kernel
-        and current_platform.is_cuda()
-        and current_platform.is_device_capability((7, 0))
-    ):
-        use_cuda_kernel = False
+    global _repetition_penalties_cuda_unavailable
+    use_cuda_kernel = (
+        logits.is_cuda
+        and logits.is_contiguous()
+        and not _repetition_penalties_cuda_unavailable
+    )
 
     if use_cuda_kernel:
-        apply_repetition_penalties_cuda(
-            logits, prompt_mask, output_mask, repetition_penalties
-        )
-    else:
-        apply_repetition_penalties_torch(
-            logits, prompt_mask, output_mask, repetition_penalties
-        )
+        try:
+            apply_repetition_penalties_cuda(
+                logits, prompt_mask, output_mask, repetition_penalties
+            )
+            return
+        except RuntimeError as exc:
+            if not _is_missing_cuda_kernel_error(exc):
+                raise
+            _repetition_penalties_cuda_unavailable = True
+            logger.warning(
+                "Falling back to torch repetition penalty path because the "
+                "custom CUDA kernel is unavailable for this GPU/build: %s",
+                exc,
+            )
+
+    apply_repetition_penalties_torch(
+        logits, prompt_mask, output_mask, repetition_penalties
+    )
 
 
 # fused quant layer norm ops
