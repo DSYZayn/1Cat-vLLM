@@ -71,14 +71,16 @@ the public wheel.
    default, while `VLLM_USE_FLASHINFER_SAMPLER=1` still fails loudly for
    diagnostics.
 
-4. V100 repetition, presence, and frequency penalty requests avoid unsupported
-   custom CUDA kernels and use the torch fallback on SM70.
+4. V100 repetition, presence, and frequency penalty requests now prefer the
+   custom CUDA path when it is available, with a runtime torch fallback only for
+   builds that report a missing device kernel.
 
 5. Prefix-cache release checks now require an actual cache-hit pass instead of
    accepting a skipped or missing probe.
 
-6. The wheel build bundles the Flash-V100 extension modules together with the
-   vLLM CUDA extensions.
+6. The wheel build bundles the Flash-V100 extension modules, paged KV utilities,
+   upstream FA2 extension, and the vLLM CUDA extensions in one installable
+   package.
 
 ## Build Target
 
