@@ -180,7 +180,9 @@ def bundle_flash_attn_v100(build_lib: str) -> None:
         return
 
     env = os.environ.copy()
-    env.setdefault("TORCH_CUDA_ARCH_LIST", "7.0")
+    env["TORCH_CUDA_ARCH_LIST"] = os.environ.get(
+        "FLASH_ATTN_V100_CUDA_ARCH_LIST", "7.0"
+    )
     subprocess.check_call(
         [sys.executable, "setup.py", "build_ext", "--inplace"],
         cwd=FLASH_ATTN_V100_ROOT,
@@ -200,7 +202,17 @@ def bundle_flash_attn_v100(build_lib: str) -> None:
             matches = sorted(FLASH_ATTN_V100_ROOT.glob(f"{ext_name}*.so"))
         if not matches:
             raise RuntimeError(f"Failed to build Flash-V100 extension: {ext_name}")
-        shutil.copy2(matches[-1], dst_pkg / matches[-1].name)
+        dst_ext = dst_pkg / matches[-1].name
+        shutil.copy2(matches[-1], dst_ext)
+        remove_rpath(dst_ext)
+
+
+def remove_rpath(path: Path) -> None:
+    patchelf = which("patchelf")
+    if patchelf is None:
+        logger.warning("patchelf not found; leaving RPATH unchanged for %s", path)
+        return
+    subprocess.run([patchelf, "--remove-rpath", str(path)], check=False)
 
 
 class CMakeExtension(Extension):
@@ -800,6 +812,10 @@ class precompiled_wheel_utils:
                 )
                 # DeepGEMM: extract all files (.py, .so, .cuh, .h, .hpp, etc.)
                 deep_gemm_regex = re.compile(r"vllm/third_party/deep_gemm/.*")
+                flash_attn_v100_ext_regex = re.compile(
+                    r"flash_attn_v100/"
+                    r"(?:flash_attn_v100_cuda|paged_kv_utils).*\.so"
+                )
                 file_members = []
                 for member in wheel.filelist:
                     if member.filename in exact_members:
@@ -817,6 +833,7 @@ class precompiled_wheel_utils:
                         or triton_kernels_regex.match(member.filename)
                         or flashmla_regex.match(member.filename)
                         or deep_gemm_regex.match(member.filename)
+                        or flash_attn_v100_ext_regex.match(member.filename)
                     ):
                         file_members.append(member)
 
@@ -832,6 +849,8 @@ class precompiled_wheel_utils:
                     mode = file.external_attr >> 16
                     if mode:
                         os.chmod(target_path, mode)
+                    if flash_attn_v100_ext_regex.match(file.filename):
+                        remove_rpath(Path(target_path))
 
                     pkg = os.path.dirname(file.filename).replace("/", ".")
                     package_data_patch.setdefault(pkg, []).append(
@@ -1137,8 +1156,9 @@ if _is_hip():
 if _is_cuda():
     if _cuda_arch_at_least(8, 0):
         ext_modules.append(CMakeExtension(name="vllm.vllm_flash_attn._vllm_fa2_C"))
-        if USE_PRECOMPILED_EXTENSIONS or (
-            CUDA_HOME and get_nvcc_cuda_version() >= Version("12.3")
+        if _cuda_arch_at_least(9, 0) and (
+            USE_PRECOMPILED_EXTENSIONS
+            or (CUDA_HOME and get_nvcc_cuda_version() >= Version("12.3"))
         ):
             # FA3 requires CUDA 12.3 or later
             ext_modules.append(CMakeExtension(name="vllm.vllm_flash_attn._vllm_fa3_C"))

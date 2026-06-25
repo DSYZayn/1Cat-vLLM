@@ -18,6 +18,7 @@ from vllm.utils.math_utils import cdiv
 logger = init_logger(__name__)
 
 current_platform.import_kernels()
+_repetition_penalties_cuda_unavailable = False
 
 if TYPE_CHECKING:
 
@@ -384,6 +385,15 @@ def apply_repetition_penalties_cuda(
     )
 
 
+def _is_missing_cuda_kernel_error(exc: RuntimeError) -> bool:
+    message = str(exc).lower()
+    return (
+        "no kernel image is available for execution on the device" in message
+        or "no kernel image for device" in message
+        or "invalid device function" in message
+    )
+
+
 def apply_repetition_penalties(
     logits: torch.Tensor,
     prompt_mask: torch.Tensor,
@@ -398,14 +408,32 @@ def apply_repetition_penalties(
         output_mask: A boolean tensor indicating which tokens appear in the output.
         repetition_penalties: The repetition penalties of shape (num_seqs, ).
     """
-    if logits.is_cuda and logits.is_contiguous():
-        apply_repetition_penalties_cuda(
-            logits, prompt_mask, output_mask, repetition_penalties
-        )
-    else:
-        apply_repetition_penalties_torch(
-            logits, prompt_mask, output_mask, repetition_penalties
-        )
+    global _repetition_penalties_cuda_unavailable
+    use_cuda_kernel = (
+        logits.is_cuda
+        and logits.is_contiguous()
+        and not _repetition_penalties_cuda_unavailable
+    )
+
+    if use_cuda_kernel:
+        try:
+            apply_repetition_penalties_cuda(
+                logits, prompt_mask, output_mask, repetition_penalties
+            )
+            return
+        except RuntimeError as exc:
+            if not _is_missing_cuda_kernel_error(exc):
+                raise
+            _repetition_penalties_cuda_unavailable = True
+            logger.warning(
+                "Falling back to torch repetition penalty path because the "
+                "custom CUDA kernel is unavailable for this GPU/build: %s",
+                exc,
+            )
+
+    apply_repetition_penalties_torch(
+        logits, prompt_mask, output_mask, repetition_penalties
+    )
 
 
 # fused quant layer norm ops
@@ -2956,6 +2984,68 @@ def top1_argmax(
 ) -> None:
     torch.ops._C_custom_ar.top1_argmax(
         fa, input_pair, out, reg_buffer, reg_buffer_sz_bytes
+    )
+
+
+def tile_runtime_all_reduce(
+    fa: int,
+    inp: torch.Tensor,
+    out: torch.Tensor,
+    reg_buffer: int,
+    reg_buffer_sz_bytes: int,
+    tile_numel: int,
+    engine_blocks: int,
+    compute_iters: int,
+) -> None:
+    torch.ops._C_custom_ar.tile_runtime_all_reduce(
+        fa,
+        inp,
+        out,
+        reg_buffer,
+        reg_buffer_sz_bytes,
+        tile_numel,
+        engine_blocks,
+        compute_iters,
+    )
+
+
+def tile_runtime_all_reduce_engine(
+    fa: int,
+    inp: torch.Tensor,
+    out: torch.Tensor,
+    reg_buffer: int,
+    reg_buffer_sz_bytes: int,
+    tile_numel: int,
+    producer_blocks: int,
+    reducer_blocks: int,
+    compute_iters: int,
+) -> None:
+    torch.ops._C_custom_ar.tile_runtime_all_reduce_engine(
+        fa,
+        inp,
+        out,
+        reg_buffer,
+        reg_buffer_sz_bytes,
+        tile_numel,
+        producer_blocks,
+        reducer_blocks,
+        compute_iters,
+    )
+
+
+def tile_runtime_wait_reduce(
+    fa: int,
+    staging: torch.Tensor,
+    out: torch.Tensor,
+    tile_numel: int,
+    reducer_blocks: int,
+) -> None:
+    torch.ops._C_custom_ar.tile_runtime_wait_reduce(
+        fa,
+        staging,
+        out,
+        tile_numel,
+        reducer_blocks,
     )
 
 
