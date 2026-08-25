@@ -190,10 +190,13 @@ jobs:
       VLLM_REQUIRE_RUST_FRONTEND: ${{ needs.prepare.outputs.rust_changed }}
       RUST_CHANGED: ${{ needs.prepare.outputs.rust_changed }}
       BASE_WHEEL_URL: ${{ needs.prepare.outputs.base_wheel_url }}
-      TORCH_CUDA_ARCH_LIST: "7.0 7.5 8.0 8.6 8.9 9.0 10.0 12.0+PTX"
+      # This wheel targets the V100 image. Keeping only SM70 avoids compiling
+      # large SM90/SM100/SM120 template instantiations that can exhaust RAM.
+      TORCH_CUDA_ARCH_LIST: "7.0"
       FLASH_ATTN_V100_CUDA_ARCH_LIST: "7.0"
       VLLM_BUILD_FLASH_ATTN_V100: "1"
-      MAX_JOBS: "2"
+      MAX_JOBS: "1"
+      CMAKE_BUILD_PARALLEL_LEVEL: "1"
       NVCC_THREADS: "1"
       CMAKE_BUILD_TYPE: Release
 
