@@ -1,0 +1,310 @@
+name: Full Native Wheel Build
+
+on:
+  workflow_dispatch:
+    inputs:
+      source_sha:
+        description: "Exact main commit to build; empty means current main"
+        required: false
+        type: string
+      build_date:
+        description: "UTC build date in YYYYMMDD format; empty means today"
+        required: false
+        type: string
+
+concurrency:
+  group: full-native-wheel-build-${{ github.repository }}
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  prepare:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    env:
+      GH_TOKEN: ${{ github.token }}
+      SOURCE_SHA_INPUT: ${{ inputs.source_sha }}
+      BUILD_DATE_INPUT: ${{ inputs.build_date }}
+    outputs:
+      source_sha: ${{ steps.metadata.outputs.source_sha }}
+      build_date: ${{ steps.metadata.outputs.build_date }}
+      base_release_repo: ${{ steps.metadata.outputs.base_release_repo }}
+      base_tag: ${{ steps.metadata.outputs.base_tag }}
+      base_version: ${{ steps.metadata.outputs.base_version }}
+      rolling_tag: ${{ steps.metadata.outputs.rolling_tag }}
+
+    steps:
+      - name: Check out main
+        uses: actions/checkout@8e8c483db84b4bee98b60c0593521ed34d9990e8 # v6.0.1
+        with:
+          ref: main
+          fetch-depth: 0
+
+      - name: Resolve build metadata
+        id: metadata
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          git fetch origin main --prune
+          if [[ -n "$SOURCE_SHA_INPUT" ]]; then
+            if ! git cat-file -e "${SOURCE_SHA_INPUT}^{commit}" 2>/dev/null; then
+              git fetch origin main --prune
+            fi
+            git checkout --detach "$SOURCE_SHA_INPUT"
+          else
+            git checkout --detach origin/main
+          fi
+
+          source_sha="$(git rev-parse HEAD)"
+          build_date="$BUILD_DATE_INPUT"
+          if [[ -z "$build_date" ]]; then
+            build_date="$(date -u +%Y%m%d)"
+          fi
+          if [[ ! "$build_date" =~ ^[0-9]{8}$ ]]; then
+            echo "Invalid build date: $build_date" >&2
+            exit 1
+          fi
+
+          fallback_release_repo="1CatAI/1Cat-vLLM"
+          base_release_repo="$GITHUB_REPOSITORY"
+          if ! release_json="$(gh api \
+            "repos/${base_release_repo}/releases/latest" 2>/dev/null)"; then
+            base_release_repo="$fallback_release_repo"
+            release_json="$(gh api \
+              "repos/${base_release_repo}/releases/latest")"
+          fi
+
+          base_tag="$(jq -r '.tag_name' <<< "$release_json")"
+          base_version="${base_tag#v}"
+          if [[ ! "$base_tag" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "Latest release tag is not a stable semantic version: $base_tag" >&2
+            exit 1
+          fi
+
+          rolling_tag="${base_tag}-native-rolling"
+          {
+            echo "source_sha=$source_sha"
+            echo "build_date=$build_date"
+            echo "base_release_repo=$base_release_repo"
+            echo "base_tag=$base_tag"
+            echo "base_version=$base_version"
+            echo "rolling_tag=$rolling_tag"
+          } >> "$GITHUB_OUTPUT"
+
+          jq -n \
+            --arg source_sha "$source_sha" \
+            --arg build_date "$build_date" \
+            --arg base_release_repo "$base_release_repo" \
+            --arg base_tag "$base_tag" \
+            --arg base_version "$base_version" \
+            --arg rolling_tag "$rolling_tag" \
+            '{source_sha, build_date, base_release_repo, base_tag,
+              base_version, rolling_tag}' \
+            > "$RUNNER_TEMP/native-build-metadata.json"
+
+          echo "Source commit: $source_sha"
+          echo "Build date: $build_date UTC"
+          echo "Base release: $base_release_repo@$base_tag"
+          echo "Native rolling release: $rolling_tag"
+
+      - name: Upload build metadata
+        uses: actions/upload-artifact@v4
+        with:
+          name: native-build-metadata
+          path: ${{ runner.temp }}/native-build-metadata.json
+          if-no-files-found: error
+          retention-days: 3
+
+  build-rust:
+    needs: prepare
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    steps:
+      - name: Check out the source commit
+        uses: actions/checkout@8e8c483db84b4bee98b60c0593521ed34d9990e8 # v6.0.1
+        with:
+          ref: ${{ needs.prepare.outputs.source_sha }}
+          fetch-depth: 1
+
+      - name: Install Rust build prerequisites
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            build-essential \
+            ca-certificates \
+            curl \
+            libssl-dev \
+            pkg-config
+
+      - name: Install the pinned Rust toolchain
+        shell: bash
+        run: |
+          set -euo pipefail
+          curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
+            | sh -s -- -y --profile minimal
+          source "$HOME/.cargo/env"
+          rustup toolchain install 1.95.0 --profile minimal
+          echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+
+      - name: Build the Rust frontend
+        shell: bash
+        run: |
+          set -euo pipefail
+          source "$HOME/.cargo/env"
+          cargo +1.95.0 build \
+            --release \
+            --manifest-path rust/src/cmd/Cargo.toml \
+            --bin vllm-rs
+
+      - name: Upload the Rust frontend
+        uses: actions/upload-artifact@v4
+        with:
+          name: native-rust-frontend
+          path: rust/target/release/vllm-rs
+          if-no-files-found: error
+          retention-days: 3
+
+  build-cuda:
+    needs: [prepare, build-rust]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 340
+    container:
+      image: nvidia/cuda:13.0.3-devel-ubuntu24.04
+      options: --user 0
+    strategy:
+      fail-fast: false
+      max-parallel: 6
+      matrix:
+        include:
+          - name: sm70
+            arch_list: "7.0"
+            build_flash_v100: "1"
+          - name: sm75
+            arch_list: "7.5"
+            build_flash_v100: "0"
+          - name: sm80
+            arch_list: "8.0 8.6 8.9"
+            build_flash_v100: "0"
+          - name: sm90
+            arch_list: "9.0"
+            build_flash_v100: "0"
+          - name: sm100
+            arch_list: "10.0"
+            build_flash_v100: "0"
+          - name: sm120
+            arch_list: "12.0+PTX"
+            build_flash_v100: "0"
+    env:
+      PYTHON_VERSION: "3.12"
+      VLLM_TARGET_DEVICE: cuda
+      VLLM_VERSION_OVERRIDE: ${{ needs.prepare.outputs.base_version }}.post${{ needs.prepare.outputs.build_date }}+${{ matrix.name }}
+      TORCH_CUDA_ARCH_LIST: ${{ matrix.arch_list }}
+      FLASH_ATTN_V100_CUDA_ARCH_LIST: "7.0"
+      VLLM_BUILD_FLASH_ATTN_V100: ${{ matrix.build_flash_v100 }}
+      MAX_JOBS: "2"
+      NVCC_THREADS: "1"
+      CMAKE_BUILD_TYPE: Release
+
+    steps:
+      - name: Install build tools in the CUDA container
+        shell: bash
+        run: |
+          set -euo pipefail
+          export DEBIAN_FRONTEND=noninteractive
+          apt-get update
+          apt-get install -y --no-install-recommends \
+            build-essential \
+            ca-certificates \
+            cmake \
+            curl \
+            git \
+            jq \
+            ninja-build \
+            patchelf \
+            pkg-config \
+            python3.12 \
+            python3.12-dev \
+            python3.12-venv \
+            unzip
+
+      - name: Check out the source commit
+        uses: actions/checkout@8e8c483db84b4bee98b60c0593521ed34d9990e8 # v6.0.1
+        with:
+          ref: ${{ needs.prepare.outputs.source_sha }}
+          fetch-depth: 1
+
+      - name: Set up uv and Python
+        uses: astral-sh/setup-uv@v7
+        with:
+          enable-cache: true
+          cache-dependency-glob: |
+            requirements/**/*.txt
+            pyproject.toml
+          python-version: ${{ env.PYTHON_VERSION }}
+
+      - name: Create build environment
+        shell: bash
+        run: uv venv --python "${PYTHON_VERSION}"
+
+      - name: Download the shared Rust frontend
+        uses: actions/download-artifact@v4
+        with:
+          name: native-rust-frontend
+          path: .native-rust
+
+      - name: Install build and runtime dependencies
+        shell: bash
+        run: |
+          set -euo pipefail
+          cp .native-rust/vllm-rs vllm/vllm-rs
+          chmod +x vllm/vllm-rs
+          uv pip install --python .venv/bin/python \
+            -r requirements/build/cuda.txt \
+            -r requirements/cuda.txt \
+            --torch-backend=auto
+
+      - name: Run repository checks
+        shell: bash
+        run: bash tools/check_repo.sh
+
+      - name: Build the complete native wheel
+        shell: bash
+        run: |
+          set -euo pipefail
+          rm -rf build dist vllm.egg-info
+          rm -rf .deps/*-build .deps/*-subbuild
+          .venv/bin/python setup.py bdist_wheel --dist-dir=dist
+
+          wheel_path="$(find dist -maxdepth 1 -type f -name '*.whl' -print -quit)"
+          if [[ -z "$wheel_path" ]]; then
+            echo "The build produced no wheel." >&2
+            exit 1
+          fi
+
+          wheel_listing="$RUNNER_TEMP/wheel.listing"
+          unzip -l "$wheel_path" > "$wheel_listing"
+          grep -q "vllm/vllm-rs" "$wheel_listing"
+          grep -q "vllm/_C.abi3.so" "$wheel_listing"
+
+          metadata_name="$(awk '/\.dist-info\/METADATA$/ {print $4; exit}' "$wheel_listing")"
+          unzip -p "$wheel_path" "$metadata_name" > "$RUNNER_TEMP/wheel.metadata"
+          actual_version="$(sed -n 's/^Version: //p' "$RUNNER_TEMP/wheel.metadata" | sed -n '1p')"
+          if [[ "$actual_version" != "$VLLM_VERSION_OVERRIDE" ]]; then
+            echo "Wheel version mismatch: $actual_version != $VLLM_VERSION_OVERRIDE" >&2
+            exit 1
+          fi
+          echo "Validated $(basename "$wheel_path")"
+
+      - name: Upload the native wheel
+        uses: actions/upload-artifact@v4
+        with:
+          name: native-wheel-${{ matrix.name }}
+          path: dist/*.whl
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 3

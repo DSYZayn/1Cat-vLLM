@@ -1,0 +1,160 @@
+name: Full Native Wheel Publish
+
+on:
+  workflow_run:
+    workflows:
+      - Full Native Wheel Build
+    types:
+      - completed
+
+permissions:
+  actions: read
+  contents: write
+
+jobs:
+  publish:
+    if: >-
+      github.event.workflow_run.conclusion == 'success' &&
+      github.event.workflow_run.event == 'workflow_dispatch' &&
+      github.event.workflow_run.head_repository.full_name == github.repository
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    env:
+      GH_TOKEN: ${{ github.token }}
+
+    steps:
+      - name: Download build metadata
+        uses: actions/download-artifact@v4
+        with:
+          github-token: ${{ github.token }}
+          run-id: ${{ github.event.workflow_run.id }}
+          name: native-build-metadata
+          path: metadata
+
+      - name: Download native wheels
+        uses: actions/download-artifact@v4
+        with:
+          github-token: ${{ github.token }}
+          run-id: ${{ github.event.workflow_run.id }}
+          pattern: native-wheel-*
+          merge-multiple: true
+          path: dist
+
+      - name: Validate artifacts
+        id: metadata
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          metadata_file="metadata/native-build-metadata.json"
+          test -s "$metadata_file"
+          source_sha="$(jq -r '.source_sha' "$metadata_file")"
+          build_date="$(jq -r '.build_date' "$metadata_file")"
+          base_release_repo="$(jq -r '.base_release_repo' "$metadata_file")"
+          base_tag="$(jq -r '.base_tag' "$metadata_file")"
+          base_version="$(jq -r '.base_version' "$metadata_file")"
+          rolling_tag="$(jq -r '.rolling_tag' "$metadata_file")"
+          expected_prefix="${base_version}.post${build_date}+"
+
+          mapfile -t wheels < <(find dist -maxdepth 1 -type f -name '*.whl' -print | sort)
+          if [[ "${#wheels[@]}" -eq 0 ]]; then
+            echo "No native wheel artifacts were downloaded." >&2
+            exit 1
+          fi
+
+          for wheel_path in "${wheels[@]}"; do
+            wheel_listing="$RUNNER_TEMP/$(basename "$wheel_path").listing"
+            unzip -l "$wheel_path" > "$wheel_listing"
+            grep -q "vllm/vllm-rs" "$wheel_listing"
+            grep -q "vllm/_C.abi3.so" "$wheel_listing"
+            metadata_name="$(awk '/\.dist-info\/METADATA$/ {print $4; exit}' "$wheel_listing")"
+            unzip -p "$wheel_path" "$metadata_name" \
+              > "$RUNNER_TEMP/$(basename "$wheel_path").metadata"
+            version="$(sed -n 's/^Version: //p' \
+              "$RUNNER_TEMP/$(basename "$wheel_path").metadata" | sed -n '1p')"
+            case "$version" in
+              "${expected_prefix}"*) ;;
+              *)
+                echo "Unexpected wheel version in $(basename "$wheel_path"): $version" >&2
+                exit 1
+                ;;
+            esac
+            sha256sum "$wheel_path"
+          done
+
+          {
+            echo "source_sha=$source_sha"
+            echo "build_date=$build_date"
+            echo "base_release_repo=$base_release_repo"
+            echo "base_tag=$base_tag"
+            echo "base_version=$base_version"
+            echo "rolling_tag=$rolling_tag"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Create or update the native rolling release
+        shell: bash
+        env:
+          SOURCE_SHA: ${{ steps.metadata.outputs.source_sha }}
+          BUILD_DATE: ${{ steps.metadata.outputs.build_date }}
+          BASE_RELEASE_REPO: ${{ steps.metadata.outputs.base_release_repo }}
+          BASE_TAG: ${{ steps.metadata.outputs.base_tag }}
+          ROLLING_TAG: ${{ steps.metadata.outputs.rolling_tag }}
+        run: |
+          set -euo pipefail
+
+          notes_file="$RUNNER_TEMP/native-release-notes.md"
+          cat > "$notes_file" <<EOF
+          Full native rolling wheels for ${BASE_RELEASE_REPO}@${BASE_TAG}.
+
+          - Source: ${SOURCE_SHA}
+          - Build date: ${BUILD_DATE} UTC
+          - CUDA architecture variants: SM70, SM75, SM80, SM90, SM100, SM120
+          - Each asset is a complete wheel built from source without reusing native extensions.
+          EOF
+
+          if gh release view "$ROLLING_TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            gh release edit "$ROLLING_TAG" \
+              --repo "$GITHUB_REPOSITORY" \
+              --title "${BASE_TAG} native rolling update" \
+              --notes-file "$notes_file" \
+              --prerelease
+          else
+            gh release create "$ROLLING_TAG" \
+              --repo "$GITHUB_REPOSITORY" \
+              --target "$SOURCE_SHA" \
+              --title "${BASE_TAG} native rolling update" \
+              --notes-file "$notes_file" \
+              --prerelease
+          fi
+
+          mapfile -t wheel_paths < <(find dist -maxdepth 1 -type f -name '*.whl' -print | sort)
+          for wheel_path in "${wheel_paths[@]}"; do
+            gh release upload "$ROLLING_TAG" "$wheel_path" \
+              --repo "$GITHUB_REPOSITORY" \
+              --clobber
+          done
+
+          mapfile -t current_assets < <(
+            for wheel_path in "${wheel_paths[@]}"; do
+              basename "$wheel_path"
+            done
+          )
+          gh release view "$ROLLING_TAG" --repo "$GITHUB_REPOSITORY" --json assets \
+            --jq '.assets[].name' > "$RUNNER_TEMP/release-assets.txt"
+          while IFS= read -r asset_name; do
+            [[ "$asset_name" == *.whl ]] || continue
+            keep=false
+            for current_asset in "${current_assets[@]}"; do
+              if [[ "$asset_name" == "$current_asset" ]]; then
+                keep=true
+                break
+              fi
+            done
+            if [[ "$keep" != true ]]; then
+              gh release delete-asset "$ROLLING_TAG" "$asset_name" \
+                --repo "$GITHUB_REPOSITORY" --yes || \
+                echo "::warning::Could not remove old asset $asset_name"
+            fi
+          done < "$RUNNER_TEMP/release-assets.txt"
+
+          echo "Published ${#wheel_paths[@]} native wheels to ${ROLLING_TAG}."

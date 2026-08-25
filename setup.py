@@ -492,7 +492,7 @@ class cmake_build_ext(build_ext):
         if should_bundle_tcmalloc():
             bundle_tcmalloc(self.build_lib)
 
-        if _is_cuda():
+        if _is_cuda() and os.getenv("VLLM_BUILD_FLASH_ATTN_V100", "1") != "0":
             bundle_flash_attn_v100(self.build_lib)
             bundle_flash_qla_sm70(self.build_lib, self.build_temp)
 
