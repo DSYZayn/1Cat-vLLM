@@ -180,7 +180,7 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 340
     container:
-      image: nvidia/cuda:13.0.3-devel-ubuntu24.04
+      image: nvidia/cuda:12.8.2-devel-ubuntu24.04
       options: --user 0
     env:
       GH_TOKEN: ${{ github.token }}
