@@ -22,7 +22,7 @@ concurrency:
   cancel-in-progress: false
 
 permissions:
-  contents: write
+  contents: read
 
 jobs:
   prepare:
@@ -154,8 +154,10 @@ jobs:
             --arg base_wheel_url "$base_wheel_url" \
             --arg rust_changed "$rust_changed" \
             --arg rolling_tag "$rolling_tag" \
-            '{source_sha, build_date, base_release_repo, base_tag,
-              base_version, base_wheel_url, rust_changed, rolling_tag}' \
+            '{source_sha: $source_sha, build_date: $build_date,
+              base_release_repo: $base_release_repo, base_tag: $base_tag,
+              base_version: $base_version, base_wheel_url: $base_wheel_url,
+              rust_changed: $rust_changed, rolling_tag: $rolling_tag}' \
             > "$RUNNER_TEMP/native-build-metadata.json"
 
           echo "Source commit: $source_sha"
@@ -329,7 +331,6 @@ jobs:
             echo "Wheel version mismatch: $actual_version != $VLLM_VERSION_OVERRIDE" >&2
             exit 1
           fi
-          echo "WHEEL_PATH=$wheel_path" >> "$GITHUB_ENV"
           echo "Validated $(basename "$wheel_path")"
 
       - name: Upload the native wheel
@@ -340,58 +341,3 @@ jobs:
           if-no-files-found: error
           compression-level: 0
           retention-days: 3
-
-      - name: Publish the native rolling release
-        shell: bash
-        env:
-          SOURCE_SHA: ${{ needs.prepare.outputs.source_sha }}
-          BUILD_DATE: ${{ needs.prepare.outputs.build_date }}
-          BASE_RELEASE_REPO: ${{ needs.prepare.outputs.base_release_repo }}
-          BASE_TAG: ${{ needs.prepare.outputs.base_tag }}
-          EXPECTED_VERSION: ${{ needs.prepare.outputs.base_version }}.post${{ needs.prepare.outputs.build_date }}
-          ROLLING_TAG: ${{ needs.prepare.outputs.rolling_tag }}
-        run: |
-          set -euo pipefail
-
-          notes_file="$RUNNER_TEMP/native-rolling-release-notes.md"
-          cat > "$notes_file" <<EOF
-          Daily native rolling wheel for ${BASE_RELEASE_REPO}@${BASE_TAG}.
-
-          - Source: ${SOURCE_SHA}
-          - Build date: ${BUILD_DATE} UTC
-          - Wheel version: ${EXPECTED_VERSION}
-          - CUDA architecture: SM70 (V100)
-          - Native extensions: built from source
-          EOF
-
-          if gh release view "$ROLLING_TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
-            gh release edit "$ROLLING_TAG" \
-              --repo "$GITHUB_REPOSITORY" \
-              --title "${BASE_TAG} native rolling update" \
-              --notes-file "$notes_file" \
-              --prerelease
-          else
-            gh release create "$ROLLING_TAG" \
-              --repo "$GITHUB_REPOSITORY" \
-              --target "$SOURCE_SHA" \
-              --title "${BASE_TAG} native rolling update" \
-              --notes-file "$notes_file" \
-              --prerelease
-          fi
-
-          gh release upload "$ROLLING_TAG" "$WHEEL_PATH" \
-            --repo "$GITHUB_REPOSITORY" \
-            --clobber
-
-          current_asset="$(basename "$WHEEL_PATH")"
-          gh release view "$ROLLING_TAG" --repo "$GITHUB_REPOSITORY" --json assets \
-            --jq '.assets[].name' \
-            | while IFS= read -r asset_name; do
-                if [[ "$asset_name" == *.whl && "$asset_name" != "$current_asset" ]]; then
-                  gh release delete-asset "$ROLLING_TAG" "$asset_name" \
-                    --repo "$GITHUB_REPOSITORY" --yes || \
-                    echo "::warning::Could not remove old asset $asset_name"
-                fi
-              done
-
-          echo "Published $current_asset to $ROLLING_TAG"
