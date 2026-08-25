@@ -213,7 +213,20 @@ jobs:
           set -euo pipefail
           uv pip install --python .venv/bin/python \
             -r requirements/build/cuda.txt \
-            --torch-backend=auto
+            --torch-backend=cu128
+
+      - name: Verify CUDA PyTorch installation
+        if: steps.metadata.outputs.native_changed != 'true'
+        shell: bash
+        run: |
+          set -euo pipefail
+          .venv/bin/python - <<'PY'
+          import torch
+
+          if torch.version.cuda is None:
+              raise SystemExit("The resolved PyTorch package is CPU-only.")
+          print(f"PyTorch CUDA runtime: {torch.version.cuda}")
+          PY
 
       - name: Build the dated wheel
         if: steps.metadata.outputs.native_changed != 'true'
