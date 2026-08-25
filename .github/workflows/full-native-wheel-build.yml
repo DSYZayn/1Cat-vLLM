@@ -164,6 +164,10 @@ jobs:
           if-no-files-found: error
           retention-days: 3
 
+      - name: Check source repository
+        shell: bash
+        run: bash tools/check_repo.sh
+
   build-cuda:
     needs: prepare
     runs-on: ubuntu-24.04
@@ -262,10 +266,6 @@ jobs:
             -r requirements/build/cuda.txt \
             -r requirements/cuda.txt \
             --torch-backend=auto
-
-      - name: Run repository checks
-        shell: bash
-        run: bash tools/check_repo.sh
 
       - name: Build the complete native wheel
         shell: bash
