@@ -108,11 +108,22 @@ jobs:
             'requirements/common.txt' \
             'flash-attention-v100/**' \
             'flash_qla/**')"
+          rust_files="$(git diff --name-only "$base_commit" "$source_sha" -- \
+            ':(glob)rust/**' \
+            'Cargo.toml' \
+            'Cargo.lock' \
+            'build_rust.sh')"
           native_changed=false
+          rust_changed=false
           if [[ -n "$native_files" ]]; then
             native_changed=true
             echo "Native changes detected since ${base_tag}:"
             printf '%s\n' "$native_files"
+          fi
+          if [[ -n "$rust_files" ]]; then
+            rust_changed=true
+            echo "Rust changes detected since ${base_tag}:"
+            printf '%s\n' "$rust_files"
           fi
 
           rolling_tag="${base_tag}-rolling"
@@ -128,6 +139,7 @@ jobs:
             echo "rolling_tag=$rolling_tag"
             echo "expected_version=$expected_version"
             echo "native_changed=$native_changed"
+            echo "rust_changed=$rust_changed"
           } >> "$GITHUB_OUTPUT"
 
           echo "Source commit: $source_sha"
@@ -136,6 +148,7 @@ jobs:
           echo "Rolling release: $rolling_tag"
           echo "Wheel version: $expected_version"
           echo "Native changes: $native_changed"
+          echo "Rust changes: $rust_changed"
 
       - name: Dispatch full native build
         if: steps.metadata.outputs.native_changed == 'true'
@@ -143,13 +156,15 @@ jobs:
         env:
           SOURCE_SHA: ${{ steps.metadata.outputs.source_sha }}
           BUILD_DATE: ${{ steps.metadata.outputs.build_date }}
+          RUST_CHANGED: ${{ steps.metadata.outputs.rust_changed }}
         run: |
           set -euo pipefail
           gh workflow run full-native-wheel-build.yml \
             --repo "$GITHUB_REPOSITORY" \
             --ref main \
             -f source_sha="$SOURCE_SHA" \
-            -f build_date="$BUILD_DATE"
+            -f build_date="$BUILD_DATE" \
+            -f rust_changed="$RUST_CHANGED"
           echo "Full native wheel build dispatched for ${SOURCE_SHA}."
 
       - name: Set up uv and Python

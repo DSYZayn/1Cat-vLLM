@@ -36,7 +36,7 @@ jobs:
         with:
           github-token: ${{ github.token }}
           run-id: ${{ github.event.workflow_run.id }}
-          pattern: native-wheel-*
+          name: native-wheel
           merge-multiple: true
           path: dist
 
@@ -54,15 +54,22 @@ jobs:
           base_tag="$(jq -r '.base_tag' "$metadata_file")"
           base_version="$(jq -r '.base_version' "$metadata_file")"
           rolling_tag="$(jq -r '.rolling_tag' "$metadata_file")"
-          expected_prefix="${base_version}.post${build_date}+"
+          expected_prefix="${base_version}.post${build_date}"
 
           mapfile -t wheels < <(find dist -maxdepth 1 -type f -name '*.whl' -print | sort)
-          if [[ "${#wheels[@]}" -eq 0 ]]; then
-            echo "No native wheel artifacts were downloaded." >&2
+          if [[ "${#wheels[@]}" -ne 1 ]]; then
+            echo "Expected exactly one native wheel artifact, found ${#wheels[@]}." >&2
             exit 1
           fi
 
           for wheel_path in "${wheels[@]}"; do
+            case "$(basename "$wheel_path")" in
+              *-cp312-cp312-linux_x86_64.whl) ;;
+              *)
+                echo "Unexpected wheel platform: $(basename "$wheel_path")" >&2
+                exit 1
+                ;;
+            esac
             wheel_listing="$RUNNER_TEMP/$(basename "$wheel_path").listing"
             unzip -l "$wheel_path" > "$wheel_listing"
             grep -q "vllm/vllm-rs" "$wheel_listing"
@@ -108,8 +115,9 @@ jobs:
 
           - Source: ${SOURCE_SHA}
           - Build date: ${BUILD_DATE} UTC
-          - CUDA architecture variants: SM70, SM75, SM80, SM90, SM100, SM120
-          - Each asset is a complete wheel built from source without reusing native extensions.
+          - Wheel: cp312-cp312-linux_x86_64
+          - CUDA/C++ extensions are built from source.
+          - The Rust frontend is rebuilt only when Rust sources changed; otherwise it is reused from the stable release wheel.
           EOF
 
           if gh release view "$ROLLING_TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then

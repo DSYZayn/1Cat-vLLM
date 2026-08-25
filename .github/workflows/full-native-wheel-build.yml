@@ -11,6 +11,11 @@ on:
         description: "UTC build date in YYYYMMDD format; empty means today"
         required: false
         type: string
+      rust_changed:
+        description: "Whether Rust sources changed; defaults to rebuilding Rust"
+        required: false
+        default: "true"
+        type: string
 
 concurrency:
   group: full-native-wheel-build-${{ github.repository }}
@@ -27,12 +32,15 @@ jobs:
       GH_TOKEN: ${{ github.token }}
       SOURCE_SHA_INPUT: ${{ inputs.source_sha }}
       BUILD_DATE_INPUT: ${{ inputs.build_date }}
+      RUST_CHANGED_INPUT: ${{ inputs.rust_changed }}
     outputs:
       source_sha: ${{ steps.metadata.outputs.source_sha }}
       build_date: ${{ steps.metadata.outputs.build_date }}
       base_release_repo: ${{ steps.metadata.outputs.base_release_repo }}
       base_tag: ${{ steps.metadata.outputs.base_tag }}
       base_version: ${{ steps.metadata.outputs.base_version }}
+      base_wheel_url: ${{ steps.metadata.outputs.base_wheel_url }}
+      rust_changed: ${{ steps.metadata.outputs.rust_changed }}
       rolling_tag: ${{ steps.metadata.outputs.rolling_tag }}
 
     steps:
@@ -84,6 +92,40 @@ jobs:
             exit 1
           fi
 
+          base_wheel_name="$(jq -r \
+            '[.assets[]? | select(.name | test("cp312-cp312-linux_x86_64\\.whl$")) | .name][0] // empty' \
+            <<< "$release_json")"
+          if [[ -z "$base_wheel_name" && "$base_release_repo" != "$fallback_release_repo" ]]; then
+            base_release_repo="$fallback_release_repo"
+            release_json="$(gh api \
+              "repos/${base_release_repo}/releases/latest")"
+            base_tag="$(jq -r '.tag_name' <<< "$release_json")"
+            base_version="${base_tag#v}"
+            base_wheel_name="$(jq -r \
+              '[.assets[]? | select(.name | test("cp312-cp312-linux_x86_64\\.whl$")) | .name][0] // empty' \
+              <<< "$release_json")"
+          fi
+          if [[ -z "$base_wheel_name" ]]; then
+            echo "No compatible cp312 Linux x86_64 wheel found in ${base_release_repo}." >&2
+            exit 1
+          fi
+          base_wheel_url="$(jq -r --arg name "$base_wheel_name" \
+            '.assets[]? | select(.name == $name) | .browser_download_url' \
+            <<< "$release_json")"
+          if [[ -z "$base_wheel_url" || "$base_wheel_url" == "null" ]]; then
+            echo "Could not resolve the baseline wheel download URL." >&2
+            exit 1
+          fi
+
+          rust_changed="$RUST_CHANGED_INPUT"
+          if [[ -z "$rust_changed" ]]; then
+            rust_changed=true
+          fi
+          if [[ "$rust_changed" != "true" && "$rust_changed" != "false" ]]; then
+            echo "Invalid rust_changed value: $rust_changed" >&2
+            exit 1
+          fi
+
           rolling_tag="${base_tag}-native-rolling"
           {
             echo "source_sha=$source_sha"
@@ -91,6 +133,8 @@ jobs:
             echo "base_release_repo=$base_release_repo"
             echo "base_tag=$base_tag"
             echo "base_version=$base_version"
+            echo "base_wheel_url=$base_wheel_url"
+            echo "rust_changed=$rust_changed"
             echo "rolling_tag=$rolling_tag"
           } >> "$GITHUB_OUTPUT"
 
@@ -100,9 +144,11 @@ jobs:
             --arg base_release_repo "$base_release_repo" \
             --arg base_tag "$base_tag" \
             --arg base_version "$base_version" \
+            --arg base_wheel_url "$base_wheel_url" \
+            --arg rust_changed "$rust_changed" \
             --arg rolling_tag "$rolling_tag" \
             '{source_sha, build_date, base_release_repo, base_tag,
-              base_version, rolling_tag}' \
+              base_version, base_wheel_url, rust_changed, rolling_tag}' \
             > "$RUNNER_TEMP/native-build-metadata.json"
 
           echo "Source commit: $source_sha"
@@ -118,94 +164,24 @@ jobs:
           if-no-files-found: error
           retention-days: 3
 
-  build-rust:
-    needs: prepare
-    runs-on: ubuntu-24.04
-    timeout-minutes: 90
-    steps:
-      - name: Check out the source commit
-        uses: actions/checkout@8e8c483db84b4bee98b60c0593521ed34d9990e8 # v6.0.1
-        with:
-          ref: ${{ needs.prepare.outputs.source_sha }}
-          fetch-depth: 1
-
-      - name: Install Rust build prerequisites
-        shell: bash
-        run: |
-          set -euo pipefail
-          sudo apt-get update
-          sudo apt-get install -y --no-install-recommends \
-            build-essential \
-            ca-certificates \
-            curl \
-            libssl-dev \
-            pkg-config
-
-      - name: Install the pinned Rust toolchain
-        shell: bash
-        run: |
-          set -euo pipefail
-          curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
-            | sh -s -- -y --profile minimal
-          source "$HOME/.cargo/env"
-          rustup toolchain install 1.95.0 --profile minimal
-          echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
-
-      - name: Build the Rust frontend
-        shell: bash
-        run: |
-          set -euo pipefail
-          source "$HOME/.cargo/env"
-          cargo +1.95.0 build \
-            --release \
-            --manifest-path rust/src/cmd/Cargo.toml \
-            --bin vllm-rs
-
-      - name: Upload the Rust frontend
-        uses: actions/upload-artifact@v4
-        with:
-          name: native-rust-frontend
-          path: rust/target/release/vllm-rs
-          if-no-files-found: error
-          retention-days: 3
-
   build-cuda:
-    needs: [prepare, build-rust]
+    needs: prepare
     runs-on: ubuntu-24.04
     timeout-minutes: 340
     container:
       image: nvidia/cuda:13.0.3-devel-ubuntu24.04
       options: --user 0
-    strategy:
-      fail-fast: false
-      max-parallel: 6
-      matrix:
-        include:
-          - name: sm70
-            arch_list: "7.0"
-            build_flash_v100: "1"
-          - name: sm75
-            arch_list: "7.5"
-            build_flash_v100: "0"
-          - name: sm80
-            arch_list: "8.0 8.6 8.9"
-            build_flash_v100: "0"
-          - name: sm90
-            arch_list: "9.0"
-            build_flash_v100: "0"
-          - name: sm100
-            arch_list: "10.0"
-            build_flash_v100: "0"
-          - name: sm120
-            arch_list: "12.0+PTX"
-            build_flash_v100: "0"
     env:
+      GH_TOKEN: ${{ github.token }}
       PYTHON_VERSION: "3.12"
       VLLM_TARGET_DEVICE: cuda
-      VLLM_VERSION_OVERRIDE: ${{ needs.prepare.outputs.base_version }}.post${{ needs.prepare.outputs.build_date }}+${{ matrix.name }}
-      TORCH_CUDA_ARCH_LIST: ${{ matrix.arch_list }}
+      VLLM_VERSION_OVERRIDE: ${{ needs.prepare.outputs.base_version }}.post${{ needs.prepare.outputs.build_date }}
+      VLLM_REQUIRE_RUST_FRONTEND: ${{ needs.prepare.outputs.rust_changed }}
+      RUST_CHANGED: ${{ needs.prepare.outputs.rust_changed }}
+      BASE_WHEEL_URL: ${{ needs.prepare.outputs.base_wheel_url }}
+      TORCH_CUDA_ARCH_LIST: "7.0 7.5 8.0 8.6 8.9 9.0 10.0 12.0+PTX"
       FLASH_ATTN_V100_CUDA_ARCH_LIST: "7.0"
-      VLLM_BUILD_FLASH_ATTN_V100: ${{ matrix.build_flash_v100 }}
+      VLLM_BUILD_FLASH_ATTN_V100: "1"
       MAX_JOBS: "2"
       NVCC_THREADS: "1"
       CMAKE_BUILD_TYPE: Release
@@ -224,6 +200,7 @@ jobs:
             curl \
             git \
             jq \
+            libssl-dev \
             ninja-build \
             patchelf \
             pkg-config \
@@ -251,18 +228,36 @@ jobs:
         shell: bash
         run: uv venv --python "${PYTHON_VERSION}"
 
-      - name: Download the shared Rust frontend
-        uses: actions/download-artifact@v4
-        with:
-          name: native-rust-frontend
-          path: .native-rust
+      - name: Reuse Rust frontend from the latest release
+        if: env.RUST_CHANGED != 'true'
+        shell: bash
+        run: |
+          set -euo pipefail
+          baseline_wheel="$RUNNER_TEMP/base-wheel.whl"
+          curl -fL \
+            -H "Authorization: Bearer ${GH_TOKEN}" \
+            -H "Accept: application/octet-stream" \
+            "$BASE_WHEEL_URL" \
+            -o "$baseline_wheel"
+          unzip -p "$baseline_wheel" vllm/vllm-rs > vllm/vllm-rs
+          test -s vllm/vllm-rs
+          chmod +x vllm/vllm-rs
+
+      - name: Install the pinned Rust toolchain
+        if: env.RUST_CHANGED == 'true'
+        shell: bash
+        run: |
+          set -euo pipefail
+          curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
+            | sh -s -- -y --profile minimal --default-toolchain none
+          source "$HOME/.cargo/env"
+          rustup toolchain install 1.95.0 --profile minimal
+          echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
 
       - name: Install build and runtime dependencies
         shell: bash
         run: |
           set -euo pipefail
-          cp .native-rust/vllm-rs vllm/vllm-rs
-          chmod +x vllm/vllm-rs
           uv pip install --python .venv/bin/python \
             -r requirements/build/cuda.txt \
             -r requirements/cuda.txt \
@@ -285,6 +280,13 @@ jobs:
             echo "The build produced no wheel." >&2
             exit 1
           fi
+          case "$(basename "$wheel_path")" in
+            *-cp312-cp312-linux_x86_64.whl) ;;
+            *)
+              echo "Unexpected wheel platform: $(basename "$wheel_path")" >&2
+              exit 1
+              ;;
+          esac
 
           wheel_listing="$RUNNER_TEMP/wheel.listing"
           unzip -l "$wheel_path" > "$wheel_listing"
@@ -303,7 +305,7 @@ jobs:
       - name: Upload the native wheel
         uses: actions/upload-artifact@v4
         with:
-          name: native-wheel-${{ matrix.name }}
+          name: native-wheel
           path: dist/*.whl
           if-no-files-found: error
           compression-level: 0
