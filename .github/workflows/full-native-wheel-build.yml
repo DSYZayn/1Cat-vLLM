@@ -273,6 +273,9 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
+          sed -E -i \
+            's/^nvidia-cutlass-dsl\[cu13\]([<>=])/nvidia-cutlass-dsl\1/' \
+            requirements/cuda.txt
           uv pip install --python .venv/bin/python \
             -r requirements/build/cuda.txt \
             -r requirements/cuda.txt \
