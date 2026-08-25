@@ -117,6 +117,13 @@ jobs:
             exit 1
           fi
 
+          git fetch --tags --force origin
+          if ! git describe --tags >/dev/null 2>&1; then
+            git fetch --no-tags \
+              "https://github.com/${base_release_repo}.git" \
+              "refs/tags/${base_tag}:refs/tags/${base_tag}"
+          fi
+
           rust_changed="$RUST_CHANGED_INPUT"
           if [[ -z "$rust_changed" ]]; then
             rust_changed=true
