@@ -171,9 +171,11 @@ jobs:
               --notes-file "$notes_file" \
               --prerelease
           else
+            # GITHUB_TOKEN cannot create a release targeting a commit that
+            # changes workflow files. Keep SOURCE_SHA in the notes and let
+            # GitHub target the current default branch for the release tag.
             gh release create "$ROLLING_TAG" \
               --repo "$GITHUB_REPOSITORY" \
-              --target "$SOURCE_SHA" \
               --title "${BASE_TAG} native rolling update" \
               --notes-file "$notes_file" \
               --prerelease
