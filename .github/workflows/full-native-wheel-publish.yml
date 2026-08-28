@@ -1,6 +1,11 @@
 name: Full Native Wheel Publish
 
 on:
+  workflow_run:
+    workflows:
+      - Full Native Wheel Build
+    types:
+      - completed
   workflow_dispatch:
     inputs:
       build_run_id:
@@ -20,13 +25,16 @@ permissions:
 
 jobs:
   publish:
+    if: >-
+      ${{ github.event_name == 'workflow_dispatch' ||
+      github.event.workflow_run.conclusion == 'success' }}
     runs-on: ubuntu-24.04
     environment: actions
     timeout-minutes: 30
     env:
       GH_TOKEN: ${{ github.token }}
-      BUILD_RUN_ID: ${{ inputs.build_run_id }}
-      ARTIFACT_NAME: ${{ inputs.artifact_name || 'native-wheel' }}
+      BUILD_RUN_ID: ${{ inputs.build_run_id || github.event.workflow_run.id }}
+      ARTIFACT_NAME_INPUT: ${{ inputs.artifact_name }}
       AI_SUMMARY_ENABLED: ${{ vars.AI_SUMMARY_ENABLED || 'true' }}
       AI_MODEL: ${{ vars.AI_SUMMARY_MODEL || 'openai/gpt-4o-mini' }}
 
@@ -65,14 +73,39 @@ jobs:
           name: native-build-metadata
           path: metadata
 
-      - name: Download native wheels
-        uses: actions/download-artifact@v4
-        with:
-          github-token: ${{ github.token }}
-          run-id: ${{ env.BUILD_RUN_ID }}
-          name: ${{ env.ARTIFACT_NAME }}
-          merge-multiple: true
-          path: dist
+      - name: Download native wheel artifact
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          artifact_name="${ARTIFACT_NAME_INPUT:-}"
+          if [[ -z "${artifact_name}" ]]; then
+            mapfile -t artifact_names < <(
+              gh api --paginate \
+                "repos/${GITHUB_REPOSITORY}/actions/runs/${BUILD_RUN_ID}/artifacts" \
+                --jq '.artifacts[] | select(.expired == false) | .name'
+            )
+            for candidate in native-wheel-self-hosted native-wheel-official native-wheel; do
+              for available in "${artifact_names[@]}"; do
+                if [[ "${available}" == "${candidate}" ]]; then
+                  artifact_name="${candidate}"
+                  break 2
+                fi
+              done
+            done
+          fi
+
+          if [[ -z "${artifact_name}" ]]; then
+            echo "No native wheel artifact was found for build run ${BUILD_RUN_ID}." >&2
+            exit 1
+          fi
+          echo "Downloading native wheel artifact: ${artifact_name}"
+          rm -rf dist
+          mkdir -p dist
+          gh run download "${BUILD_RUN_ID}" \
+            --repo "${GITHUB_REPOSITORY}" \
+            --name "${artifact_name}" \
+            --dir dist
 
       - name: Validate artifacts
         id: metadata
@@ -197,7 +230,6 @@ jobs:
       - name: Publish the native rolling releases
         shell: bash
         env:
-          GH_TOKEN: ${{ secrets.DOCKER_REPOSITORY_DISPATCH_TOKEN }}
           SOURCE_SHA: ${{ steps.metadata.outputs.source_sha }}
           BUILD_DATE: ${{ steps.metadata.outputs.build_date }}
           BASE_TAG: ${{ steps.metadata.outputs.base_tag }}
