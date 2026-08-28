@@ -414,6 +414,7 @@ jobs:
             git \
             jq \
             libssl-dev \
+            libprotobuf-dev \
             ninja-build \
             patchelf \
             pkg-config \
@@ -496,6 +497,9 @@ jobs:
           set -euo pipefail
           sed -E -i \
             's/^nvidia-cutlass-dsl\[cu13\]([<>=])/nvidia-cutlass-dsl\1/' \
+            requirements/cuda.txt
+          sed -E -i \
+            's/^apache-tvm-ffi==0\.1\.10$/apache-tvm-ffi==0.1.13/' \
             requirements/cuda.txt
           if ! uv pip install --python .venv/bin/python \
             -r requirements/build/cuda.txt \

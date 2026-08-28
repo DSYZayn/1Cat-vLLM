@@ -72,6 +72,7 @@ build_packages=(
   git \
   jq \
   libssl-dev \
+  libprotobuf-dev \
   ninja-build \
   patchelf \
   pkg-config \
