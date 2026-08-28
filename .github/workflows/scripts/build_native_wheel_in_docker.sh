@@ -150,6 +150,11 @@ fi
 sed -E -i \
   's/^nvidia-cutlass-dsl\[cu13\]([<>=])/nvidia-cutlass-dsl\1/' \
   requirements/cuda.txt
+# tokenspeed-mla 0.2.5 requires the newer TVM FFI release. Keep this
+# compatibility override inside CI so upstream-synced source files stay intact.
+sed -E -i \
+  's/^apache-tvm-ffi==0\.1\.10$/apache-tvm-ffi==0.1.13/' \
+  requirements/cuda.txt
 if ! uv pip install --python .venv/bin/python \
   -r requirements/build/cuda.txt \
   -r requirements/cuda.txt \
