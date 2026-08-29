@@ -1,11 +1,26 @@
 name: Full Native Wheel Publish
 
 on:
+  workflow_run:
+    workflows:
+      - Full Native Wheel Build
+    types:
+      - completed
   workflow_dispatch:
     inputs:
       build_run_id:
         description: "Successful Full Native Wheel Build run ID to publish"
         required: true
+        type: string
+      artifact_name:
+        description: "Native wheel artifact name; leave empty to auto-detect"
+        required: false
+        type: string
+  workflow_call:
+    inputs:
+      build_run_id:
+        description: "Successful Full Native Wheel Build run ID to publish"
+        required: false
         type: string
       artifact_name:
         description: "Native wheel artifact name; leave empty to auto-detect"
@@ -19,12 +34,15 @@ permissions:
 
 jobs:
   publish:
+    if: >-
+      ${{ github.event_name != 'workflow_run' ||
+      github.event.workflow_run.conclusion == 'success' }}
     runs-on: ubuntu-24.04
     environment: actions
     timeout-minutes: 30
     env:
       GH_TOKEN: ${{ github.token }}
-      BUILD_RUN_ID: ${{ inputs.build_run_id }}
+      BUILD_RUN_ID: ${{ inputs.build_run_id || github.event.workflow_run.id || github.run_id }}
       ARTIFACT_NAME_INPUT: ${{ inputs.artifact_name }}
       AI_SUMMARY_ENABLED: ${{ vars.AI_SUMMARY_ENABLED || 'true' }}
       AI_MODEL: ${{ vars.AI_SUMMARY_MODEL || 'openai/gpt-4o-mini' }}
@@ -36,18 +54,20 @@ jobs:
           set -euo pipefail
 
           run_json="$(gh api "repos/${GITHUB_REPOSITORY}/actions/runs/${BUILD_RUN_ID}")"
-          [[ "$(jq -r '.name' <<< "$run_json")" == "Full Native Wheel Build" ]] || {
-            echo "Run ${BUILD_RUN_ID} is not a Full Native Wheel Build run." >&2
-            exit 1
-          }
-          [[ "$(jq -r '.conclusion' <<< "$run_json")" == "success" ]] || {
-            echo "Build run ${BUILD_RUN_ID} did not succeed." >&2
-            exit 1
-          }
-          [[ "$(jq -r '.head_repository.full_name' <<< "$run_json")" == "$GITHUB_REPOSITORY" ]] || {
-            echo "Build run ${BUILD_RUN_ID} is from another repository." >&2
-            exit 1
-          }
+          if [[ "$GITHUB_EVENT_NAME" != "workflow_call" ]]; then
+            [[ "$(jq -r '.name' <<< "$run_json")" == "Full Native Wheel Build" ]] || {
+              echo "Run ${BUILD_RUN_ID} is not a Full Native Wheel Build run." >&2
+              exit 1
+            }
+            [[ "$(jq -r '.conclusion' <<< "$run_json")" == "success" ]] || {
+              echo "Build run ${BUILD_RUN_ID} did not succeed." >&2
+              exit 1
+            }
+            [[ "$(jq -r '.head_repository.full_name' <<< "$run_json")" == "$GITHUB_REPOSITORY" ]] || {
+              echo "Build run ${BUILD_RUN_ID} is from another repository." >&2
+              exit 1
+            }
+          fi
           echo "BUILD_HEAD_SHA=$(jq -r '.head_sha' <<< "$run_json")" >> "$GITHUB_ENV"
 
       - name: Check out the source for release notes

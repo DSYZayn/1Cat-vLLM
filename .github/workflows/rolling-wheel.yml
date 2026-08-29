@@ -14,7 +14,7 @@ concurrency:
 
 permissions:
   actions: write
-  contents: read
+  contents: write
 
 jobs:
   resolve:
@@ -58,27 +58,11 @@ jobs:
           echo "Source commit: $source_sha"
           echo "Build date: $build_date UTC+8"
 
-  dispatch_native:
-    name: Dispatch full native build
+  build_native:
+    name: Build full native wheel
     needs: resolve
-    if: needs.resolve.result == 'success'
-    runs-on: ubuntu-24.04
-    timeout-minutes: 10
-    permissions:
-      actions: write
-      contents: read
-    env:
-      GH_TOKEN: ${{ github.token }}
-      SOURCE_SHA: ${{ needs.resolve.outputs.source_sha }}
-      BUILD_DATE: ${{ needs.resolve.outputs.build_date }}
-    steps:
-      - name: Dispatch full native build
-        shell: bash
-        run: |
-          set -euo pipefail
-          gh workflow run full-native-wheel-build.yml \
-            --repo "$GITHUB_REPOSITORY" \
-            --ref main \
-            -f source_sha="$SOURCE_SHA" \
-            -f build_date="$BUILD_DATE"
-          echo "Full native wheel build dispatched for ${SOURCE_SHA}."
+    uses: ./.github/workflows/full-native-wheel-build.yml
+    with:
+      source_sha: ${{ needs.resolve.outputs.source_sha }}
+      build_date: ${{ needs.resolve.outputs.build_date }}
+    secrets: inherit

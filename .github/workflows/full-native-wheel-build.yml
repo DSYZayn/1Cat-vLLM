@@ -23,6 +23,28 @@ on:
         description: "Previous daily build source SHA; empty means resolve it"
         required: false
         type: string
+  workflow_call:
+    inputs:
+      source_sha:
+        description: "Exact main commit to build; empty means current main"
+        required: false
+        type: string
+      build_date:
+        description: "UTC+8 build date in YYYYMMDD format; empty means today"
+        required: false
+        type: string
+      rust_changed:
+        description: "Override whether Rust sources changed; empty means detect"
+        required: false
+        type: string
+      daily_tag:
+        description: "Daily native rolling release tag; empty means derive it"
+        required: false
+        type: string
+      previous_source_sha:
+        description: "Previous daily build source SHA; empty means resolve it"
+        required: false
+        type: string
 
 concurrency:
   group: full-native-wheel-build-${{ github.repository }}
@@ -30,7 +52,7 @@ concurrency:
 
 permissions:
   actions: write
-  contents: read
+  contents: write
   models: read
 
 jobs:
@@ -553,30 +575,17 @@ jobs:
           retention-days: 3
 
   publish:
-    name: Dispatch native wheel publish
+    name: Publish native wheel
     needs: [build_self_hosted, build_official]
     if: >-
-      ${{ !cancelled() &&
+      ${{ github.event_name == 'workflow_call' &&
+      !cancelled() &&
       (
         needs.build_self_hosted.result == 'success' ||
         needs.build_official.result == 'success'
       ) }}
-    runs-on: ubuntu-24.04
-    timeout-minutes: 10
-    permissions:
-      actions: write
-      contents: read
-    env:
-      GH_TOKEN: ${{ github.token }}
-      ARTIFACT_NAME: ${{ needs.build_self_hosted.result == 'success' && 'native-wheel-self-hosted' || 'native-wheel-official' }}
-    steps:
-      - name: Dispatch native wheel publish
-        shell: bash
-        run: |
-          set -euo pipefail
-          gh workflow run full-native-wheel-publish.yml \
-            --repo "$GITHUB_REPOSITORY" \
-            --ref main \
-            -f build_run_id="$GITHUB_RUN_ID" \
-            -f artifact_name="$ARTIFACT_NAME"
-          echo "Native wheel publish dispatched for build run ${GITHUB_RUN_ID}."
+    uses: ./.github/workflows/full-native-wheel-publish.yml
+    with:
+      build_run_id: ${{ github.run_id }}
+      artifact_name: ${{ needs.build_self_hosted.result == 'success' && 'native-wheel-self-hosted' || 'native-wheel-official' }}
+    secrets: inherit
