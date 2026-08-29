@@ -215,7 +215,6 @@ jobs:
       - name: Publish the native rolling releases
         shell: bash
         env:
-          GH_TOKEN: ${{ secrets.DOCKER_REPOSITORY_DISPATCH_TOKEN }}
           SOURCE_SHA: ${{ steps.metadata.outputs.source_sha }}
           BUILD_DATE: ${{ steps.metadata.outputs.build_date }}
           BASE_TAG: ${{ steps.metadata.outputs.base_tag }}
