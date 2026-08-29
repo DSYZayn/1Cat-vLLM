@@ -1,0 +1,84 @@
+name: Daily Rolling Wheel
+
+on:
+  workflow_run:
+    workflows:
+      - Upstream Sync
+    types:
+      - completed
+  workflow_dispatch:
+
+concurrency:
+  group: rolling-wheel-${{ github.repository }}
+  cancel-in-progress: false
+
+permissions:
+  actions: write
+  contents: read
+
+jobs:
+  resolve:
+    if: >-
+      ${{ github.event_name == 'workflow_dispatch' ||
+      github.event.workflow_run.conclusion == 'success' }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    outputs:
+      source_sha: ${{ steps.metadata.outputs.source_sha }}
+      build_date: ${{ steps.metadata.outputs.build_date }}
+
+    steps:
+      - name: Check out the latest main branch
+        uses: actions/checkout@8e8c483db84b4bee98b60c0593521ed34d9990e8 # v6.0.1
+        with:
+          ref: main
+          fetch-depth: 0
+
+      - name: Resolve source metadata
+        id: metadata
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          git fetch origin main --prune
+          git checkout --detach origin/main
+
+          source_sha="$(git rev-parse HEAD)"
+          build_date="$(TZ=Asia/Shanghai date +%Y%m%d)"
+          if [[ ! "$build_date" =~ ^[0-9]{8}$ ]]; then
+            echo "Invalid build date: $build_date" >&2
+            exit 1
+          fi
+
+          {
+            echo "source_sha=$source_sha"
+            echo "build_date=$build_date"
+          } >> "$GITHUB_OUTPUT"
+
+          echo "Source commit: $source_sha"
+          echo "Build date: $build_date UTC+8"
+
+  dispatch_native:
+    name: Dispatch full native build
+    needs: resolve
+    if: needs.resolve.result == 'success'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      actions: write
+      contents: read
+    env:
+      GH_TOKEN: ${{ github.token }}
+      SOURCE_SHA: ${{ needs.resolve.outputs.source_sha }}
+      BUILD_DATE: ${{ needs.resolve.outputs.build_date }}
+    steps:
+      - name: Dispatch full native build
+        shell: bash
+        run: |
+          set -euo pipefail
+          gh workflow run full-native-wheel-build.yml \
+            --repo "$GITHUB_REPOSITORY" \
+            --ref main \
+            -f source_sha="$SOURCE_SHA" \
+            -f build_date="$BUILD_DATE"
+          echo "Full native wheel build dispatched for ${SOURCE_SHA}."
