@@ -1,11 +1,6 @@
 name: Full Native Wheel Publish
 
 on:
-  workflow_run:
-    workflows:
-      - Full Native Wheel Build
-    types:
-      - completed
   workflow_dispatch:
     inputs:
       build_run_id:
@@ -13,9 +8,8 @@ on:
         required: true
         type: string
       artifact_name:
-        description: "Native wheel artifact name; defaults to native-wheel for legacy runs"
+        description: "Native wheel artifact name; leave empty to auto-detect"
         required: false
-        default: native-wheel
         type: string
 
 permissions:
@@ -25,15 +19,12 @@ permissions:
 
 jobs:
   publish:
-    if: >-
-      ${{ github.event_name == 'workflow_dispatch' ||
-      github.event.workflow_run.conclusion == 'success' }}
     runs-on: ubuntu-24.04
     environment: actions
     timeout-minutes: 30
     env:
       GH_TOKEN: ${{ github.token }}
-      BUILD_RUN_ID: ${{ inputs.build_run_id || github.event.workflow_run.id }}
+      BUILD_RUN_ID: ${{ inputs.build_run_id }}
       ARTIFACT_NAME_INPUT: ${{ inputs.artifact_name }}
       AI_SUMMARY_ENABLED: ${{ vars.AI_SUMMARY_ENABLED || 'true' }}
       AI_MODEL: ${{ vars.AI_SUMMARY_MODEL || 'openai/gpt-4o-mini' }}
