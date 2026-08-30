@@ -45,6 +45,11 @@ on:
         description: "Previous daily build source SHA; empty means resolve it"
         required: false
         type: string
+      publish_inline:
+        description: "Publish the wheel as part of this reusable workflow run"
+        required: false
+        default: false
+        type: boolean
 
 concurrency:
   group: full-native-wheel-build-${{ github.repository }}
@@ -578,7 +583,7 @@ jobs:
     name: Publish native wheel
     needs: [build_self_hosted, build_official]
     if: >-
-      ${{ github.event_name == 'workflow_call' &&
+      ${{ inputs.publish_inline &&
       !cancelled() &&
       (
         needs.build_self_hosted.result == 'success' ||
@@ -588,4 +593,5 @@ jobs:
     with:
       build_run_id: ${{ github.run_id }}
       artifact_name: ${{ needs.build_self_hosted.result == 'success' && 'native-wheel-self-hosted' || 'native-wheel-official' }}
+      inline_publish: true
     secrets: inherit

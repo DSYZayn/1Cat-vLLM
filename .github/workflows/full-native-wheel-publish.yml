@@ -26,6 +26,11 @@ on:
         description: "Native wheel artifact name; leave empty to auto-detect"
         required: false
         type: string
+      inline_publish:
+        description: "Called from the build workflow in the same run"
+        required: false
+        default: false
+        type: boolean
 
 permissions:
   actions: read
@@ -44,6 +49,7 @@ jobs:
       GH_TOKEN: ${{ github.token }}
       BUILD_RUN_ID: ${{ inputs.build_run_id || github.event.workflow_run.id || github.run_id }}
       ARTIFACT_NAME_INPUT: ${{ inputs.artifact_name }}
+      INLINE_PUBLISH: ${{ inputs.inline_publish }}
       AI_SUMMARY_ENABLED: ${{ vars.AI_SUMMARY_ENABLED || 'true' }}
       AI_MODEL: ${{ vars.AI_SUMMARY_MODEL || 'openai/gpt-4o-mini' }}
 
@@ -54,7 +60,7 @@ jobs:
           set -euo pipefail
 
           run_json="$(gh api "repos/${GITHUB_REPOSITORY}/actions/runs/${BUILD_RUN_ID}")"
-          if [[ "$GITHUB_EVENT_NAME" != "workflow_call" ]]; then
+          if [[ "${INLINE_PUBLISH:-false}" != "true" ]]; then
             [[ "$(jq -r '.name' <<< "$run_json")" == "Full Native Wheel Build" ]] || {
               echo "Run ${BUILD_RUN_ID} is not a Full Native Wheel Build run." >&2
               exit 1

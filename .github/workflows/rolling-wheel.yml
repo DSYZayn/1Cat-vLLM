@@ -66,4 +66,5 @@ jobs:
     with:
       source_sha: ${{ needs.resolve.outputs.source_sha }}
       build_date: ${{ needs.resolve.outputs.build_date }}
+      publish_inline: true
     secrets: inherit
