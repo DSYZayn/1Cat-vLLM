@@ -15,6 +15,7 @@ concurrency:
 permissions:
   actions: write
   contents: write
+  models: read
 
 jobs:
   resolve:
