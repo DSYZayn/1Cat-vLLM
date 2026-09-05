@@ -60,6 +60,14 @@ tracked separately in
 That attention correction is not included here. Runtime results are from the
 frozen `fbcef6e2f9`-based validation stack, not a retest of later upstream main.
 
+All measured arms also freeze the existing `VLLM_SM70_QWEN38_FP16_GEMV=1`,
+`VLLM_SM70_QWEN38_FUSED_HC_FP16=1`,
+`VLLM_SM70_QWEN38_FUSED_GDN_INPUT_FP16=1`, and
+`VLLM_SM70_QSA_INDEXER_CUBLAS=1` opt-ins. Runtime-lossy online QPN8 is off.
+Actual collectives on this PCIe validation stack use PyNCCL; the later
+fully-connected custom-AR HC-sharding results from SXM2 systems do not imply
+that the same optimized route was active here.
+
 Each cell has a 16-token warmup and one scored request batch with a 320-token
 output limit, `ignore_eos=false`, `min_tokens=0`, greedy decoding, and frozen
 prompt token IDs. The numbered-list prompts request enough output to reach
