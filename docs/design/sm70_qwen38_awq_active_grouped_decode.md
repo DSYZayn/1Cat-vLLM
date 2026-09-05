@@ -173,8 +173,48 @@ the grouped-decode flag. Added boundary tests verify that indexed prefill and
 grouped decode never both admit the same token count. The original validated
 branch is retained. The new base also changes HC, NVFP4 dispatch and scratch
 lifetimes: the historical GPU results above are **not** a GPU acceptance of
-this new integrated tree. Keep the fork PR in draft until that integration
-has been built and GPU-validated; CPU checks cannot close this gate.
+this new integrated tree. The separate integration run below closes the bounded
+model acceptance gate; final human review remains required before promotion.
+
+### Aligned-tree integration acceptance (2026-09-05, r2)
+
+The native extensions were rebuilt from `b50bb1f5037d` on base `755baae1d075`.
+Both formats additionally use the separate QSA ordering port `05c46b2cd0` and
+its matching Flash-V100 Python package and rebuilt extension. No production
+changes were made after these binaries were built. Each AWQ cell was scored
+once with grouped decode and the optional existing autotune enabled; shared
+expert overlap was disabled. This is integration acceptance, not a new matched
+grouped-OFF/ON experiment or evidence that all changes come from this PR.
+
+| AWQ cell | Pure aggregate tok/s | Mean pure ITL ms | Prefill+mixed s | Pure window s | E2E s |
+|---|---:|---:|---:|---:|---:|
+| C1×64K | 51.2897 | 19.4971 | 14.5356 | 6.2196 | 20.7552 |
+| C4×64K | 131.7116 | 30.3694 | 79.8826 | 8.9286 | 89.4635 |
+| C8×16K | 247.5878 | 32.3118 | 31.3695 | 9.8228 | 41.6304 |
+
+The frozen inputs, natural-EOS 320-token cap and pure-window accounting are
+unchanged: 319/294/304 tokens per request, no multi-token deliveries. All
+18 short quality requests stopped at EOS, passed basic answer checks and had
+finite recorded logprobs. Same-arm C4 repeats matched complete token IDs and
+top-5 logprobs in 4/4 cases. The post-score C1 profile matched the scored output.
+This is bounded quality evidence, not cross-version bitwise or broad quality
+acceptance; the precision deferral above remains unchanged.
+
+All four workers reported 48 admitted grouped layers and tuning enabled.
+Startup took 438.4613 seconds, KV capacity was 441,392 tokens (563×784), and
+graph memory was 0.37 GiB. The model exited with status 0 and no OOM. Python
+resource-tracker cleanup warnings at shutdown are retained in the raw log;
+the completed scores and profile are not reclassified as a clean shutdown log.
+
+The first integration attempt failed before long-context scoring: QSA imported
+an image-local 18-argument XQA binding, while the hash check inspected a
+different top-level 19-argument module. Fixing the harness package path and
+checking actual binding identity plus argument conversion resolved that
+runtime mismatch. No attention route, quality gate or precision setting was
+disabled. Failed and successful evidence remain separate under experiment ID
+`qwen38-c1-main-20260905-r2` (successful AWQ/NVFP4) and its unsuffixed failed run.
+This investigation did not require another change to the PR's five production
+files. GPU integration acceptance does not imply production deployment.
 
 C1 is a separate follow-up for **both AWQ and NVFP4**, not merely an attempt
 to reach NVFP4's current speed. Investigate shared projection/HC, attention
