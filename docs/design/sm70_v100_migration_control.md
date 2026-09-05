@@ -2,6 +2,18 @@
 
 Date: 2026-05-30
 
+## QUASAR + DFlash2 operator audit, 2026-09-06
+
+See [the operator audit](sm70_quasar_dflash2_operator_audit.md) for the frozen
+`755baae1d075ee04fa9096b23fc0225b23589a86` baseline, per-operator error
+tables, sampling-boundary fixes, and rejected diagnostic evidence. C1
+captures and the original concatenated GDN QKV oracle are invalid for
+production numerical conclusions. C2 residuals and q8 state updates are
+exact under their staged contracts. E5M2 conversion and LM-head rounding
+remain distinct precision concerns. Keep this change in Draft: final
+complete-round costs are 20.781/19.941 ms versus 18.037/17.588 ms, and the
+three-case Plus smoke is 0/3 versus the old DFlash 1/3.
+
 ## Objective
 
 Target tree:

@@ -1617,11 +1617,11 @@ def test_lm_head_candidate_interface_falls_back_when_rerank_is_disabled(monkeypa
     )
 
 
-@pytest.mark.parametrize("selector_k", [16, 20])
+@pytest.mark.parametrize("selector_k", [16, 20, 21])
 @pytest.mark.parametrize("num_rows", [1, 7, 8])
 def test_qpn8_rerank_output_buffers_are_contiguous(selector_k, num_rows):
     layer = SimpleNamespace()
-    for top_k in (16, 20):
+    for top_k in (16, 20, 21):
         setattr(
             layer,
             f"_sm70_dflash2_rerank_values_{top_k}",

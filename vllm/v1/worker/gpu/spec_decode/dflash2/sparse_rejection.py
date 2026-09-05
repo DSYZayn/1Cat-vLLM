@@ -31,6 +31,35 @@ _SELECTOR_ALIGNMENT_DUMP_COUNT = 0
 _SELECTOR_ALIGNMENT_STEP = 0
 
 
+def _compact_target_requires_reference(
+    probe_logits: torch.Tensor,
+    temperature: float,
+    top_p: float,
+) -> bool:
+    """Keep ambiguous cutoffs on the full-vocabulary sampling contract.
+
+    The 21st candidate detects a tie crossing top-20. Ties wholly inside the
+    retained nucleus are harmless; ties split by top-p need the reference's
+    vocabulary tie order. The small CDF guard also covers FP32 scan rounding.
+    This is called outside the model CUDA graphs, once per B1 verification.
+    """
+    # The branch needs one host decision anyway. Copy the tiny B1 probe once
+    # instead of launching a chain of GPU reductions followed by the same fence.
+    probe = probe_logits.detach().cpu().float().numpy()
+    logits = probe[:, :_TARGET_TOP_K] / temperature
+    exp_logits = np.exp(logits - logits.max(axis=-1, keepdims=True))
+    probs = exp_logits / exp_logits.sum(axis=-1, keepdims=True)
+    before = probs.cumsum(axis=-1) - probs
+    keep = before < top_p
+    cutoff_tie = probe[:, -2] == probe[:, -1]
+    nucleus_tie = (
+        (logits[:, :-1] == logits[:, 1:]) & (keep[:, :-1] != keep[:, 1:])
+    ).any(axis=-1)
+    near_cutoff = np.abs(before - top_p).min(axis=-1) <= (16 * np.finfo(np.float32).eps)
+    ambiguous = cutoff_tie | ((nucleus_tie | near_cutoff) & (top_p < 1.0))
+    return bool(ambiguous.any())
+
+
 def _parse_alignment_steps(raw_steps: str | None) -> set[int] | None:
     if not raw_steps:
         return None
@@ -219,8 +248,21 @@ def try_dflash2_sparse_target_rejection(
     draft_topk_ids, draft_topk_logits = sparse_draft_logits
     target_topk_ids, target_topk_logits = model.get_topk_tokens_and_logits(
         sample_hidden_states,
-        _TARGET_TOP_K,
+        _TARGET_TOP_K + 1,
     )
+    idx = input_batch.idx_mapping_np[0]
+    states = rejection_sampler.sampler.sampling_states
+    if _compact_target_requires_reference(
+        target_topk_logits,
+        float(states.temperature.np[idx]),
+        float(states.top_p.np[idx]),
+    ):
+        logger.info_once(
+            "DFlash2 target cutoff requires full-vocabulary reference sampling."
+        )
+        return None
+    target_topk_ids = target_topk_ids[:, :_TARGET_TOP_K]
+    target_topk_logits = target_topk_logits[:, :_TARGET_TOP_K]
     draft_sampled = input_batch.input_ids[input_batch.logits_indices]
     pos = input_batch.positions[input_batch.logits_indices]
     sampled, num_sampled = dflash2_sparse_topk_rejection_sample(

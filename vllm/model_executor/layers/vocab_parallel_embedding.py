@@ -266,7 +266,7 @@ def _prepare_sm70_dflash2_qpn8_rerank(layer: torch.nn.Module) -> bool:
     # [max_rows, 20] allocation for top-16 leaves a row stride of 20 and makes
     # the result non-contiguous.  The TP all-gather requires contiguous inputs,
     # and inserting a runtime contiguous() copy would add work to both graphs.
-    for selector_k in (16, 20):
+    for selector_k in (16, 20, 21):
         layer.register_buffer(
             f"_sm70_dflash2_rerank_values_{selector_k}",
             torch.empty((max_rows, selector_k), dtype=torch.float16, device=device),
@@ -299,7 +299,7 @@ def _sm70_dflash2_rerank_output_buffers(
     num_rows: int,
     selector_k: int,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    """Select graph-stable, contiguous rerank outputs for top-16 or top-20."""
+    """Select contiguous rerank outputs, including the target tie sentinel."""
     if selector_k == 16:
         values = layer._sm70_dflash2_rerank_values_16[:num_rows]
         positions = layer._sm70_dflash2_rerank_positions_16[:num_rows]
@@ -308,6 +308,10 @@ def _sm70_dflash2_rerank_output_buffers(
         values = layer._sm70_dflash2_rerank_values_20[:num_rows]
         positions = layer._sm70_dflash2_rerank_positions_20[:num_rows]
         ids = layer._sm70_dflash2_rerank_ids_20[:num_rows]
+    elif selector_k == 21:
+        values = layer._sm70_dflash2_rerank_values_21[:num_rows]
+        positions = layer._sm70_dflash2_rerank_positions_21[:num_rows]
+        ids = layer._sm70_dflash2_rerank_ids_21[:num_rows]
     else:
         raise ValueError(f"Unsupported DFlash2 rerank top-k: {selector_k}")
     return values, positions, ids
@@ -522,7 +526,9 @@ def _maybe_sm70_dflash2_qpn8_rerank(
         return None
     if not getattr(layer, "_sm70_dflash2_qpn8_rerank_prepared", False):
         return None
-    if selector_k not in (16, 20) or bias is not None:
+    if selector_k not in (16, 20, 21) or bias is not None:
+        return None
+    if selector_k == 21 and not _sm70_dflash2_use_dense_order():
         return None
     if x.dtype != torch.float16 or not x.is_cuda:
         return None
