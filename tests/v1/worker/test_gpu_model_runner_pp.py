@@ -136,3 +136,82 @@ def test_mamba_neutral_pp_update_accepts_int32_slot_indices(monkeypatch) -> None
     state.postprocess_state(idx_mapping, 0)
 
     assert launches == [(idx_mapping, 1)]
+
+
+# ---------------------------------------------------------------------------
+# PLE under PP: the runner gate follows the partition, not the PP size (#479)
+# ---------------------------------------------------------------------------
+
+
+def _pp2_vllm_config_with_ple(ple_layer_ids: list[int]):
+    from vllm.config import (
+        CacheConfig,
+        ModelConfig,
+        ParallelConfig,
+        SchedulerConfig,
+        VllmConfig,
+    )
+
+    model_config = ModelConfig(model="facebook/opt-125m", dtype="float16", seed=42)
+    # Give the text config the PLE shape of a Qwen4Exp checkpoint.
+    model_config.hf_text_config.ple_layer_ids = ple_layer_ids
+    model_config.hf_text_config.ngram_size = 3
+    # A world of two ranks in a single-GPU test process: set after
+    # construction, the validator would otherwise count the local GPUs.
+    parallel_config = ParallelConfig()
+    parallel_config.pipeline_parallel_size = 2
+    return VllmConfig(
+        model_config=model_config,
+        cache_config=CacheConfig(
+            block_size=16, gpu_memory_utilization=0.9, cache_dtype="auto"
+        ),
+        scheduler_config=SchedulerConfig(
+            max_num_seqs=10,
+            max_num_batched_tokens=512,
+            max_model_len=512,
+            is_encoder_decoder=model_config.is_encoder_decoder,
+        ),
+        parallel_config=parallel_config,
+    )
+
+
+def _patch_pp_group(monkeypatch) -> None:
+    monkeypatch.setattr(
+        "vllm.v1.worker.gpu_model_runner.get_pp_group",
+        lambda: SimpleNamespace(
+            world_size=2,
+            rank=0,
+            rank_in_group=0,
+            ranks=[0, 1],
+            is_first_rank=True,
+            is_last_rank=False,
+        ),
+    )
+
+
+def test_runner_accepts_pp2_with_ple_layers_on_first_rank(monkeypatch) -> None:
+    from vllm.config import set_current_vllm_config
+    from vllm.platforms import current_platform
+    from vllm.v1.worker.gpu_model_runner import GPUModelRunner
+
+    _patch_pp_group(monkeypatch)
+    monkeypatch.delenv("VLLM_PP_LAYER_PARTITION", raising=False)
+    vllm_config = _pp2_vllm_config_with_ple([2])  # decoder layer 1 of 12
+    with set_current_vllm_config(vllm_config):
+        runner = GPUModelRunner(vllm_config, current_platform.device_type)
+    assert runner.uses_ngram_embedding
+
+
+def test_runner_rejects_pp2_with_ple_layer_on_second_rank(monkeypatch) -> None:
+    from vllm.config import set_current_vllm_config
+    from vllm.platforms import current_platform
+    from vllm.v1.worker.gpu_model_runner import GPUModelRunner
+
+    _patch_pp_group(monkeypatch)
+    monkeypatch.delenv("VLLM_PP_LAYER_PARTITION", raising=False)
+    vllm_config = _pp2_vllm_config_with_ple([10])  # decoder layer 9 of 12
+    with (
+        set_current_vllm_config(vllm_config),
+        pytest.raises(RuntimeError, match="first pipeline rank"),
+    ):
+        GPUModelRunner(vllm_config, current_platform.device_type)

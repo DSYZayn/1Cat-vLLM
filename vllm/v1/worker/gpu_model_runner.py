@@ -1405,8 +1405,14 @@ class GPUModelRunner(
             self.ngram_eos_token_id = 0
         if self.uses_ngram_embedding and self.ngram_context_len <= 0:
             raise ValueError("N-gram embedding requires context length >= 1")
-        if self.uses_ngram_embedding and parallel_config.pipeline_parallel_size > 1:
-            raise RuntimeError("N-gram PLE embedding requires pipeline_parallel_size=1")
+        if self.uses_ngram_embedding:
+            from vllm.models.qwen4_exp.common.ple import (
+                check_ple_layers_on_first_pp_rank,
+            )
+
+            check_ple_layers_on_first_pp_rank(
+                model_config.hf_text_config, parallel_config.pipeline_parallel_size
+            )
         self._ple_offload_connector: Any | None = None
 
         self.cascade_attn_enabled = not self.model_config.disable_cascade_attn

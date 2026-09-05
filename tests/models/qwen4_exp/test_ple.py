@@ -5,6 +5,7 @@ from concurrent.futures import ThreadPoolExecutor
 from types import SimpleNamespace
 
 import pytest
+import regex as re
 import torch
 from torch import nn
 from torch.nn import functional as F
@@ -771,3 +772,60 @@ def test_ple_state_shape_reserves_speculative_tokens() -> None:
     module.num_spec_tokens = 3
 
     assert module.get_state_shape()[0] in ((32, 12), (12, 32))
+
+
+# ---------------------------------------------------------------------------
+# PP gate: the pipeline partition decides, not the pipeline size (#479)
+# ---------------------------------------------------------------------------
+
+
+def _text_config(ple_layer_ids, num_hidden_layers=48):
+    return SimpleNamespace(
+        ple_layer_ids=ple_layer_ids, num_hidden_layers=num_hidden_layers
+    )
+
+
+@pytest.mark.parametrize(
+    ("ple_layer_ids", "pp_size", "partition"),
+    [
+        pytest.param([2], 1, None, id="pp1"),
+        pytest.param([2], 2, None, id="pp2-even-split"),
+        pytest.param([2], 2, "2,46", id="pp2-custom-split-rank0-holds-layer1"),
+        pytest.param([2, 24], 2, None, id="pp2-two-ple-layers-on-rank0"),
+    ],
+)
+def test_ple_pp_gate_accepts_ple_layers_on_first_rank(
+    monkeypatch: pytest.MonkeyPatch, ple_layer_ids, pp_size, partition
+):
+    from vllm.models.qwen4_exp.common.ple import check_ple_layers_on_first_pp_rank
+
+    if partition is None:
+        monkeypatch.delenv("VLLM_PP_LAYER_PARTITION", raising=False)
+    else:
+        monkeypatch.setenv("VLLM_PP_LAYER_PARTITION", partition)
+
+    check_ple_layers_on_first_pp_rank(_text_config(ple_layer_ids), pp_size)
+
+
+@pytest.mark.parametrize(
+    ("ple_layer_ids", "pp_size", "partition", "misplaced"),
+    [
+        pytest.param([2, 30], 2, None, "[29]", id="pp2-even-split"),
+        # ple_layer_ids are 1-based: id 2 is decoder layer 1, which a 1,47
+        # split puts on the second stage.
+        pytest.param([2], 2, "1,47", "[1]", id="pp2-custom-split-off-by-one"),
+        pytest.param([2, 20, 40], 4, None, "[19, 39]", id="pp4-two-misplaced"),
+    ],
+)
+def test_ple_pp_gate_rejects_ple_layers_beyond_first_rank(
+    monkeypatch: pytest.MonkeyPatch, ple_layer_ids, pp_size, partition, misplaced
+):
+    from vllm.models.qwen4_exp.common.ple import check_ple_layers_on_first_pp_rank
+
+    if partition is None:
+        monkeypatch.delenv("VLLM_PP_LAYER_PARTITION", raising=False)
+    else:
+        monkeypatch.setenv("VLLM_PP_LAYER_PARTITION", partition)
+
+    with pytest.raises(RuntimeError, match=re.escape(f"decoder layers {misplaced}")):
+        check_ple_layers_on_first_pp_rank(_text_config(ple_layer_ids), pp_size)
