@@ -9,10 +9,12 @@ correctness failure. It reuses `awq_moe_active_dense_stage_sm70_out`, its
 existing active-segment builder, and the existing grouped GEMM implementation.
 There is no new public operator, Python operator wrapper, or GEMM kernel.
 
-Admission requires SM70 AWQ, TP4, 512 experts, top-k 10, native group size 32,
+Admission requires SM70 AWQ, TP4, 512 experts, top-k 10, effective group size 32,
 hidden size 2560, W13 `(K,N)=(2560,320)`, W2 `(K,N)=(160,2560)`, and 2–8
 input tokens. Runtime and pre-capture warmup share the admission policy.
-Single-token and unmatched shapes retain their existing routes. Explicit
+GPU validation uses a native-g32 checkpoint; remapped checkpoints are not a
+separate validated quality claim. Single-token and unmatched shapes retain
+their existing routes. Explicit
 dense/exact diagnostic routes and the existing decode token cap take priority.
 
 Repeated expert IDs form multi-row segments; unused trailing offsets describe
@@ -142,7 +144,7 @@ profiled kernel durations, not new unprofiled ITLs or a sum across ranks.
 
 ## Validation and follow-up
 
-The source checkpoint is `5cceeaad89d6ead1474ca834afd9aaf3a7bd413c`.
+The measured source checkpoint is `5cceeaad89d6ead1474ca834afd9aaf3a7bd413c`.
 The extension built successfully; prior validation retained 51 GPU-directed
 test passes and 32 dynamic-route comparisons, including repeated experts and
 graph replay. The focused CPU policy/warmup regression command is:
@@ -155,6 +157,16 @@ The natural-EOS, per-token, startup/LUT and per-rank trace artifacts are
 retained under experiment IDs `awq-narrow-qsa-fixed-ab-20260904` (r3),
 `awq-nvfp4-decode-gap-profile-20260904` (r3), and
 `awq-autotune-model-ab-20260905`. No production deployment is implied.
+
+For fork review, the patch was ported onto synchronized main
+`755baae1d075ee04fa9096b23fc0225b23589a86`. Conflict resolution preserves the
+new indexed-prefill admission and compact-metadata initialization alongside
+the grouped-decode flag. Added boundary tests verify that indexed prefill and
+grouped decode never both admit the same token count. The original validated
+branch is retained. The new base also changes HC, NVFP4 dispatch and scratch
+lifetimes: the historical GPU results above are **not** a GPU acceptance of
+this new integrated tree. Keep the fork PR in draft until that integration
+has been built and GPU-validated; CPU checks cannot close this gate.
 
 C1 is a separate follow-up for **both AWQ and NVFP4**, not merely an attempt
 to reach NVFP4's current speed. Investigate shared projection/HC, attention

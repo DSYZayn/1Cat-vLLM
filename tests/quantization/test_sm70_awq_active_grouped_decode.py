@@ -10,6 +10,7 @@ from vllm import envs
 from vllm.model_executor.layers.quantization.awq_sm70_moe import (
     _qwen38_active_grouped_layer_contract,
     _use_qwen38_active_grouped_decode,
+    _use_qwen38_indexed_prefill,
 )
 from vllm.model_executor.warmup import awq_sm70_warmup as warmup
 
@@ -62,6 +63,22 @@ def test_group_size_gate(group_size):
     assert _qwen38_active_grouped_layer_contract(_layer(), group_size) == (
         group_size == 32
     )
+
+
+@pytest.mark.parametrize("tokens", [1, 2, 8, 9, 127, 128])
+def test_grouped_decode_and_indexed_prefill_are_disjoint(tokens):
+    layer = _layer()
+    layer.sm70_awq_qwen38_indexed_prefill = True
+    layer.sm70_awq_checkpoint_group_size = 32
+    layer.sm70_awq_group_size = 32
+    layer.sm70_intermediate_size = 160
+    x = torch.empty(tokens, 2560, dtype=torch.float16)
+    topk_ids = torch.empty(tokens, 10, dtype=torch.int32)
+    grouped = _use_qwen38_active_grouped_decode(layer, tokens, 10)
+    indexed = _use_qwen38_indexed_prefill(layer, x, topk_ids)
+    assert grouped == (2 <= tokens <= 8)
+    assert indexed == (tokens >= 128)
+    assert not (grouped and indexed)
 
 
 @pytest.mark.parametrize(
