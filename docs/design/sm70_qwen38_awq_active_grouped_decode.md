@@ -201,8 +201,10 @@ This is bounded quality evidence, not cross-version bitwise or broad quality
 acceptance; the precision deferral above remains unchanged.
 
 All four workers reported 48 admitted grouped layers and tuning enabled.
-Startup took 438.4613 seconds, KV capacity was 441,392 tokens (563×784), and
-graph memory was 0.37 GiB. The model exited with status 0 and no OOM. Python
+Startup took 438.4613 seconds. The engine reported 427,385 KV tokens, with
+563 configured cache blocks and 0.37 GiB graph memory. Correction: the earlier
+563×784 extrapolation was not the engine-reported token capacity.
+The model exited with status 0 and no OOM. Python
 resource-tracker cleanup warnings at shutdown are retained in the raw log;
 the completed scores and profile are not reclassified as a clean shutdown log.
 
