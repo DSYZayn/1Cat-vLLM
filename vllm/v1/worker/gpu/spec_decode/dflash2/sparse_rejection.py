@@ -91,6 +91,10 @@ def _safe_dump_tag(raw_tag: str) -> str:
 
 
 def _diagnostic_rank() -> int:
+    # Multiprocess workers need not export RANK/LOCAL_RANK. Falling back to
+    # zero there dumps every TP replica and overcounts independent samples.
+    if torch.distributed.is_initialized():
+        return torch.distributed.get_rank()
     return int(os.getenv("RANK", os.getenv("LOCAL_RANK", "0")))
 
 

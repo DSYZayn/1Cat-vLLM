@@ -45887,3 +45887,41 @@ Interpretation:
   warmups. Use `context-fc-fresh-v2.json`. Raw bundle:
   `v100-dflash2-fastpath-numerics-20260906`. Full reproduction and scope limits:
   [fast-path numerical audit](sm70_dflash2_fastpath_numerics.md).
+
+## 2026-09-06 DFlash2 verifier route costs and quality attribution
+
+- Continue owned Draft PR #517 from `53be620005`, integration `755baae1d0`.
+  GPU 0–3 are occupied by another task; this audit leases GPU 4–7. Do not label
+  changed hardware-set measurements as recovery of the earlier speed peak.
+- QPN8 support/FP32 rerank: 535 real rows (465 target, 70 draft), no local top21
+  or required global top-k misses, no target top-p support changes; maximum
+  target TV 1.2456e-6. Local q8 head cost is 573–575 us vs 993–1011 us dense
+  FP32, excluding TP communication.
+- Sparse rejection: 60 independent real q8 rounds, emitted counts 1–8, exactly
+  equal to dense rejection and the captured output. Local graph cost 15.242 us
+  vs 43.530 us dense rejection alone; the latter excludes separate top-p.
+- Real admitted norm cases: 144 Gemma and 24 GDN reproduce live fused outputs
+  exactly, but can differ from staged FP32/FP64 references. Standalone fused
+  vs eager costs: Gemma 3.620/26.846 us; GDN 2.231/25.428 us. Do not extrapolate
+  the eager reference timing to the compiled full-model fallback.
+- Full-model fixed-prefix norm-switch comparisons show up to 4.55% TV with
+  unchanged greedy top-1. However, the same optimized configuration restarted
+  also differs by up to 4.33%. Layer 0/rank 2 GDN core already differs before
+  the first affected Gemma fusion. Attribution to either norm is not closed;
+  repeatability of prefill state and the forced-prefix diagnostic comes first.
+- Repair two diagnostics only: GDN projection dump violates its non-aliasing
+  schema; alignment rank detection can duplicate every TP replica. Three GPU
+  schema/AOT/graph tests and seven distributed-rank/fallback tests pass.
+  Deduplicate the original 240 alignment files into 60 independent rounds.
+  Use `norm-real-cost-v2.json` to exclude first-layer FP16 residuals that do
+  not enter the fused Gemma gate.
+- Uninstrumented GPU 4–7 production closure: medians 19.505/19.092 ms per round,
+  154.434/234.829 decode tokens/s, 248/270 output tokens, 82/60 rounds. Each
+  request's three measured repetitions match and stop naturally. The token
+  trajectories differ from the historical GPU 0–3 run; 17.6–18 ms and broad
+  cross-startup output parity remain open. Native hashes are unchanged.
+- Route-by-route ledger, controls and failed-diagnostic exclusions:
+  [verifier route audit](sm70_dflash2_verifier_route_audit.md). Raw bundle:
+  `v100-dflash2-verifier-route-audit-20260906`. Runtime arithmetic and precision
+  defaults are unchanged; keep the existing Draft PR pending the remaining
+  state, QAT teacher and performance gates.
