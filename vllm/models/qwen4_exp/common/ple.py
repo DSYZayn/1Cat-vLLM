@@ -3,8 +3,36 @@
 """Common Qwen4Exp PLE helpers."""
 
 from dataclasses import dataclass
+from typing import Any
 
 import torch
+
+from vllm.distributed.utils import get_layers_outside_first_pp_rank
+
+
+def check_ple_layers_on_first_pp_rank(text_config: Any, pp_size: int) -> None:
+    """Refuse a pipeline split that puts a PLE layer beyond the first rank.
+
+    The n-gram context and ``query_start_loc`` a PLE layer consumes are only
+    prepared on the first pipeline rank, and later ranks receive no input ids
+    at all. ``ple_layer_ids`` are 1-based: id ``L`` attaches the PLE module to
+    decoder layer ``L - 1`` (see ``Qwen4ExpDecoderLayer``), so that is the
+    index the partition has to keep on rank 0.
+    """
+    if pp_size <= 1:
+        return
+    ple_decoder_layers = [int(layer_id) - 1 for layer_id in text_config.ple_layer_ids]
+    misplaced, first_rank_end = get_layers_outside_first_pp_rank(
+        ple_decoder_layers, int(text_config.num_hidden_layers), pp_size
+    )
+    if misplaced:
+        raise RuntimeError(
+            "N-gram PLE embedding requires every PLE layer on the first pipeline "
+            f"rank, which holds decoder layers 0..{first_rank_end - 1}, but the "
+            f"PLE modules of decoder layers {misplaced} fall on a later stage. "
+            "Either run with pipeline_parallel_size=1 or move the split with "
+            "VLLM_PP_LAYER_PARTITION so those layers stay on rank 0."
+        )
 
 
 @dataclass(frozen=True)

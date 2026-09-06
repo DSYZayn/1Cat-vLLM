@@ -256,6 +256,9 @@ hashes. Use the owned worktree's `.venv/bin/python` under an exclusive lease.
 - `serve-production.sh` and `run_production.py`: independent uninstrumented
   production closure, natural EOS, one warmup and three measured requests.
 
-Keep Draft. Native arithmetic is unchanged, the broader QAT teacher question
-remains open, and single-path full-model attribution requires the state and
-prefix repeatability gate above.
+The broader QAT teacher question remains open, and single-path full-model
+attribution requires the state and prefix repeatability gate above. The user
+subsequently requested mainline integration of PR #517's validated repairs
+with these limits retained. That integration does not close the remaining
+quality investigation or promote the optional precision/performance flags.
+Merge-time checks and the exact integrated revision are recorded on #517.
