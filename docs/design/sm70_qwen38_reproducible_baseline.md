@@ -6,6 +6,22 @@ integrated by [PR #525](https://github.com/1CatAI/1Cat-vLLM/pull/525), including
 the HC and QSA/router commits from #506/#507. A stacked PR remaining open is
 not proof that its commits are absent from `main`.
 
+The integration audit found these accepted components already in the base
+`95205a2d9952813aa7469f63ff65b8f2813c027a`; this PR adds their reproducible
+build/launch packaging, not a second copy of the optimizations:
+
+| Component | Main-source implementation |
+|---|---|
+| HC projection/mix and TP4 communication | `vllm/models/qwen4_exp/nvidia/sm70_fp16_hc.py`, `csrc/custom_all_reduce.cu` |
+| NVFP4 M1 experts, fused W13 and direct W2 reduction | `csrc/sm70_turbomind/ops/mxfp4_qpn_m1_sm70.cu`, `vllm/_sm70_ops.py` |
+| Exact QSA top-k and router | `csrc/qsa_lexicographic_topk.cuh`, `vllm/models/qwen4_exp/nvidia/ops/qsa.py`, `vllm/model_executor/layers/fused_moe/fused_topk_router.py` |
+| Flash-V100 logical-page-order quality repair | `flash-attention-v100/kernel/fused_mha_forward_paged.cu` and its public planner regression |
+| GDN and fused FP16 projections | `flash_qla/`, `vllm/models/qwen4_exp/nvidia/sm70_fp16_gemv.py` |
+| Hybrid PLE and unified prefill/decode configuration | `vllm/v1/ple_offload/`, `vllm/config/vllm.py` |
+
+PR #507 was closed as already incorporated through #525. Open #510 and the
+FlashInfer/E4M3 experiments are not part of this accepted single-request lane.
+
 ## What this entry point fixes
 
 Previous local launchers selected HC, NVFP4 W13/W2, QSA top-k, FlashQLA and
@@ -102,10 +118,9 @@ fixed contract above. Two warmed repeats per case measured:
 |131072|5830.36|83.814|11.931|
 |261631|5137.10|73.977|13.518|
 
-These are the previous frozen-library results, **not yet fresh-builder results**.
-The source-only reproduction review must attach fresh build manifests, worker
-route evidence, natural quality results, repeatability/reference comparisons,
-and unprofiled timings before claiming the new entry point reproduces them.
+These are the previous frozen-library results, not measurements of the new
+builder. The fresh short-context reproduction follows below; keep the two
+sets of evidence distinct.
 Do not substitute an Nsight graph interval for endpoint TPOT, or call a
 configured256K maximum a tested256K input.
 
@@ -113,6 +128,54 @@ The follow-up length trace attributed98.989% of the increase in graph kernel
 service to QSA Top-K and compressed-key scoring. It did not implement a new
 long-context optimization. The current Top-K still has its single-CTA long-row
 fallback; these reproduction changes do not claim reduced context decay.
+
+### Fresh-source baseline, 2026-09-06
+
+Source `b2042fb24b78bba131ec9aa0b1a05cdf3f54df60`, physical GPUs4-7, with all
+six overlay libraries rebuilt by the public script and independent compilation
+caches. This is one model initialization, with two warmed timing repeats:
+
+8192-token input:
+
+| Measurement | Run1 | Run2 | Mean |
+|---|---:|---:|---:|
+| Decode tok/s |97.71679|97.73243|**97.72461**|
+| TPOT ms |10.23366|10.23202|**10.23284**|
+| Prefill tok/s |6890.26|7010.06|**6950.16**|
+
+The complete513-token outputs of both repeats and their warmup match the
+accepted frozen-library sweep exactly, not just the first token or a text
+prefix. The arithmetic and record-copy checks both stop naturally and pass.
+All four workers verify this checkout, native FP32 SSM, FP16 KV, no MTP/prefix
+cache, `FULL_AND_PIECEWISE`, QSA specialization version1, and the five loaded
+optimized DSO hashes. The sixth built library is the paged-KV utility.
+
+The same instance's261631+513 case measures **73.98534 decode tok/s**, **5169.99
+prefill tok/s**, and **13.51619ms TPOT** (two warmed repeats). Both complete
+513-token outputs and the warmup match the corresponding frozen-sweep output
+exactly. This reproduces the existing length-dependent baseline; it is not a
+new long-context speed optimization.
+
+Model-free checks of these new builds also pass: HC256 graph replays with zero
+bit mismatches on every rank; router1280 bitwise rows; QSA72 exact cases and
+128 changing-length graph replays/1536 row comparisons. Eleven CPU helper tests
+and the scoped pre-commit suite pass. Long-context completion, detailed runtime
+manifests and the final integration audit are recorded in
+[PR #532](https://github.com/1CatAI/1Cat-vLLM/pull/532).
+
+The compatible native-base dependency hashes observed on every worker are:
+
+| Native library | SHA256 |
+|---|---|
+| `_C.abi3.so` | `c35b76ca723ec1a6907e31b2f0fe4f96c2e1b212603e04b976f9a48b85d0916a` |
+| `_C_stable_libtorch.abi3.so` | `8c866c3612bbbe2323ff4cc912f5fe3924d6f0517ee675f3f40230c151854890` |
+| `_moe_C.abi3.so` | `80d92f26cbed180bf538ce3254534f32581d89741953ee6ee45e4e9e63ece85e` |
+
+This reproduces approximately98 decode/7K prefill tok/s under the stated
+contract; it is not a100 tok/s claim or a universal speed/quality guarantee.
+The bounded output agreement does not close the broader GDN/W13
+actual-input numerical-reference work described in the
+[quality repair report](sm70_qwen38_nvfp4_quality_repair.md).
 
 ## Focused checks
 
