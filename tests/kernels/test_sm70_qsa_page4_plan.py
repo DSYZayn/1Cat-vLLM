@@ -177,9 +177,11 @@ def test_plan_selection_order_and_graph_relocation(extension, page_size):
 
 @pytest.mark.parametrize("context", [8192, 32768, 262144])
 @pytest.mark.parametrize("interleaved", [False, True])
-def test_qwen38_page400_long_context_graph_plan(extension, context, interleaved):
-    """The NVFP4 no-MTP lane uses 400-token pages, not power-of-two pages."""
-    page_size = 400
+@pytest.mark.parametrize("page_size", [400, 784])
+def test_qwen38_hybrid_page_long_context_graph_plan(
+    extension, context, interleaved, page_size
+):
+    """Actual FP16/FP32 SSM contracts produce 400/784-token attention pages."""
     generator = torch.Generator().manual_seed(context)
     positions = torch.arange(context - 8, context, dtype=torch.int64)
     lengths = torch.tensor([context], dtype=torch.int32)

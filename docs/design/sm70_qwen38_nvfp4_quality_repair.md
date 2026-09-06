@@ -72,8 +72,9 @@ The extension SHA256 values for these controls were:
 
 ## Focused regression
 
-The extra regression uses actual 400-token page geometry, contiguous and
-interleaved strides, contexts 8192/32768/262144 and graph replay with physical
+The extra regression uses actual 400/784-token page geometry (FP16/native-FP32
+SSM contracts), contiguous and interleaved strides, contexts 8192/32768/262144
+and graph replay with physical
 layout A/B/A. Every emitted page and mask is checked against a CPU logical
 reference. Combined with the existing page4 and QSA-ops suites:
 
@@ -85,6 +86,9 @@ reference. Combined with the existing page4 and QSA-ops suites:
 
 Result: **53 passed**, no skips, in 17.62 seconds on V100 GPU0.
 The 262144 cases here are planner tests, not 256K model-quality measurements.
+After observing the native-state784-token geometry, the six added784 cases
+passed separately in3.13 seconds (`-k 'hybrid_page and 784'`): **59 distinct
+passed cases** across the two targeted invocations.
 
 For retained actual-input captures, replay with explicitly selected extensions:
 
@@ -135,9 +139,56 @@ must not be reported as a pure-decode comparison against 98.965 tokens/s.
 This missing-metrics limitation is retained explicitly; the native-state run
 enables statistics and rejects missing separated metrics.
 
-Native FP32-state validation, genuine long-range retrieval near 256K, and
-natural-answer checks remain separate gates. Existing GDN gate-reduction and
-W13 split-order differences require actual-input numerical and propagated
-ranking evidence; this narrow repair does not certify those other kernels.
-Human review remains required before promoting this integration or its speed
-record to an accepted quality baseline.
+### Native FP32-state validation and separated performance
+
+A second model instance used `mamba_ssm_cache_dtype=auto`. All four workers
+confirmed **float32** recurrent state; FP16 activations, short-convolution state
+and attention KV remained unchanged. The runtime consequently selected
+784-token attention pages instead of 400. All other production optimization
+gates and sidecars remained the frozen ones. Request statistics were enabled.
+
+- Four 8192+513 deterministic requests had identical complete token sequences;
+  all48 observed positions had bitwise equal complete logits and final hidden
+  across repetitions. Finite/argmax/TP-replica checks passed.
+- All11 official-sampling natural-EOS requests
+  passed: arithmetic and copy before/after, three additional Chinese/Python/set
+  questions, and dispersed retrieval at8191/8192/8193/261632 input tokens.
+  The first two checks preceded observation installation; the rest followed
+  detachment. These are nine distinct cases, not a broad dataset evaluation.
+- The261632-input case placed three unique records at token offsets13079,
+  130797 and248514 (approximately5%,50%,95% of context). All three codes were
+  recovered correctly; the answer stopped naturally after217 generated tokens.
+  The answer depends on the interior records, not on the final question alone.
+- Following the long request and a shape warmup, three unobserved8192+513
+  requests again matched the earlier native-state token hash. This also checks
+  this particular long-to-short request reuse transition.
+
+| Measurement | Run1 | Run2 | Run3 | Mean |
+|---|---:|---:|---:|---:|
+| Pure decode, tokens/s | 97.90434 | 97.90695 | 97.90411 | **97.90513** |
+| TPOT, ms/token | 10.21405 | 10.21378 | 10.21408 | **10.21397** |
+| Prefill, tokens/s (8192 input) | 6965.58 | 6976.74 | 6970.63 | **6970.98** |
+
+Decode is512 tokens divided by last-token minus first-token time; prefill is
+8192 divided by scheduled-to-first-token time. Do not substitute the engine's
+periodic aggregate throughput log. This is a warmed repeated benchmark prompt,
+not a universal prefill number for arbitrary content or261632-token inputs.
+The new native-state pure-decode result is1.07% below the historical98.965175
+FP16-state record. That comparison changes state precision and planner together;
+it does not isolate either change's cost or claim a contemporary A/B timing.
+
+With the fixed planner, native FP32 versus the old FP16 state override gave
+bitwise identical first-prefill logits. Subsequent common-prefix decode logits
+differed (maximum2.3193359375 across the first12 observed positions), despite
+unchanged sampled tokens there. The first token-sequence difference was at37,
+**after both natural EOS positions at28**. This is not evidence of a natural
+answer failure, nor does it justify treating the lower-state-precision override
+as numerically equivalent. Keep native FP32 state for this quality contract.
+
+The two bounded model loads ended normally and released their GPU workers;
+no API service or model residency remains. Current evidence closes the
+reproduced allocation-induced token-fork defect and these bounded native-state
+quality gates. Existing GDN gate-reduction and W13 split-order differences still
+need independent actual-input references and propagated-ranking evidence;
+this repair does not certify all kernels or arbitrary inputs as error-free.
+Human review and wider quality acceptance remain required before promotion.
