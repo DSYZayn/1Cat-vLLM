@@ -1142,6 +1142,7 @@ class DFlash2Speculator(DFlashSpeculator):
             nmin_tail=self._lookup_nmin_tail,
             long_min=self._lookup_long_min,
             take_flags=self._lookup_take_flags,
+            probabilistic=self.draft_logits is not None,
         )
 
         draft_logits = self.draft_logits

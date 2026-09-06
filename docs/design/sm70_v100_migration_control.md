@@ -45854,3 +45854,36 @@ Interpretation:
 - No new speed claim. Full evidence, reproducible matrix command and remaining
   gates: [TP quality audit](sm70_quasar_tp2_tp4_quality.md). Bundle:
   `v100-quasar-tp2-tp4-quality-audit-20260906`. Owned GPU services/leases stopped.
+
+## 2026-09-06 DFlash2 proposal and context fast-path numerical audit
+
+- Continue Draft PR #517 from `41a9018e9f`, integration `755baae1d0`.
+  Optional probabilistic lookup with a positive agreement threshold rewrote
+  the deciding random prefix's q as point masses. A production-kernel
+  counterexample changes target P(A)=0.8 to 0.70027 over 100000 seeds.
+  Preserve that prefix's original q and only replace subsequent positions:
+  repaired P(A)=0.80072. Default q8 and agreement threshold0 are unaffected.
+- Twelve lookup GPU regressions pass, including sparse and dense statistical
+  correction. The fusion kernel adds no launch; paired graph median cost
+  increases at most 0.006 us on B1/B4. This is not whole-round latency.
+- Ten fresh E4M3/FP32 request snapshots: 70 conditional selector rows have
+  unchanged greedy top-1, but FP32 selector arithmetic gives maximum proposal
+  TV 0.0954%. Token-keyed draws change 3/17920 at official temperature1 and
+  10/17920 at diagnostic temperature0.6. These are draft-token changes, not
+  final target-token errors. Do not claim a selector precision upgrade
+  improves final quality without measuring acceptance and target correction.
+- Fused selector graph vs sequential dense Gumbel: all 8960 positions match;
+  realized/sparse/dense q caches are exact. Cache overwrite under reordered,
+  intersecting supports and permuted request slots passes 288 checks.
+- Fresh context FC outputs reproduce the live TP4 path bitwise. Same-kernel
+  counterfactual TP2/TP4 output partition error reaches 9.21e-6 relative L2;
+  TP4-vs-cuBLAS FC drift is 1.77e-5 and becomes 1.06e-4 after BF16 norm.
+- Context pipeline/KV/metadata graphs on vs off: ten complete real boundaries
+  match bitwise through candidate scores, q caches and accept/reject counts.
+  Both full outputs match the prior 260-token MBPP28 control (49 rounds).
+  Synchronized capture timing is excluded; retain historical 18.435/18.892 ms
+  medians and the unmet 17.6–18 ms objective.
+- Exclude `_warmup_*` captures by request ID; first two dumps are startup
+  warmups. Use `context-fc-fresh-v2.json`. Raw bundle:
+  `v100-dflash2-fastpath-numerics-20260906`. Full reproduction and scope limits:
+  [fast-path numerical audit](sm70_dflash2_fastpath_numerics.md).
