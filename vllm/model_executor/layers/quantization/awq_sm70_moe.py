@@ -198,6 +198,37 @@ def _is_qwen38_tp4_compact_metadata_shape(
     )
 
 
+def _resolve_compact_metadata(
+    *, requested: bool, explicit: bool, native_available: bool, shape_ok: bool
+) -> bool:
+    """Decide the prepared metadata layout.
+
+    The default-on compact layout silently falls back to the 4-byte layout
+    when the build or the layer shape does not support it. An explicit
+    VLLM_SM70_AWQ_MOE_COMPACT_METADATA=1 fails closed instead.
+    """
+    if not requested:
+        return False
+    if native_available and shape_ok:
+        return True
+    if explicit:
+        if not native_available:
+            raise RuntimeError(
+                "VLLM_SM70_AWQ_MOE_COMPACT_METADATA=1 requires an SM70 "
+                "build with awq_sm70_prepare_compact."
+            )
+        raise RuntimeError(
+            "VLLM_SM70_AWQ_MOE_COMPACT_METADATA=1 currently requires "
+            "the exact Qwen3.8 TP4 E512 native-g32 W13/W2 shapes."
+        )
+    logger.info_once(
+        "SM70 AWQ MoE compact metadata default skipped (%s); "
+        "using the 4-byte scale/bias layout.",
+        "unsupported layer shape" if native_available else "no compact prepare op",
+    )
+    return False
+
+
 def _silu_and_mul_w13(
     layer: RoutedExperts, out: torch.Tensor, gate_up: torch.Tensor
 ) -> None:
@@ -672,18 +703,12 @@ class AWQSM70MoEMethod(FusedMoEMethodBase):
             )
 
         num_experts = int(layer.w13_qweight.shape[0])
-        compact_metadata = envs.VLLM_SM70_AWQ_MOE_COMPACT_METADATA
-        if compact_metadata:
-            if not hasattr(torch.ops._C, "awq_sm70_prepare_compact"):
-                raise RuntimeError(
-                    "VLLM_SM70_AWQ_MOE_COMPACT_METADATA=1 requires an SM70 "
-                    "build with awq_sm70_prepare_compact."
-                )
-            if not _is_qwen38_tp4_compact_metadata_shape(layer, self.group_size):
-                raise RuntimeError(
-                    "VLLM_SM70_AWQ_MOE_COMPACT_METADATA=1 currently requires "
-                    "the exact Qwen3.8 TP4 E512 native-g32 W13/W2 shapes."
-                )
+        compact_metadata = _resolve_compact_metadata(
+            requested=envs.VLLM_SM70_AWQ_MOE_COMPACT_METADATA,
+            explicit="VLLM_SM70_AWQ_MOE_COMPACT_METADATA" in os.environ,
+            native_available=hasattr(torch.ops._C, "awq_sm70_prepare_compact"),
+            shape_ok=_is_qwen38_tp4_compact_metadata_shape(layer, self.group_size),
+        )
         prepare_awq = (
             sm70_ops.awq_sm70_prepare_compact
             if compact_metadata

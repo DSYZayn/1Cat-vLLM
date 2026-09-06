@@ -207,3 +207,12 @@ scalar 3-byte W13/W2 and 20.6160 us for the cooperative build (about 4.2%
 lower); this is a component observation, not a model-level speedup claim.
 The full-model results above use 4-byte metadata and cannot validate or
 measure deployment of the cooperative 3-byte path.
+
+Since the cooperative reader removes the speed cost of the 3-byte layout on
+the M=1 route, `VLLM_SM70_AWQ_MOE_COMPACT_METADATA` now defaults to `1` for the
+supported Qwen3.8 TP4 E512 native-g32 shape. Unsupported builds or shapes fall
+back to the 4-byte layout with an info log; an explicit `=1` still fails
+closed, and `=0` keeps the 4-byte layout. On the same-day regression contract
+(max model length 131,328, GPU memory utilization 0.89) the engine-reported
+KV cache grew from 427,385 to 497,983 tokens with C1 x 64K pure decode within
+0.2% of the 4-byte layout and C4/C8 within run-to-run noise.
