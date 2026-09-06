@@ -2,6 +2,17 @@
 
 Date: 2026-05-30
 
+## QUASAR E4M3 KV and FP32 logits, 2026-09-06
+
+The [precision follow-up](sm70_quasar_e4m3_fp32_logits.md) adds explicit
+FP32 candidate/dense logits and E4M3 grouped q8 verification. The measured
+problem-row distribution TV drops from 0.021532 to 3.6694e-7, all 24 checked
+nucleus supports match the FP32 reference, and maximum real KV conversion
+relative L2 drops from 0.059324 to 0.029024. Paired E4M3 conversion preserves
+the scalar route bitwise across 1K–256K kernel probes. Keep the opt-in
+precision contract and the answer-quality limitations visible; do not
+equate these operator improvements with recovery of unquantized-model quality.
+
 ## QUASAR + DFlash2 operator audit, 2026-09-06
 
 See [the operator audit](sm70_quasar_dflash2_operator_audit.md) for the frozen

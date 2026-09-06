@@ -1,5 +1,9 @@
 # QUASAR + DFlash2 operator quality audit, 2026-09-06
 
+This is the retained first-stage audit. The
+[E4M3 KV and FP32-logit follow-up](sm70_quasar_e4m3_fp32_logits.md) addresses
+the precision findings and records subsequent performance and quality checks.
+
 This audit fixes two sampling-boundary defects and two defects in the
 measurement path. It does **not** establish that the checkpoint, FP8 KV
 cache, or approximate LM-head candidate search preserves unquantized model

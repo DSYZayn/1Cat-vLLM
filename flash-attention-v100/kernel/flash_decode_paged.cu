@@ -2125,7 +2125,10 @@ __launch_bounds__(kGroupedVerifyThreads, 1) void flash_attention_grouped_verify_
                               : tile_start;
       load_xqa_tc_kv_panel<PAGE_BLOCK_SIZE, CONTIGUOUS_HKV1_LAYOUT,
                            kGroupedVerifyThreads, KV_DTYPE,
-                           KV_DTYPE == flash_v100::KV_CACHE_DTYPE_FP8_E5M2>(
+                           KV_DTYPE == flash_v100::KV_CACHE_DTYPE_FP8_E5M2 ||
+                               (KV_DTYPE ==
+                                    flash_v100::KV_CACHE_DTYPE_FP8_E4M3 &&
+                                !SPARSE_PAGE4)>(
           shared_kv, k_cache, page_ids, valid_k_rows, kPanelStrideVec,
           kSharedStrideVec, tile_page_offset, 0, page_block_size, 0,
           k_block_stride, k_token_stride, k_head_stride, 0);
@@ -2213,7 +2216,9 @@ __launch_bounds__(kGroupedVerifyThreads, 1) void flash_attention_grouped_verify_
                             : tile_start;
     load_xqa_tc_kv_panel<PAGE_BLOCK_SIZE, CONTIGUOUS_HKV1_LAYOUT,
                          kGroupedVerifyThreads, KV_DTYPE,
-                         KV_DTYPE == flash_v100::KV_CACHE_DTYPE_FP8_E5M2>(
+                         KV_DTYPE == flash_v100::KV_CACHE_DTYPE_FP8_E5M2 ||
+                             (KV_DTYPE == flash_v100::KV_CACHE_DTYPE_FP8_E4M3 &&
+                              !SPARSE_PAGE4)>(
         shared_kv, k_cache, page_ids, valid_k_rows, kPanelStrideVec,
         kSharedStrideVec, tile_page_offset, 0, page_block_size, 0,
         k_block_stride, k_token_stride, k_head_stride, 0);
@@ -2317,7 +2322,9 @@ __launch_bounds__(kGroupedVerifyThreads, 1) void flash_attention_grouped_verify_
 
     load_xqa_tc_kv_panel<PAGE_BLOCK_SIZE, CONTIGUOUS_HKV1_LAYOUT,
                          kGroupedVerifyThreads, KV_DTYPE,
-                         KV_DTYPE == flash_v100::KV_CACHE_DTYPE_FP8_E5M2>(
+                         KV_DTYPE == flash_v100::KV_CACHE_DTYPE_FP8_E5M2 ||
+                             (KV_DTYPE == flash_v100::KV_CACHE_DTYPE_FP8_E4M3 &&
+                              !SPARSE_PAGE4)>(
         shared_kv, v_cache, page_ids, valid_k_rows, kPanelStrideVec,
         kSharedStrideVec, tile_page_offset, 0, page_block_size, 0,
         v_block_stride, v_token_stride, v_head_stride, 0);
@@ -4054,11 +4061,17 @@ at::Tensor flash_attention_grouped_verify_paged(
   TORCH_CHECK(partial_out.is_cuda() && partial_lse.is_cuda(),
               "grouped verify workspaces must be CUDA tensors");
   TORCH_CHECK(q.dtype() == torch::kFloat16, "grouped verify q must be fp16");
-  TORCH_CHECK(kv_cache_dtype == "fp8_e5m2",
-              "grouped verify prototype supports fp8_e5m2 KV only");
+  TORCH_CHECK(kv_cache_dtype == "fp8_e5m2" || kv_cache_dtype == "fp8_e4m3",
+              "grouped verify requires E5M2 or E4M3 KV");
+  TORCH_CHECK(kv_cache_dtype != "fp8_e4m3" || (q.size(0) == 8 && one_pass),
+              "E4M3 grouped verify requires q=8 and one_pass=true");
+  TORCH_CHECK(kv_cache_dtype != "fp8_e4m3" ||
+                  (k_cache.stride(0) % 16 == 0 && k_cache.stride(1) % 16 == 0 &&
+                   v_cache.stride(0) % 16 == 0 && v_cache.stride(1) % 16 == 0),
+              "E4M3 grouped verify requires 16-byte-aligned KV strides");
   TORCH_CHECK(
       k_cache.dtype() == torch::kUInt8 && v_cache.dtype() == torch::kUInt8,
-      "grouped verify E5M2 cache must use uint8 storage");
+      "grouped verify FP8 cache must use uint8 storage");
   TORCH_CHECK(
       block_table.dtype() == torch::kInt32 && seq_lens.dtype() == torch::kInt32,
       "grouped verify block_table/seq_lens must be int32");
@@ -4128,12 +4141,12 @@ at::Tensor flash_attention_grouped_verify_paged(
   const size_t partial_shared_mem = sizeof(GroupedVerifySmem);
 #define LAUNCH_GROUPED_VERIFY_PARTIAL(MAX_QUERY_TOKENS, TWO_PASS, PAGE_SIZE,   \
                                       SINGLE_QUERY, CONTIGUOUS_LAYOUT,         \
-                                      STAGE_PAGE_IDS)                          \
+                                      STAGE_PAGE_IDS, KV_TYPE)                 \
   do {                                                                         \
     auto partial_kernel =                                                      \
         (void*)flash_attention_grouped_verify_e5m2_partial_kernel<             \
             MAX_QUERY_TOKENS, TWO_PASS, PAGE_SIZE, SINGLE_QUERY,               \
-            CONTIGUOUS_LAYOUT, STAGE_PAGE_IDS>;                                \
+            CONTIGUOUS_LAYOUT, STAGE_PAGE_IDS, KV_TYPE>;                       \
     const cudaError_t smem_status = cudaFuncSetAttribute(                      \
         partial_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize,           \
         partial_shared_mem);                                                   \
@@ -4147,7 +4160,7 @@ at::Tensor flash_attention_grouped_verify_paged(
                 cudaGetErrorString(carveout_status));                          \
     flash_attention_grouped_verify_e5m2_partial_kernel<                        \
         MAX_QUERY_TOKENS, TWO_PASS, PAGE_SIZE, SINGLE_QUERY,                   \
-        CONTIGUOUS_LAYOUT, STAGE_PAGE_IDS>                                     \
+        CONTIGUOUS_LAYOUT, STAGE_PAGE_IDS, KV_TYPE>                            \
         <<<partial_grid, kGroupedVerifyThreads, partial_shared_mem, stream>>>( \
             reinterpret_cast<const __half*>(q.data_ptr()), k_cache.data_ptr(), \
             v_cache.data_ptr(), block_table.data_ptr<int>(),                   \
@@ -4179,30 +4192,42 @@ at::Tensor flash_attention_grouped_verify_paged(
         fixed_interleaved_layout && dflash2_grouped_stage_page_ids_enabled(); \
     if (stage_page_ids && page_size == 1648) {                                \
       LAUNCH_GROUPED_VERIFY_PARTIAL(MAX_QUERY_TOKENS, TWO_PASS, 1648,         \
-                                    SINGLE_QUERY, true, true);                \
+                                    SINGLE_QUERY, true, true,                 \
+                                    flash_v100::KV_CACHE_DTYPE_FP8_E5M2);     \
     } else if (stage_page_ids) {                                              \
       LAUNCH_GROUPED_VERIFY_PARTIAL(MAX_QUERY_TOKENS, TWO_PASS, 3296,         \
-                                    SINGLE_QUERY, true, true);                \
+                                    SINGLE_QUERY, true, true,                 \
+                                    flash_v100::KV_CACHE_DTYPE_FP8_E5M2);     \
     } else if (fixed_interleaved_layout && page_size == 1648) {               \
       LAUNCH_GROUPED_VERIFY_PARTIAL(MAX_QUERY_TOKENS, TWO_PASS, 1648,         \
-                                    SINGLE_QUERY, true, false);               \
+                                    SINGLE_QUERY, true, false,                \
+                                    flash_v100::KV_CACHE_DTYPE_FP8_E5M2);     \
     } else if (fixed_interleaved_layout) {                                    \
       LAUNCH_GROUPED_VERIFY_PARTIAL(MAX_QUERY_TOKENS, TWO_PASS, 3296,         \
-                                    SINGLE_QUERY, true, false);               \
+                                    SINGLE_QUERY, true, false,                \
+                                    flash_v100::KV_CACHE_DTYPE_FP8_E5M2);     \
     } else if (page_size == 1648) {                                           \
       LAUNCH_GROUPED_VERIFY_PARTIAL(MAX_QUERY_TOKENS, TWO_PASS, 1648,         \
-                                    SINGLE_QUERY, false, false);              \
+                                    SINGLE_QUERY, false, false,               \
+                                    flash_v100::KV_CACHE_DTYPE_FP8_E5M2);     \
     } else if (page_size == 3296) {                                           \
       LAUNCH_GROUPED_VERIFY_PARTIAL(MAX_QUERY_TOKENS, TWO_PASS, 3296,         \
-                                    SINGLE_QUERY, false, false);              \
+                                    SINGLE_QUERY, false, false,               \
+                                    flash_v100::KV_CACHE_DTYPE_FP8_E5M2);     \
     } else {                                                                  \
       LAUNCH_GROUPED_VERIFY_PARTIAL(MAX_QUERY_TOKENS, TWO_PASS, 0,            \
-                                    SINGLE_QUERY, false, false);              \
+                                    SINGLE_QUERY, false, false,               \
+                                    flash_v100::KV_CACHE_DTYPE_FP8_E5M2);     \
     }                                                                         \
   } while (0)
 
   const bool single_query = q.size(0) == 1;
-  if (wide_query && one_pass) {
+  if (kv_cache_dtype == "fp8_e4m3") {
+    // Reuse the grouped q8 schedule and existing E4M3 vector conversion.
+    // Runtime strides cover both separate and interleaved hybrid KV pages.
+    LAUNCH_GROUPED_VERIFY_PARTIAL(kGroupedVerifyQ8MaxQ, false, 0, false, false,
+                                  false, flash_v100::KV_CACHE_DTYPE_FP8_E4M3);
+  } else if (wide_query && one_pass) {
     DISPATCH_GROUPED_VERIFY_PARTIAL(kGroupedVerifyQ16MaxQ, false, false);
   } else if (wide_query) {
     DISPATCH_GROUPED_VERIFY_PARTIAL(kGroupedVerifyQ16MaxQ, true, false);

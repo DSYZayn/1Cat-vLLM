@@ -785,10 +785,10 @@ def _log_kv_dtype_contract(kv_cache_dtype: str) -> None:
             "dtype is independent of model weight quantization."
         )
     elif kv_cache_dtype == "fp8_e4m3":
-        logger.warning(
+        logger.info(
             "SM70 Flash-V100 is using explicitly requested E4M3 KV cache. "
-            "The optimized V100 quantized-KV route uses E5M2. KV-cache dtype "
-            "is independent of model weight quantization."
+            "The decode route depends on the native extension and tensor "
+            "layout. KV-cache dtype is independent of model weight quantization."
         )
     elif kv_cache_dtype == "fp8_e5m2":
         logger.info(
@@ -5279,7 +5279,20 @@ class FlashAttnV100Impl(TritonAttentionImpl):
             and value_cache.dtype == torch.uint8
             and key_cache.stride(-1) == 1
             and value_cache.stride(-1) == 1
-            and self.kv_cache_dtype == "fp8_e5m2"
+            and (
+                self.kv_cache_dtype == "fp8_e5m2"
+                or (
+                    self.kv_cache_dtype == "fp8_e4m3"
+                    and num_query_tokens == 8
+                    and key_cache.stride(0) % 16 == 0
+                    and key_cache.stride(1) % 16 == 0
+                    and value_cache.stride(0) % 16 == 0
+                    and value_cache.stride(1) % 16 == 0
+                    and getattr(
+                        self.flash_attn_grouped_verify_paged, "supports_e4m3", False
+                    )
+                )
+            )
             and block_table is not None
             and block_table.ndim == 2
             and block_table.shape[0] == 1
@@ -5341,8 +5354,9 @@ class FlashAttnV100Impl(TritonAttentionImpl):
         if not _logged_prefill_smallq_grouped_verify:
             logger.info(
                 "FLASH_ATTN_V100 DFlash2 exact grouped verifier active "
-                "(q%d/H6/Hkv1/D256, FP8 E5M2 KV, one-pass).",
+                "(q%d/H6/Hkv1/D256, %s KV, one-pass).",
                 query.shape[0],
+                self.kv_cache_dtype,
             )
             _logged_prefill_smallq_grouped_verify = True
         self.flash_attn_grouped_verify_paged(

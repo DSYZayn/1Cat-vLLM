@@ -224,6 +224,7 @@ if TYPE_CHECKING:
     VLLM_SM70_LM_HEAD_TOP1: bool = True
     VLLM_SM70_LM_HEAD_TOP1_TC: bool = False
     VLLM_SM70_DFLASH2_QPN8_RERANK: bool = False
+    VLLM_SM70_DFLASH2_FP32_LOGITS: bool = False
     VLLM_SM70_DFLASH2_QPN8_RERANK_SHADOW: bool = False
     VLLM_SM70_DFLASH2_QPN8_DENSE_ORDER: bool = True
     VLLM_SM70_DFLASH2_QPN8_ALLOW_CANDIDATE_ORDER: bool = False
@@ -2107,6 +2108,11 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # quality, and complete Graph/Nsight gates all pass.
     "VLLM_SM70_DFLASH2_QPN8_RERANK": lambda: bool(
         int(os.getenv("VLLM_SM70_DFLASH2_QPN8_RERANK", "0"))
+    ),
+    # Explicit precision contract: retain FP32 candidate and dense logits
+    # for the SM70 TP4 DFlash2 LM head, including reference fallback.
+    "VLLM_SM70_DFLASH2_FP32_LOGITS": lambda: bool(
+        int(os.getenv("VLLM_SM70_DFLASH2_FP32_LOGITS", "0"))
     ),
     # Audit-only eager mode: execute QPN8+rerank, compare it with the dense
     # local top-k, and return the dense result so the baseline trajectory is
