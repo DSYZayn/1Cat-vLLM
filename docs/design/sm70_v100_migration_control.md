@@ -45925,3 +45925,17 @@ Interpretation:
   `v100-dflash2-verifier-route-audit-20260906`. Runtime arithmetic and precision
   defaults are unchanged; keep the existing Draft PR pending the remaining
   state, QAT teacher and performance gates.
+
+### Prefill repair history recheck
+
+At main `95205a2d9952813aa7469f63ff65b8f2813c027a`, the Flash-V100
+paged-prefill race/alignment fixes #202/#226 are already integrated and
+present in the source used for the retained 4.33% TV run and rebuilt native
+library. QSA allocation repair #494 and its validation #525 are in main but
+do not execute in
+the QUASAR 27B GDN/full-attention model. Draft #524 has a failed model token
+gate. No applicable validated pending prefill repair was found or merged.
+The [PR history recheck](sm70_dflash2_verifier_route_audit.md) records the
+scope and ancestry checks, prefill divergence, top-p boundary amplification,
+and the remaining conv/SSM state-replay requirement. CPU capture analysis
+passed; no fresh GPU run or performance claim accompanies this recheck.

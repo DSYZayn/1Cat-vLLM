@@ -160,6 +160,62 @@ Four resolved native-library hashes match the preceding audit. Cross-startup
 and cross-GPU-set output parity remains open; neither the diagnostic results
 nor this short stable production repetition proves broad output quality.
 
+## Prefill PR history and repeatability recheck
+
+The follow-up reviewed the public PR records against main
+`95205a2d9952813aa7469f63ff65b8f2813c027a` and audit runtime source
+`11d6b6b9dce15d8bf89d6f4509b0f8136274a653`. The Flash-V100 companion
+repository has no PR records. No applicable, validated, unmerged prefill
+repair was identified for this QUASAR dense GDN/full-attention route.
+
+| PR | Repair or evidence | Applicability and integration |
+| --- | --- | --- |
+| [#202](https://github.com/1CatAI/1Cat-vLLM/pull/202) | Two-phase P commit removes a paged-prefill shared-memory race for D64/D128. | Already in main and the tested audit source. D256 uses separate P storage. |
+| [#226](https://github.com/1CatAI/1Cat-vLLM/pull/226) | Aligns WMMA accumulators and shared-memory base; six-replay D128 regression. | Already in both trees; 32-byte accumulator alignment and the assertion remain present. |
+| [#219](https://github.com/1CatAI/1Cat-vLLM/pull/219), [#350](https://github.com/1CatAI/1Cat-vLLM/pull/350) | FP32 XQA probabilities for FP16 KV; restoration of D256 prefill operators. | Already in both trees; neither is a new E4M3/GDN-state fix. |
+| [#403](https://github.com/1CatAI/1Cat-vLLM/pull/403) | Records Flash Next QSA prefill quality evidence. | Already integrated; its matched quality claim concerns a different model route. |
+| [#434](https://github.com/1CatAI/1Cat-vLLM/pull/434), [#408](https://github.com/1CatAI/1Cat-vLLM/pull/408) | Legacy-runner hybrid prefill dispatch; Flash Next/cache correctness repairs. | Already integrated. The legacy-runner dispatch fix does not execute in this MRV2 run. |
+| [#494](https://github.com/1CatAI/1Cat-vLLM/pull/494), [#525](https://github.com/1CatAI/1Cat-vLLM/pull/525) | QSA logical-page ordering and its NVFP4 model validation. | Both are in main; this Qwen3.5-family 27B model does not execute QSA. |
+| [#524](https://github.com/1CatAI/1Cat-vLLM/pull/524) | Experimental E4M3 grouped attention with FP32 partials. | Remains Draft with a failed model token gate; not admitted as a quality repair. |
+
+Main advanced from `4366d9d5fe80eeaf79575b51ec36a6a032673df0` when another
+task merged #525 during this review. Its shared CUDA-file change is limited
+to the Qwen4Exp HC down scatter kernel; it does not change this model's
+ordinary TP all-reduce or the paged-prefill kernel.
+
+The runtime library is the retained `lib-final` artifact with SHA256
+`c3f3bef28a21f681d3d3d84e65d5f208b9d2c282b2c4bfe7cb5f7e221d55802e`.
+Its retained compile and link logs build the paged-prefill object from this
+owned source tree. The paged-prefill source is unchanged against current
+main and contains both old fixes. Thus the observed 4.33% drift was already
+measured with those repairs; merging them again supplies no new intervention.
+
+CPU reanalysis of the retained captures also narrows the causal gap:
+
+- Both runs execute the full identical 135-token MBPP28 prompt. Their final
+  prefill hidden states already differ, before any forced q8 acceptance
+  update. The first q8 layer-0 QKV projection is exact across starts, while
+  rank 2's GDN core has 52 different elements, maximum absolute 3.8147e-6,
+  before the audited output normalization.
+- At position 212, the top-20 distribution's first two candidates have
+  cumulative mass 0.94912833 versus 0.95171565. Crossing top-p 0.95 removes
+  token 23, whose sampled mass was 0.04329225; recomputed TV is 0.04329227.
+  Full-vocabulary softmax TV at that position is already 0.02030133.
+- The original probe omitted prefill layer tensors and incoming conv/SSM
+  state. It cannot distinguish a prefill arithmetic difference from state
+  propagation or core execution. It does not prove stale state or a race.
+  The fixed FP8 tuning experiment in #524 concerns another checkpoint:
+  this NVFP4 prompt M135/M153 exceeds the default dense tuning maximum M16.
+  Do not transfer that experiment's causal conclusion to this model.
+
+No runtime source, production flag or integration branch changes were made
+by this history recheck. No fresh GPU replay was run while all GPUs were
+owned by other tasks. Preserve the pending state-replay gate; the historical
+two passing D128 tests in #226 are not a new model-level validation.
+PR snapshots and ancestry/library checks are retained in bundle
+`v100-dflash2-prefill-pr-audit-20260906`; the CPU reanalysis is in the previous
+verifier bundle's `repeatability-cause` directory and exited successfully.
+
 ## Diagnostic repairs and validation
 
 `sm70_gdn_projection_dump` returned its input despite a non-aliasing custom-op
