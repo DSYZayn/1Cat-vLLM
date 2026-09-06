@@ -52,6 +52,7 @@ from vllm.distributed.parallel_state import (
     get_tp_group,
     graph_capture,
     is_global_first_rank,
+    is_last_pp_first_tp_rank,
     prepare_communication_buffer_for_model,
 )
 from vllm.forward_context import (
@@ -1262,7 +1263,9 @@ class GPUModelRunner(
 
         if calls != 1 and calls % _sm70_mtp_profile_interval() != 0:
             return
-        if not is_global_first_rank():
+        # The events come from the sampling path, which only the last PP
+        # stage runs; the global first rank never sees them when PP > 1.
+        if not is_last_pp_first_tp_rank():
             return
 
         preferred = [
@@ -1405,8 +1408,14 @@ class GPUModelRunner(
             self.ngram_eos_token_id = 0
         if self.uses_ngram_embedding and self.ngram_context_len <= 0:
             raise ValueError("N-gram embedding requires context length >= 1")
-        if self.uses_ngram_embedding and parallel_config.pipeline_parallel_size > 1:
-            raise RuntimeError("N-gram PLE embedding requires pipeline_parallel_size=1")
+        if self.uses_ngram_embedding:
+            from vllm.models.qwen4_exp.common.ple import (
+                check_ple_layers_on_first_pp_rank,
+            )
+
+            check_ple_layers_on_first_pp_rank(
+                model_config.hf_text_config, parallel_config.pipeline_parallel_size
+            )
         self._ple_offload_connector: Any | None = None
 
         self.cascade_attn_enabled = not self.model_config.disable_cascade_attn
