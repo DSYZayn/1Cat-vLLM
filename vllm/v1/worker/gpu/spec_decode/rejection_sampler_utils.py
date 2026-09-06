@@ -778,8 +778,15 @@ def dflash2_sparse_topk_rejection_sample(
     if not 0 < draft_topk_ids.shape[2] <= 64:
         raise ValueError("draft top-k width must be in [1, 64]")
 
-    target_topk_ids = target_topk_ids.contiguous()
-    target_topk_logits = target_topk_logits.contiguous()
+    # The cutoff probe retains 21 columns before slicing to top-20. The kernel
+    # already accepts a row stride, so preserve that view and avoid two copies.
+    if (
+        target_topk_ids.stride(-1) != 1
+        or target_topk_logits.stride(-1) != 1
+        or target_topk_ids.stride(0) != target_topk_logits.stride(0)
+    ):
+        target_topk_ids = target_topk_ids.contiguous()
+        target_topk_logits = target_topk_logits.contiguous()
     draft_topk_ids = draft_topk_ids.contiguous()
     draft_topk_logits = draft_topk_logits.contiguous()
     num_reqs = cu_num_logits.shape[0] - 1

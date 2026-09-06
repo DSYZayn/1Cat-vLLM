@@ -565,7 +565,10 @@ class DFlashSpeculator(DraftModelSpeculator):
         # number of rejected tokens, we maintain the size of input_ids and
         # hidden_states the same as the target model's. This means, we pad each
         # request's query length to include any rejected positions.
-        if aux_hidden_states:
+        prepared_hidden = self._get_prepared_context_hidden(input_batch)
+        if prepared_hidden is not None:
+            hidden_states = prepared_hidden
+        elif aux_hidden_states:
             if (
                 getattr(self, "_debug_proposal_stages", False)
                 and getattr(self, "_debug_real_proposal", False)
@@ -692,7 +695,7 @@ class DFlashSpeculator(DraftModelSpeculator):
             context_slots = self._context_slot_mappings[0][:num_target_tokens]
         self._debug_proposal_stage("context kv begin")
         with record_function_or_nullcontext("dflash: materialize context kv"):
-            self.model.precompute_and_store_context_kv(
+            self._precompute_context_kv(
                 self.hidden_states[:num_target_tokens],
                 self.context_positions[:num_target_tokens],
                 context_slots,
@@ -741,20 +744,26 @@ class DFlashSpeculator(DraftModelSpeculator):
             num_reqs_padded = batch_desc.num_reqs or num_reqs
             num_tokens_padded = batch_desc.num_tokens
 
-            # Rebuild the draft attention metadata even when replaying the FULL
-            # graph so that any attention metadata builder state is updated.
-            draft_attn_metadata = self._build_draft_attn_metadata(
-                num_reqs=num_reqs,
-                num_reqs_padded=num_reqs_padded,
-                num_tokens_padded=num_tokens_padded,
-                seq_lens_cpu_upper_bound=input_batch.seq_lens_cpu_upper_bound,
-                step=self.num_query_per_req,
-                causal=self._group_causal,
-            )
-            draft_slot_mappings_by_layer = build_slot_mappings_by_layer(
-                query_slot_mappings[:, :num_tokens_padded],
-                self.kv_cache_config,
-            )
+            # Refresh persistent metadata before FULL replay. The supported
+            # DFlash2 path copies its captured inputs; other routes rebuild.
+            if batch_desc.cg_mode == CUDAGraphMode.FULL and (
+                self._refresh_draft_graph_metadata(num_reqs_padded, num_tokens_padded)
+            ):
+                draft_attn_metadata = None
+                draft_slot_mappings_by_layer = None
+            else:
+                draft_attn_metadata = self._build_draft_attn_metadata(
+                    num_reqs=num_reqs,
+                    num_reqs_padded=num_reqs_padded,
+                    num_tokens_padded=num_tokens_padded,
+                    seq_lens_cpu_upper_bound=input_batch.seq_lens_cpu_upper_bound,
+                    step=self.num_query_per_req,
+                    causal=self._group_causal,
+                )
+                draft_slot_mappings_by_layer = build_slot_mappings_by_layer(
+                    query_slot_mappings[:, :num_tokens_padded],
+                    self.kv_cache_config,
+                )
 
             self._debug_proposal_stage("query preparation end")
             if batch_desc.cg_mode == CUDAGraphMode.FULL:
@@ -786,6 +795,22 @@ class DFlashSpeculator(DraftModelSpeculator):
         )
 
         return self.draft_tokens[:num_reqs]
+
+    def _precompute_context_kv(
+        self,
+        hidden_states: torch.Tensor,
+        positions: torch.Tensor,
+        slots: torch.Tensor | list[torch.Tensor | None] | None,
+    ) -> None:
+        self.model.precompute_and_store_context_kv(hidden_states, positions, slots)
+
+    def _get_prepared_context_hidden(
+        self, input_batch: InputBatch
+    ) -> torch.Tensor | None:
+        return None
+
+    def _refresh_draft_graph_metadata(self, num_reqs: int, num_tokens: int) -> bool:
+        return False
 
 
 @triton.jit

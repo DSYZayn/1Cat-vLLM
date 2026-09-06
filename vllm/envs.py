@@ -226,6 +226,7 @@ if TYPE_CHECKING:
     VLLM_SM70_LM_HEAD_TOP1: bool = True
     VLLM_SM70_LM_HEAD_TOP1_TC: bool = False
     VLLM_SM70_DFLASH2_QPN8_RERANK: bool = False
+    VLLM_SM70_DFLASH2_FP32_LOGITS: bool = False
     VLLM_SM70_DFLASH2_QPN8_RERANK_SHADOW: bool = False
     VLLM_SM70_DFLASH2_QPN8_DENSE_ORDER: bool = True
     VLLM_SM70_DFLASH2_QPN8_ALLOW_CANDIDATE_ORDER: bool = False
@@ -242,6 +243,8 @@ if TYPE_CHECKING:
     VLLM_SM70_DFLASH2_FUSED_GEMMA_RMS: bool = False
     VLLM_SM70_DFLASH2_SPARSE_TARGET_REJECTION: bool = False
     VLLM_SM70_DFLASH2_SHARDED_CONTEXT_FC: bool = False
+    VLLM_SM70_DFLASH2_CONTEXT_KV_GRAPH: bool = False
+    VLLM_SM70_DFLASH2_CONTEXT_PIPELINE: bool = False
     VLLM_SM70_GLM53_MHC_NATIVE_VERIFY: bool = False
     VLLM_SM70_GLM53_MHC_FUSED_POST_DOT_Q8: bool = False
     VLLM_SM70_GLM53_MOE_FUSED_PERMUTE_Q8: bool = True
@@ -2124,6 +2127,11 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_SM70_DFLASH2_QPN8_RERANK": lambda: bool(
         int(os.getenv("VLLM_SM70_DFLASH2_QPN8_RERANK", "0"))
     ),
+    # Explicit precision contract: retain FP32 candidate and dense logits
+    # for the SM70 TP4 DFlash2 LM head, including reference fallback.
+    "VLLM_SM70_DFLASH2_FP32_LOGITS": lambda: bool(
+        int(os.getenv("VLLM_SM70_DFLASH2_FP32_LOGITS", "0"))
+    ),
     # Audit-only eager mode: execute QPN8+rerank, compare it with the dense
     # local top-k, and return the dense result so the baseline trajectory is
     # unchanged.  This intentionally synchronizes for diagnostics.
@@ -2218,6 +2226,12 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # default remains off; audited DFlash2 contracts enable it explicitly.
     "VLLM_SM70_DFLASH2_SHARDED_CONTEXT_FC": lambda: bool(
         int(os.getenv("VLLM_SM70_DFLASH2_SHARDED_CONTEXT_FC", "0"))
+    ),
+    "VLLM_SM70_DFLASH2_CONTEXT_KV_GRAPH": lambda: bool(
+        int(os.getenv("VLLM_SM70_DFLASH2_CONTEXT_KV_GRAPH", "0"))
+    ),
+    "VLLM_SM70_DFLASH2_CONTEXT_PIPELINE": lambda: bool(
+        int(os.getenv("VLLM_SM70_DFLASH2_CONTEXT_PIPELINE", "0"))
     ),
     # Native SM70 final stage for the GLM-5.3 q8 mHC verifier. Audited model and
     # topology contracts enable it while the global default remains off.
