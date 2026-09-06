@@ -1,9 +1,11 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""Default-off native-g32 Qwen3.8 TP4 AWQ QPN M1 admission.
+"""Shape-gated native-g32 TP4 AWQ QPN M1 admission.
 
 The changed FP32 reduction order is not a bitwise-equivalence guarantee.
 """
+
+import os
 
 import torch
 
@@ -17,6 +19,7 @@ def _has_native_op() -> bool:
 def initialize_qpn_m1(layer, shape_contract: bool) -> bool:
     if not envs.VLLM_SM70_AWQ_QWEN38_QPN_M1:
         return False
+    explicit = "VLLM_SM70_AWQ_QWEN38_QPN_M1" in os.environ
     if not (
         shape_contract
         and layer.sm70_awq_moe_batched_gemm
@@ -25,9 +28,13 @@ def initialize_qpn_m1(layer, shape_contract: bool) -> bool:
         and layer.sm70_awq_checkpoint_group_size == 32
         and layer.sm70_awq_group_size == 32
     ):
-        raise RuntimeError("AWQ QPN M1 requires native-g32 TP4 E512 C1")
+        if explicit:
+            raise RuntimeError("AWQ QPN M1 requires native-g32 TP4 E512 C1")
+        return False
     if not _has_native_op():
-        raise RuntimeError("AWQ QPN M1 requires a native build with CUDA arch 7.0")
+        if explicit:
+            raise RuntimeError("AWQ QPN M1 requires a native build with CUDA arch 7.0")
+        return False
     return True
 
 

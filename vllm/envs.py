@@ -120,7 +120,7 @@ if TYPE_CHECKING:
     VLLM_SM70_AWQ_MOE_BATCHED_GEMM: bool = True
     VLLM_SM70_AWQ_QWEN38_MOE_INDEXED_PREFILL: bool = True
     VLLM_SM70_AWQ_QWEN38_MOE_COMPACT_GROUPED_DECODE: bool = True
-    VLLM_SM70_AWQ_QWEN38_QPN_M1: bool = False
+    VLLM_SM70_AWQ_QWEN38_QPN_M1: bool = True
     VLLM_SM70_AWQ_MOE_BATCHED_SINGLE_TOKEN_DENSE_W13: bool = False
     VLLM_SM70_AWQ_MOE_BATCHED_EXACT_W2: bool = False
     VLLM_SM70_AWQ_MOE_BATCHED_ACTIVE_EXACT_W2: bool = False
@@ -1669,10 +1669,12 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_SM70_AWQ_QWEN38_MOE_COMPACT_GROUPED_DECODE": lambda: bool(
         int(os.getenv("VLLM_SM70_AWQ_QWEN38_MOE_COMPACT_GROUPED_DECODE", "1"))
     ),
-    # Opt-in Qwen3.8 TP4/native-g32 single-token W13/W2 QPN route.
-    # Keeps prepared metadata and FP16 boundaries, but changes reduction order.
+    # Default-on TP4/native-g32 single-token W13/W2 QPN route for supported
+    # E512 shapes and native builds. Implicit unsupported requests fall back;
+    # explicit 1 fails closed, and 0 restores the legacy route. Keeps prepared
+    # metadata and FP16 boundaries, but changes reduction order.
     "VLLM_SM70_AWQ_QWEN38_QPN_M1": lambda: (
-        env_with_choices("VLLM_SM70_AWQ_QWEN38_QPN_M1", "0", ["0", "1"])() == "1"
+        env_with_choices("VLLM_SM70_AWQ_QWEN38_QPN_M1", "1", ["0", "1"])() == "1"
     ),
     "VLLM_SM70_AWQ_MOE_BATCHED_SINGLE_TOKEN_DENSE_W13": lambda: bool(
         int(os.getenv("VLLM_SM70_AWQ_MOE_BATCHED_SINGLE_TOKEN_DENSE_W13", "0"))

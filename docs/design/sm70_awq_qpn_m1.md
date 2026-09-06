@@ -82,8 +82,9 @@ tests do not by themselves establish full-model quality or throughput.
 
 ## Runtime layer
 
-`VLLM_SM70_AWQ_QWEN38_QPN_M1=1` opts in at model initialization. The default
-is `0`; other values are rejected. Use a native build containing the operator
+`VLLM_SM70_AWQ_QWEN38_QPN_M1` defaults to `1` at model initialization for
+supported layer contracts and native builds. Set `0` for rollback; other
+values are rejected. Use a native build containing the operator
 and restart the engine after changing the setting, including for rollback.
 Changing an environment variable does not replace an already captured graph.
 There is no research sidecar, runtime compilation or external DSO loader.
@@ -92,6 +93,8 @@ Admission requires the existing TP4/E512/native-group-32 geometry, batched
 TurboMind weights, interleaved W13 and the legacy single-token compact path.
 Both the checkpoint and prepared group sizes must be 32. An explicit opt-in
 with an unsupported layer contract or missing native operator fails closed.
+When the variable is unset, those cases automatically retain the legacy route.
+Admission uses tensor geometry and capabilities, not checkpoint identity.
 At execution, only contiguous FP16 `(1, 2560)` inputs with ten INT32 expert
 IDs and FP32 router weights select QPN. Other physical batch sizes, including
 padded CUDA Graph batches, retain their existing route. This does not change
@@ -182,12 +185,22 @@ from `topk(2)`, for the greedy tie rule. Reanalysis found an IFEval flip at
 index 80 where QPN's top two logits tie; an earlier short-prompt flip was
 a tie-order reporting artifact. Raw tensors and task scores did not change.
 
-Current scope is an opt-in review proposal. The tested local numerical
+The original runtime proposal was opt-in. The tested local numerical
 evidence does not justify rewriting the kernel solely to reproduce legacy
 tokens, but broad quality non-inferiority and production readiness remain
 unproven. Future acceptance must retain task-level quality checks alongside
 numerical bounds; neither single-question changes nor their aggregate
 cancellation alone settle that decision.
+
+The September 6 integration enables the measured shape by default under the
+repository owner's acceptance policy: preserve the observed C1 speedup and
+independently checked arithmetic without requiring greedy equality. The
+65-case quality observations and their limitations above remain unchanged;
+this policy decision is not a new model benchmark or a statistical quality
+claim. Both the grouped-decode baseline and the QSA allocation-order repair
+must be retained when comparing to that paired evidence. The integration
+adds CPU coverage for implicit unsupported-shape/build fallback, explicit
+rollback and interaction with the loading-cache lifecycle regression.
 
 ## Cooperative 3-byte metadata layer
 

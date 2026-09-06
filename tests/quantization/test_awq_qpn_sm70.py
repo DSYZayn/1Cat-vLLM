@@ -25,12 +25,48 @@ def layer():
     )
 
 
-def test_default_off_never_loads(monkeypatch):
+def test_default_on_unsupported_shape_never_loads(monkeypatch):
     monkeypatch.delenv("VLLM_SM70_AWQ_QWEN38_QPN_M1", raising=False)
+    assert qpn.envs.VLLM_SM70_AWQ_QWEN38_QPN_M1
     monkeypatch.setattr(
         qpn, "_has_native_op", lambda: pytest.fail("unexpected native lookup")
     )
     assert not qpn.initialize_qpn_m1(object(), False)
+
+
+def test_explicit_disable_never_loads(monkeypatch):
+    monkeypatch.setenv("VLLM_SM70_AWQ_QWEN38_QPN_M1", "0")
+    monkeypatch.setattr(
+        qpn, "_has_native_op", lambda: pytest.fail("unexpected native lookup")
+    )
+    assert not qpn.initialize_qpn_m1(layer(), True)
+
+
+@pytest.mark.parametrize("native_available", [False, True])
+def test_default_on_checks_native_capability(monkeypatch, native_available):
+    monkeypatch.delenv("VLLM_SM70_AWQ_QWEN38_QPN_M1", raising=False)
+    monkeypatch.setattr(qpn, "_has_native_op", lambda: native_available)
+    assert qpn.initialize_qpn_m1(layer(), True) == native_available
+
+
+@pytest.mark.parametrize(
+    "attribute,value",
+    [
+        ("sm70_awq_moe_batched_gemm", False),
+        ("sm70_awq_moe_w13_interleaved", False),
+        ("sm70_awq_moe_legacy_single_token_compact", False),
+        ("sm70_awq_checkpoint_group_size", 128),
+        ("sm70_awq_group_size", 64),
+    ],
+)
+def test_implicit_unsupported_layer_falls_back(monkeypatch, attribute, value):
+    monkeypatch.delenv("VLLM_SM70_AWQ_QWEN38_QPN_M1", raising=False)
+    current = layer()
+    setattr(current, attribute, value)
+    monkeypatch.setattr(
+        qpn, "_has_native_op", lambda: pytest.fail("unexpected native lookup")
+    )
+    assert not qpn.initialize_qpn_m1(current, True)
 
 
 @pytest.mark.parametrize("value", ["2", "true", "", "-1"])
