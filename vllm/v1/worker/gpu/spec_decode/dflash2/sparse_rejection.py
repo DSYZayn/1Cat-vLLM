@@ -263,8 +263,15 @@ def try_dflash2_sparse_target_rejection(
         return None
     target_topk_ids = target_topk_ids[:, :_TARGET_TOP_K]
     target_topk_logits = target_topk_logits[:, :_TARGET_TOP_K]
-    draft_sampled = input_batch.input_ids[input_batch.logits_indices]
-    pos = input_batch.positions[input_batch.logits_indices]
+    num_rows = target_topk_ids.shape[0]
+    if input_batch.num_tokens == num_rows:
+        # For the gated B1 decode, logits_indices spans the entire real query.
+        # Keep views instead of launching two identity gather kernels.
+        draft_sampled = input_batch.input_ids[:num_rows]
+        pos = input_batch.positions[:num_rows]
+    else:
+        draft_sampled = input_batch.input_ids[input_batch.logits_indices]
+        pos = input_batch.positions[input_batch.logits_indices]
     sampled, num_sampled = dflash2_sparse_topk_rejection_sample(
         target_topk_ids,
         target_topk_logits,

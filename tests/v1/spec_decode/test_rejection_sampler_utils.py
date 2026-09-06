@@ -134,10 +134,12 @@ def _assert_distribution_match(
 @pytest.mark.parametrize("num_speculative_steps", [3, 7])
 @pytest.mark.parametrize("top_p", [1.0, 0.95])
 @pytest.mark.parametrize("temperature", [0.6, 1.0])
+@pytest.mark.parametrize("padded_candidates", [False, True])
 def test_dflash2_sparse_topk_matches_dense_rejection(
     num_speculative_steps: int,
     top_p: float,
     temperature: float,
+    padded_candidates: bool,
 ):
     """Compact p/q support must preserve the dense DFlash2 decision path."""
     torch.manual_seed(20260823)
@@ -245,6 +247,15 @@ def test_dflash2_sparse_topk_matches_dense_rejection(
         seeds,
         num_speculative_steps,
     )
+    if padded_candidates:
+        padded_ids = target_topk_ids.new_zeros((num_logits, target_top_k + 1))
+        padded_logits = target_topk_logits.new_full(
+            (num_logits, target_top_k + 1), 1000.0
+        )
+        padded_ids[:, :target_top_k].copy_(target_topk_ids)
+        padded_logits[:, :target_top_k].copy_(target_topk_logits)
+        target_topk_ids = padded_ids[:, :target_top_k]
+        target_topk_logits = padded_logits[:, :target_top_k]
     sparse_sampled, sparse_num_sampled = dflash2_sparse_topk_rejection_sample(
         target_topk_ids,
         target_topk_logits,

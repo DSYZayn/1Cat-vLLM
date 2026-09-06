@@ -45789,3 +45789,29 @@ Interpretation:
   fused variants compile with 31 registers/16 bytes shared/zero stack or
   spills. Compare complete HC with the newly registered up fusion held fixed,
   including actual auxiliary sum2 and post-wrap checks. GPU gate pending.
+
+## 2026-09-06 QUASAR E4M3 / FP32 DFlash2 latency recovery
+
+- Continue owned Draft PR #517 from precision-control `6ec27bec9c`; integration
+  base remains `755baae1d0`. Keep E4M3 target KV, FP32 candidate logits, and
+  ambiguous-cutoff reference sampling.
+- Capture q8 context computation and accepted-slot writes; stage independent
+  context work before sampling; refresh the non-causal paged graph's persistent
+  metadata directly. Remove four identity gather/stride-copy launches.
+- Same-process control/pipeline/control medians: release1k 20.035 → 18.925 ms;
+  MBPP28 19.642 → 18.467 ms. Full token sequences and acceptance counts match.
+  The historical 18.037 / 17.588 ms peaks are still about 0.9 ms faster.
+- Real weights: all 64 changing-context cases and all 16 metadata cases match
+  eager reference bitwise, including accepted lengths 1–8 and the 256K boundary.
+  Three long code responses (3559 / 1400 / 1856 tokens) match completely; MBPP
+  Base 3/3, Plus 1/3 in both arms; structured JSON 42 passes. Independent startup
+  trajectories differ, so cross-start reproducibility is still unclosed.
+- Focused GPU tests 32 passed; metadata/policy tests 15 passed; Ruff/mypy pass.
+- Profiling environment: use Nsight Systems 2025.3.1 for V100. 2026.4 does not
+  support Volta. Start the profiler in every TP worker; a rank-zero-only CUDA
+  trace must not be reported as TP4 GPU evidence. Final trace has all four ranks.
+- NUMA pinning gave only ~0.03–0.04 ms; original affinity restored. Do not repeat
+  that experiment or disable sampling guards to manufacture a peak result.
+- Full contract, exact tests, acceptance limits, and artifact bundle are in
+  [the recovery report](sm70_quasar_dflash2_quality_speed_recovery.md). Raw bundle:
+  `v100-quasar-quality-speed-recovery-20260906`.

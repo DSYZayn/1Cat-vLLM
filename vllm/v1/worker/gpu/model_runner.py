@@ -117,6 +117,7 @@ from vllm.v1.worker.gpu.spec_decode import init_speculator
 from vllm.v1.worker.gpu.spec_decode.dflash2.sparse_rejection import (
     try_dflash2_sparse_target_rejection,
 )
+from vllm.v1.worker.gpu.spec_decode.dflash2.speculator import DFlash2Speculator
 from vllm.v1.worker.gpu.spec_decode.eagle.eagle3_utils import (
     set_eagle3_aux_hidden_state_layers,
 )
@@ -1726,6 +1727,10 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             return ModelRunnerOutput.with_kv_conn_output_only(kv_connector_output)
 
         # Last rank: sample tokens
+        if isinstance(self.speculator, DFlash2Speculator):
+            self.speculator.prepare_target_context(
+                input_batch, hidden_states, aux_hidden_states
+            )
         mtp_sample_start = self._sm70_v2_mtp_profile_start(mtp_profile_ctx)
         sampler_output, num_sampled, num_rejected = self.sample(
             hidden_states, input_batch, grammar_output

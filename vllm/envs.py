@@ -241,6 +241,8 @@ if TYPE_CHECKING:
     VLLM_SM70_DFLASH2_FUSED_GEMMA_RMS: bool = False
     VLLM_SM70_DFLASH2_SPARSE_TARGET_REJECTION: bool = False
     VLLM_SM70_DFLASH2_SHARDED_CONTEXT_FC: bool = False
+    VLLM_SM70_DFLASH2_CONTEXT_KV_GRAPH: bool = False
+    VLLM_SM70_DFLASH2_CONTEXT_PIPELINE: bool = False
     VLLM_SM70_GLM53_MHC_NATIVE_VERIFY: bool = False
     VLLM_SM70_GLM53_MHC_FUSED_POST_DOT_Q8: bool = False
     VLLM_SM70_GLM53_MOE_FUSED_PERMUTE_Q8: bool = True
@@ -2208,6 +2210,12 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # default remains off; audited DFlash2 contracts enable it explicitly.
     "VLLM_SM70_DFLASH2_SHARDED_CONTEXT_FC": lambda: bool(
         int(os.getenv("VLLM_SM70_DFLASH2_SHARDED_CONTEXT_FC", "0"))
+    ),
+    "VLLM_SM70_DFLASH2_CONTEXT_KV_GRAPH": lambda: bool(
+        int(os.getenv("VLLM_SM70_DFLASH2_CONTEXT_KV_GRAPH", "0"))
+    ),
+    "VLLM_SM70_DFLASH2_CONTEXT_PIPELINE": lambda: bool(
+        int(os.getenv("VLLM_SM70_DFLASH2_CONTEXT_PIPELINE", "0"))
     ),
     # Native SM70 final stage for the GLM-5.3 q8 mHC verifier. Audited model and
     # topology contracts enable it while the global default remains off.

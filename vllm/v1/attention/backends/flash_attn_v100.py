@@ -3515,19 +3515,36 @@ class FlashAttnV100MetadataBuilder(TritonAttentionMetadataBuilder):
         assert self._draft_seq_lens is not None
         assert self._draft_query_start_loc is not None
 
-        self._draft_block_table[:num_reqs].copy_(block_table, non_blocking=True)
-        self._draft_seq_lens[:num_reqs].copy_(
+        self.copy_dflash_graph_metadata(
+            block_table,
             attn_metadata.seq_lens[:num_reqs],
-            non_blocking=True,
-        )
-        self._draft_query_start_loc[: num_reqs + 1].copy_(
             attn_metadata.query_start_loc[: num_reqs + 1],
-            non_blocking=True,
         )
 
         attn_metadata.block_table = self._draft_block_table[:num_reqs]
         attn_metadata.seq_lens = self._draft_seq_lens[:num_reqs]
         attn_metadata.query_start_loc = self._draft_query_start_loc[: num_reqs + 1]
+
+    def copy_dflash_graph_metadata(
+        self,
+        block_table: torch.Tensor,
+        seq_lens: torch.Tensor,
+        query_start_loc: torch.Tensor,
+    ) -> None:
+        """Refresh the three persistent inputs of a non-causal DFlash graph."""
+        num_reqs = seq_lens.numel()
+        assert self._draft_block_table is not None
+        assert self._draft_seq_lens is not None
+        assert self._draft_query_start_loc is not None
+        self._draft_block_table[:num_reqs].copy_(block_table, non_blocking=True)
+        self._draft_seq_lens[:num_reqs].copy_(
+            seq_lens,
+            non_blocking=True,
+        )
+        self._draft_query_start_loc[: num_reqs + 1].copy_(
+            query_start_loc,
+            non_blocking=True,
+        )
 
     def _configured_smallq_max_query_len(self) -> int:
         return int(os.getenv("VLLM_FLASH_V100_SMALLQ_DECODE_MAX_Q", "16"))
