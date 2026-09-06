@@ -175,6 +175,44 @@ def test_plan_selection_order_and_graph_relocation(extension, page_size):
         assert masks[0, :count].cpu().tolist() == expected_masks
 
 
+@pytest.mark.parametrize("context", [8192, 32768, 262144])
+@pytest.mark.parametrize("interleaved", [False, True])
+def test_qwen38_page400_long_context_graph_plan(extension, context, interleaved):
+    """The NVFP4 no-MTP lane uses 400-token pages, not power-of-two pages."""
+    page_size = 400
+    generator = torch.Generator().manual_seed(context)
+    positions = torch.arange(context - 8, context, dtype=torch.int64)
+    lengths = torch.tensor([context], dtype=torch.int32)
+    requests = torch.zeros(8, dtype=torch.int32)
+    indices = torch.full((8, WIDTH), -1, dtype=torch.int32)
+    for row, position in enumerate(positions.tolist()):
+        visible = position + 1
+        blocks = torch.randperm(visible // 4, generator=generator)[:512]
+        indices[row, :2048] = (blocks[:, None] * 4 + torch.arange(4)).flatten()
+        tail = visible % 4
+        indices[row, 2048 : 2048 + tail] = torch.arange(visible - tail, visible)
+    count = (context + page_size - 1) // page_size
+    table = torch.arange(count, dtype=torch.int32).view(1, -1)
+    case = (indices, table, requests, positions, lengths)
+    changed_case, _ = relocate(case, "shuffled")
+    stride = page_size // 4 * (2 if interleaved else 1)
+    pages, masks, lens, launch, device_case = run_plan(
+        extension, case, page_size, stride, int(changed_case[1].max()) + 1
+    )
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        launch()
+    for source_case in (case, changed_case, case):
+        for source, target in zip(source_case, device_case):
+            target.copy_(source)
+        graph.replay()
+        expected_pages, expected_masks = reference(source_case, page_size, stride)
+        size = len(expected_pages)
+        assert int(lens[0]) == size * 4
+        assert pages[0, :size].cpu().tolist() == expected_pages
+        assert masks[0, :size].cpu().tolist() == expected_masks
+
+
 @pytest.mark.parametrize("interleaved", [False, True])
 @pytest.mark.parametrize("kv_dtype", ["auto", "fp8_e4m3"])
 def test_attention_is_bitwise_invariant_to_physical_relocation(
