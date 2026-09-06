@@ -785,10 +785,10 @@ def _log_kv_dtype_contract(kv_cache_dtype: str) -> None:
             "dtype is independent of model weight quantization."
         )
     elif kv_cache_dtype == "fp8_e4m3":
-        logger.warning(
+        logger.info(
             "SM70 Flash-V100 is using explicitly requested E4M3 KV cache. "
-            "The optimized V100 quantized-KV route uses E5M2. KV-cache dtype "
-            "is independent of model weight quantization."
+            "The decode route depends on the native extension and tensor "
+            "layout. KV-cache dtype is independent of model weight quantization."
         )
     elif kv_cache_dtype == "fp8_e5m2":
         logger.info(
@@ -3515,19 +3515,36 @@ class FlashAttnV100MetadataBuilder(TritonAttentionMetadataBuilder):
         assert self._draft_seq_lens is not None
         assert self._draft_query_start_loc is not None
 
-        self._draft_block_table[:num_reqs].copy_(block_table, non_blocking=True)
-        self._draft_seq_lens[:num_reqs].copy_(
+        self.copy_dflash_graph_metadata(
+            block_table,
             attn_metadata.seq_lens[:num_reqs],
-            non_blocking=True,
-        )
-        self._draft_query_start_loc[: num_reqs + 1].copy_(
             attn_metadata.query_start_loc[: num_reqs + 1],
-            non_blocking=True,
         )
 
         attn_metadata.block_table = self._draft_block_table[:num_reqs]
         attn_metadata.seq_lens = self._draft_seq_lens[:num_reqs]
         attn_metadata.query_start_loc = self._draft_query_start_loc[: num_reqs + 1]
+
+    def copy_dflash_graph_metadata(
+        self,
+        block_table: torch.Tensor,
+        seq_lens: torch.Tensor,
+        query_start_loc: torch.Tensor,
+    ) -> None:
+        """Refresh the three persistent inputs of a non-causal DFlash graph."""
+        num_reqs = seq_lens.numel()
+        assert self._draft_block_table is not None
+        assert self._draft_seq_lens is not None
+        assert self._draft_query_start_loc is not None
+        self._draft_block_table[:num_reqs].copy_(block_table, non_blocking=True)
+        self._draft_seq_lens[:num_reqs].copy_(
+            seq_lens,
+            non_blocking=True,
+        )
+        self._draft_query_start_loc[: num_reqs + 1].copy_(
+            query_start_loc,
+            non_blocking=True,
+        )
 
     def _configured_smallq_max_query_len(self) -> int:
         return int(os.getenv("VLLM_FLASH_V100_SMALLQ_DECODE_MAX_Q", "16"))
@@ -5279,7 +5296,20 @@ class FlashAttnV100Impl(TritonAttentionImpl):
             and value_cache.dtype == torch.uint8
             and key_cache.stride(-1) == 1
             and value_cache.stride(-1) == 1
-            and self.kv_cache_dtype == "fp8_e5m2"
+            and (
+                self.kv_cache_dtype == "fp8_e5m2"
+                or (
+                    self.kv_cache_dtype == "fp8_e4m3"
+                    and num_query_tokens == 8
+                    and key_cache.stride(0) % 16 == 0
+                    and key_cache.stride(1) % 16 == 0
+                    and value_cache.stride(0) % 16 == 0
+                    and value_cache.stride(1) % 16 == 0
+                    and getattr(
+                        self.flash_attn_grouped_verify_paged, "supports_e4m3", False
+                    )
+                )
+            )
             and block_table is not None
             and block_table.ndim == 2
             and block_table.shape[0] == 1
@@ -5341,8 +5371,9 @@ class FlashAttnV100Impl(TritonAttentionImpl):
         if not _logged_prefill_smallq_grouped_verify:
             logger.info(
                 "FLASH_ATTN_V100 DFlash2 exact grouped verifier active "
-                "(q%d/H6/Hkv1/D256, FP8 E5M2 KV, one-pass).",
+                "(q%d/H6/Hkv1/D256, %s KV, one-pass).",
                 query.shape[0],
+                self.kv_cache_dtype,
             )
             _logged_prefill_smallq_grouped_verify = True
         self.flash_attn_grouped_verify_paged(

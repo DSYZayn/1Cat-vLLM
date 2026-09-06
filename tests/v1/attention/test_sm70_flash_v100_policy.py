@@ -1723,8 +1723,9 @@ def test_flash_v100_smallq_forward_prefers_persistent_decode_metadata():
 
 @pytest.mark.parametrize("query_len", [8, 16])
 @pytest.mark.parametrize("page_size", [3296, 3456])
+@pytest.mark.parametrize("kv_dtype", ["fp8_e5m2", "fp8_e4m3"])
 def test_flash_v100_dflash2_grouped_verify_uses_original_request_metadata(
-    query_len: int, page_size: int
+    query_len: int, page_size: int, kv_dtype: str
 ):
     from vllm.v1.attention.backends.flash_attn_v100 import FlashAttnV100Impl
 
@@ -1735,7 +1736,7 @@ def test_flash_v100_dflash2_grouped_verify_uses_original_request_metadata(
         num_kv_heads=1,
         alibi_slopes=None,
         sliding_window=None,
-        kv_cache_dtype="fp8_e5m2",
+        kv_cache_dtype=kv_dtype,
     )
     impl.use_dflash2_grouped_verify = True
     impl.dflash2_grouped_verify_max_query_tokens = 16
@@ -1787,6 +1788,24 @@ def test_flash_v100_dflash2_grouped_verify_uses_original_request_metadata(
         num_query_tokens=query_len,
     )
     attn_metadata.max_model_len = 32768
+    if kv_dtype == "fp8_e4m3":
+        assert not impl._dflash2_grouped_verify_allowed(
+            query,
+            key_cache,
+            value_cache,
+            attn_metadata,
+            num_query_tokens=query_len,
+        )
+        grouped_verify.supports_e4m3 = True  # type: ignore[attr-defined]
+        if query_len == 16:
+            assert not impl._dflash2_grouped_verify_allowed(
+                query,
+                key_cache,
+                value_cache,
+                attn_metadata,
+                num_query_tokens=query_len,
+            )
+            return
     result = impl._flash_v100_small_query_prefill_as_decode(
         layer,
         query,

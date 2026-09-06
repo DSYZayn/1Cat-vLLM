@@ -722,6 +722,15 @@ class DFlashQwen3Model(nn.Module):
         When context_slot_mapping is None (e.g. during dummy_run) only
         the computation runs, and no K/V is written to cache.
         """
+        all_k, all_v = self.compute_context_kv(context_states, context_positions)
+        self.store_context_kv(all_k, all_v, context_slot_mapping)
+
+    def compute_context_kv(
+        self,
+        context_states: torch.Tensor,
+        context_positions: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Project context without modifying the KV cache."""
         if not hasattr(self, "_num_attn_layers"):
             logger.warning_once(
                 "DFlash buffer initialization was skipped. If dummy weights are not "
@@ -755,13 +764,20 @@ class DFlashQwen3Model(nn.Module):
             self._rope_is_neox,
         )
 
+        all_k_final = all_k_flat.view(L, num_ctx, nkv, hd)
+        return all_k_final, all_v
+
+    def store_context_kv(
+        self,
+        all_k: torch.Tensor,
+        all_v: torch.Tensor,
+        context_slot_mapping: torch.Tensor | list[torch.Tensor | None] | None,
+    ) -> None:
+        """Write only the accepted, resident context slots."""
         if context_slot_mapping is None:
             return
-
-        # --- Per-layer cache insert ---
-        all_k_final = all_k_flat.view(L, num_ctx, nkv, hd)
         per_layer = isinstance(context_slot_mapping, (list, tuple))
-        for i in range(L):
+        for i in range(self._num_attn_layers):
             slot_mapping = (
                 context_slot_mapping[i] if per_layer else context_slot_mapping
             )
@@ -771,7 +787,7 @@ class DFlashQwen3Model(nn.Module):
             kv_cache = attn.kv_cache
             attn.impl.do_kv_cache_update(
                 attn,
-                all_k_final[i],
+                all_k[i],
                 all_v[i],
                 kv_cache,
                 slot_mapping,

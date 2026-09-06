@@ -74,10 +74,26 @@ def _load_column_parallel(
         scales = checkpoint.tensor(scale_key)
         if packed.shape[0] % tp_size:
             raise ValueError(f"{prefix}: output rows do not divide TP{tp_size}")
-        rows = packed.shape[0] // tp_size
-        start = tp_rank * rows
-        packed_parts.append(packed[start : start + rows].contiguous())
-        scale_parts.append(scales[start : start + rows].contiguous())
+        output_sizes = (packed.shape[0],)
+        if prefix.endswith(".in_proj_qkv"):
+            config = json.loads((checkpoint.model / "config.json").read_text())
+            config = config.get("text_config", config)
+            key_dim = config["linear_num_key_heads"] * config["linear_key_head_dim"]
+            value_dim = (
+                config["linear_num_value_heads"] * config["linear_value_head_dim"]
+            )
+            output_sizes = (key_dim, key_dim, value_dim)
+            if sum(output_sizes) != packed.shape[0]:
+                raise ValueError(f"{prefix}: Q/K/V sizes do not match checkpoint")
+        offset = 0
+        for output_size in output_sizes:
+            if output_size % tp_size:
+                raise ValueError(f"{prefix}: logical projection does not divide TP")
+            rows = output_size // tp_size
+            start = offset + tp_rank * rows
+            packed_parts.append(packed[start : start + rows].contiguous())
+            scale_parts.append(scales[start : start + rows].contiguous())
+            offset += output_size
         weight_divisors.append(float(checkpoint.tensor(weight_key).flatten()[0]))
         input_divisors.append(float(checkpoint.tensor(input_key).flatten()[0]))
     if len(set(weight_divisors)) != 1 or len(set(input_divisors)) != 1:

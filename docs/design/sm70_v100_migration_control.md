@@ -2,6 +2,29 @@
 
 Date: 2026-05-30
 
+## QUASAR E4M3 KV and FP32 logits, 2026-09-06
+
+The [precision follow-up](sm70_quasar_e4m3_fp32_logits.md) adds explicit
+FP32 candidate/dense logits and E4M3 grouped q8 verification. The measured
+problem-row distribution TV drops from 0.021532 to 3.6694e-7, all 24 checked
+nucleus supports match the FP32 reference, and maximum real KV conversion
+relative L2 drops from 0.059324 to 0.029024. Paired E4M3 conversion preserves
+the scalar route bitwise across 1K–256K kernel probes. Keep the opt-in
+precision contract and the answer-quality limitations visible; do not
+equate these operator improvements with recovery of unquantized-model quality.
+
+## QUASAR + DFlash2 operator audit, 2026-09-06
+
+See [the operator audit](sm70_quasar_dflash2_operator_audit.md) for the frozen
+`755baae1d075ee04fa9096b23fc0225b23589a86` baseline, per-operator error
+tables, sampling-boundary fixes, and rejected diagnostic evidence. C1
+captures and the original concatenated GDN QKV oracle are invalid for
+production numerical conclusions. C2 residuals and q8 state updates are
+exact under their staged contracts. E5M2 conversion and LM-head rounding
+remain distinct precision concerns. Keep this change in Draft: final
+complete-round costs are 20.781/19.941 ms versus 18.037/17.588 ms, and the
+three-case Plus smoke is 0/3 versus the old DFlash 1/3.
+
 ## Objective
 
 Target tree:
@@ -45766,6 +45789,157 @@ Interpretation:
   fused variants compile with 31 registers/16 bytes shared/zero stack or
   spills. Compare complete HC with the newly registered up fusion held fixed,
   including actual auxiliary sum2 and post-wrap checks. GPU gate pending.
+
+## 2026-09-06 QUASAR E4M3 / FP32 DFlash2 latency recovery
+
+- Continue owned Draft PR #517 from precision-control `6ec27bec9c`; integration
+  base remains `755baae1d0`. Keep E4M3 target KV, FP32 candidate logits, and
+  ambiguous-cutoff reference sampling.
+- Capture q8 context computation and accepted-slot writes; stage independent
+  context work before sampling; refresh the non-causal paged graph's persistent
+  metadata directly. Remove four identity gather/stride-copy launches.
+- Same-process control/pipeline/control medians: release1k 20.035 → 18.925 ms;
+  MBPP28 19.642 → 18.467 ms. Full token sequences and acceptance counts match.
+  The historical 18.037 / 17.588 ms peaks are still about 0.9 ms faster.
+- Independent production confirmation at `f22ac115d0`: 18.892 / 18.435 ms,
+  144.015 / 286.721 pure decode tok/s; 303 / 260 tokens and 111 / 49 rounds.
+  Both speed hashes match the preceding precision control; round cost drops
+  6.24% / 6.64%. No profiler, development mode, or diagnostic worker extension.
+- Real weights: all 64 changing-context cases and all 16 metadata cases match
+  eager reference bitwise, including accepted lengths 1–8 and the 256K boundary.
+  Three long code responses (3559 / 1400 / 1856 tokens) match completely; MBPP
+  Base 3/3, Plus 1/3 in both diagnostic arms; structured JSON 42 passes.
+  Production outputs 4939 / 5904 / 633 tokens match the preceding precision
+  configuration completely, with Base 3/3, Plus 0/3 and JSON 42. The diagnostic
+  service's different trajectories remain unexplained; no quality-score gain.
+- Focused GPU tests 32 passed; metadata/policy tests 15 passed; Ruff/mypy pass.
+- Profiling environment: use Nsight Systems 2025.3.1 for V100. 2026.4 does not
+  support Volta. Start the profiler in every TP worker; a rank-zero-only CUDA
+  trace must not be reported as TP4 GPU evidence. Final trace has all four ranks.
+- NUMA pinning gave only ~0.03–0.04 ms; original affinity restored. Do not repeat
+  that experiment or disable sampling guards to manufacture a peak result.
+- Full contract, exact tests, acceptance limits, and artifact bundle are in
+  [the recovery report](sm70_quasar_dflash2_quality_speed_recovery.md). Raw bundle:
+  `v100-quasar-quality-speed-recovery-20260906`.
+
+## 2026-09-06 QUASAR TP2/TP4 quality and QAT execution audit
+
+- Continue owned Draft PR #517 from `6f07be1cce`, integration `755baae1d0`.
+  Repairs at `fcb6dada58`: align TurboMind NVFP4 physical output to 32 columns
+  and independently honor explicit FP32 dense LM-head output on TP2.
+- TP2 GDN N=8240 was 16-aligned but corrupt. Eight real shards show relative
+  L2 32.68%–51.25%; padding to 8256 restores 0.0249%–0.0323%. TP4's 4128
+  physical width is unchanged. Do not describe this as ordinary rounding.
+- All 64 target layers / 256 fused projections tested on identical C2 inputs.
+  Same-family TP changes affect row projections through local FP16 rounding;
+  native captured TP2/TP4 collectives match FP32 sum then FP16 on the six
+  real-partial cases per rank. QPN2 is still a TP4 production route.
+- Fresh E4M3 services, two fixed-prefix tapes, 129 positions each: TP2/TP4
+  greedy IDs all match, maximum sampling TV 1.029% / 2.208%; 21 differing
+  target Gumbel draws across 16,512 paired seed/position tests. Final hidden
+  relative L2 is 0.958% / 0.978%. This is not full speculative sampling or
+  a free-generation score, and includes the production kernel-family change.
+- The TP2 head-only repair removes both changed nucleus supports and reduces
+  differing Gumbel draws from 10 to 0 against the same-hidden FP32 oracle.
+- QAT declares W4A4; SM70 currently executes W4A16. Same-input activation
+  quantization changes projection outputs up to 12.24% relative L2; replacing
+  only the final down projection yields up to 5.042% sampling TV. No BF16
+  teacher or end-to-end W4A4 quality comparison; do not claim either is better.
+- Tests: 19 native/adapter, 6 head admission, 6 logical shard tests passed.
+  Matrix CLI and actual target-prefix/production Gumbel probes completed.
+- Diagnostic request switching used a global file and could race in-flight
+  rounds after the API cap. Bind diagnostics to request IDs; exclude extra
+  rounds and validate exact input positions. TP4 MBPP3 used a separate startup.
+  The revised hook has no fresh multi-request endpoint validation yet.
+- No new speed claim. Full evidence, reproducible matrix command and remaining
+  gates: [TP quality audit](sm70_quasar_tp2_tp4_quality.md). Bundle:
+  `v100-quasar-tp2-tp4-quality-audit-20260906`. Owned GPU services/leases stopped.
+
+## 2026-09-06 DFlash2 proposal and context fast-path numerical audit
+
+- Continue Draft PR #517 from `41a9018e9f`, integration `755baae1d0`.
+  Optional probabilistic lookup with a positive agreement threshold rewrote
+  the deciding random prefix's q as point masses. A production-kernel
+  counterexample changes target P(A)=0.8 to 0.70027 over 100000 seeds.
+  Preserve that prefix's original q and only replace subsequent positions:
+  repaired P(A)=0.80072. Default q8 and agreement threshold0 are unaffected.
+- Twelve lookup GPU regressions pass, including sparse and dense statistical
+  correction. The fusion kernel adds no launch; paired graph median cost
+  increases at most 0.006 us on B1/B4. This is not whole-round latency.
+- Ten fresh E4M3/FP32 request snapshots: 70 conditional selector rows have
+  unchanged greedy top-1, but FP32 selector arithmetic gives maximum proposal
+  TV 0.0954%. Token-keyed draws change 3/17920 at official temperature1 and
+  10/17920 at diagnostic temperature0.6. These are draft-token changes, not
+  final target-token errors. Do not claim a selector precision upgrade
+  improves final quality without measuring acceptance and target correction.
+- Fused selector graph vs sequential dense Gumbel: all 8960 positions match;
+  realized/sparse/dense q caches are exact. Cache overwrite under reordered,
+  intersecting supports and permuted request slots passes 288 checks.
+- Fresh context FC outputs reproduce the live TP4 path bitwise. Same-kernel
+  counterfactual TP2/TP4 output partition error reaches 9.21e-6 relative L2;
+  TP4-vs-cuBLAS FC drift is 1.77e-5 and becomes 1.06e-4 after BF16 norm.
+- Context pipeline/KV/metadata graphs on vs off: ten complete real boundaries
+  match bitwise through candidate scores, q caches and accept/reject counts.
+  Both full outputs match the prior 260-token MBPP28 control (49 rounds).
+  Synchronized capture timing is excluded; retain historical 18.435/18.892 ms
+  medians and the unmet 17.6–18 ms objective.
+- Exclude `_warmup_*` captures by request ID; first two dumps are startup
+  warmups. Use `context-fc-fresh-v2.json`. Raw bundle:
+  `v100-dflash2-fastpath-numerics-20260906`. Full reproduction and scope limits:
+  [fast-path numerical audit](sm70_dflash2_fastpath_numerics.md).
+
+## 2026-09-06 DFlash2 verifier route costs and quality attribution
+
+- Continue owned Draft PR #517 from `53be620005`, integration `755baae1d0`.
+  GPU 0–3 are occupied by another task; this audit leases GPU 4–7. Do not label
+  changed hardware-set measurements as recovery of the earlier speed peak.
+- QPN8 support/FP32 rerank: 535 real rows (465 target, 70 draft), no local top21
+  or required global top-k misses, no target top-p support changes; maximum
+  target TV 1.2456e-6. Local q8 head cost is 573–575 us vs 993–1011 us dense
+  FP32, excluding TP communication.
+- Sparse rejection: 60 independent real q8 rounds, emitted counts 1–8, exactly
+  equal to dense rejection and the captured output. Local graph cost 15.242 us
+  vs 43.530 us dense rejection alone; the latter excludes separate top-p.
+- Real admitted norm cases: 144 Gemma and 24 GDN reproduce live fused outputs
+  exactly, but can differ from staged FP32/FP64 references. Standalone fused
+  vs eager costs: Gemma 3.620/26.846 us; GDN 2.231/25.428 us. Do not extrapolate
+  the eager reference timing to the compiled full-model fallback.
+- Full-model fixed-prefix norm-switch comparisons show up to 4.55% TV with
+  unchanged greedy top-1. However, the same optimized configuration restarted
+  also differs by up to 4.33%. Layer 0/rank 2 GDN core already differs before
+  the first affected Gemma fusion. Attribution to either norm is not closed;
+  repeatability of prefill state and the forced-prefix diagnostic comes first.
+- Repair two diagnostics only: GDN projection dump violates its non-aliasing
+  schema; alignment rank detection can duplicate every TP replica. Three GPU
+  schema/AOT/graph tests and seven distributed-rank/fallback tests pass.
+  Deduplicate the original 240 alignment files into 60 independent rounds.
+  Use `norm-real-cost-v2.json` to exclude first-layer FP16 residuals that do
+  not enter the fused Gemma gate.
+- Uninstrumented GPU 4–7 production closure: medians 19.505/19.092 ms per round,
+  154.434/234.829 decode tokens/s, 248/270 output tokens, 82/60 rounds. Each
+  request's three measured repetitions match and stop naturally. The token
+  trajectories differ from the historical GPU 0–3 run; 17.6–18 ms and broad
+  cross-startup output parity remain open. Native hashes are unchanged.
+- Route-by-route ledger, controls and failed-diagnostic exclusions:
+  [verifier route audit](sm70_dflash2_verifier_route_audit.md). Raw bundle:
+  `v100-dflash2-verifier-route-audit-20260906`. Runtime arithmetic and precision
+  defaults are unchanged; keep the existing Draft PR pending the remaining
+  state, QAT teacher and performance gates.
+
+### Prefill repair history recheck
+
+At main `95205a2d9952813aa7469f63ff65b8f2813c027a`, the Flash-V100
+paged-prefill race/alignment fixes #202/#226 are already integrated and
+present in the source used for the retained 4.33% TV run and rebuilt native
+library. QSA allocation repair #494 and its validation #525 are in main but
+do not execute in
+the QUASAR 27B GDN/full-attention model. Draft #524 has a failed model token
+gate. No applicable validated pending prefill repair was found or merged.
+The [PR history recheck](sm70_dflash2_verifier_route_audit.md) records the
+scope and ancestry checks, prefill divergence, top-p boundary amplification,
+and the remaining conv/SSM state-replay requirement. CPU capture analysis
+passed; no fresh GPU run or performance claim accompanies this recheck.
+
 - The exact down packet screen completed and is rejected. Same-source
   complete-HC control `1.989379 ms`, CUDA down plus separate gather
   `2.072549 ms`, fused down/gather `2.218926 ms`. All intermediate/final
@@ -45959,3 +46133,24 @@ Interpretation:
   code, including a warp-ordering attempt, so the intended lookahead was not
   established. Do not run these as purported prefetch variants or repeat the
   previously rejected ordinary CUDA128 down. No GPU startup for this screen.
+
+## 2026-09-06 DFlash2 quality repair mainline integration
+
+The user explicitly requested that the existing output-quality repair
+PR #517 be integrated into main after the remaining limits were reported. Its
+validated scope includes sampling cutoff boundaries, TP2 NVFP4 alignment,
+lookup proposal probabilities, independent FP32 logits, E4M3 q8 support,
+context/metadata graph options, and diagnostic ownership/rank fixes.
+
+Synchronizing main at `95205a2d9952813aa7469f63ff65b8f2813c027a` preserves
+the independent QSA ordering, HC/router, AWQ and PP work. The only merge
+conflict is this append-only ledger; both histories are retained. Native
+Flash-V100 integration is rebuilt for SM70 and the scoped regressions are
+recorded with final status, exact head and artifact hashes on PR #517.
+
+FP32 logits and the new context graph/pipeline switches remain opt-in; E4M3
+requires an explicit KV setting and a rebuilt native library. This admission
+does not certify QAT-versus-BF16 quality, solve the 4.33% fixed-prefix
+repeatability issue, or establish recovery to 17.6–18 ms. Historical Draft
+notes describe the investigation at their recorded revisions. The remaining
+state/prefix and performance goals continue after implementation integration.

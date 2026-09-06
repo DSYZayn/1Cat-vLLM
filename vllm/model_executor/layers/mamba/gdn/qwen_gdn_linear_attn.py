@@ -1265,7 +1265,7 @@ def _sm70_gdn_projection_dump_impl(
 ) -> torch.Tensor:
     _sm70_gdn_graph_buffer_copy(label, layer_name, tensor, "proj")
     if torch.cuda.is_current_stream_capturing():
-        return tensor
+        return tensor.clone()
     dump_dir = os.getenv("VLLM_SM70_DUMP_GDN_PROJ_DIR")
     enable_file = os.getenv("VLLM_SM70_DUMP_GDN_PROJ_ENABLE_FILE")
     if (
@@ -1302,7 +1302,9 @@ def _sm70_gdn_projection_dump_impl(
                 },
                 path,
             )
-    return tensor
+    # This custom op has a non-aliasing output schema. Returning the input
+    # lets AOT reuse live projection storage across diagnostic boundaries.
+    return tensor.clone()
 
 
 def _sm70_gdn_projection_dump_fake(
@@ -1310,7 +1312,7 @@ def _sm70_gdn_projection_dump_fake(
     label: str,
     layer_name: LayerNameType,
 ) -> torch.Tensor:
-    return tensor
+    return tensor.clone()
 
 
 direct_register_custom_op(

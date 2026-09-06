@@ -1090,6 +1090,12 @@ def flash_attn_grouped_verify_paged(
     )
 
 
+# Older native extensions retain the E5M2 route until rebuilt.
+flash_attn_grouped_verify_paged.supports_e4m3 = bool(  # type: ignore[attr-defined]
+    getattr(flash_attn_v100_cuda, "grouped_verify_e4m3", False)
+)
+
+
 def flash_attn_decode_paged_xqa(
     q: torch.Tensor,
     k_cache: torch.Tensor,

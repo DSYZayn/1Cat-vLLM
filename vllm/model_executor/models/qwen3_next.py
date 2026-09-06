@@ -151,6 +151,9 @@ def _sm70_qwen_layer_dump_impl(
     layer_idx: int,
     layer_type: str,
 ) -> torch.Tensor:
+    # The custom-op schema has no output alias annotation. Returning the input
+    # can corrupt AOT buffer reuse and change the tensors being diagnosed.
+    tensor = tensor.clone()
     dump_dir = os.getenv("VLLM_SM70_DUMP_QWEN_LAYER_DIR")
     graph_buffers = os.getenv("VLLM_SM70_DUMP_QWEN_LAYER_GRAPH_BUFFERS") == "1"
     target_labels = {
@@ -285,7 +288,7 @@ def _sm70_qwen_layer_dump_fake(
     layer_idx: int,
     layer_type: str,
 ) -> torch.Tensor:
-    return tensor
+    return torch.empty_like(tensor)
 
 
 direct_register_custom_op(
