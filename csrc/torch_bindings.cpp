@@ -613,7 +613,8 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, ops) {
   ops.def(
       "awq_moe_active_dense_stage_sm70_out("
       "Tensor(a!) out, Tensor input, Tensor permuted_experts_id, "
-      "Tensor active_expert_offsets, Tensor active_expert_ids, Tensor ptrs_w, "
+      "Tensor(b!) active_expert_offsets, Tensor(c!) active_expert_ids, Tensor "
+      "ptrs_w, "
       "Tensor ptrs_s, int total_slots, int k, int n, int group_size) -> ()");
   ops.impl("awq_moe_active_dense_stage_sm70_out", torch::kCUDA,
            &awq_moe_active_dense_stage_sm70_out);
@@ -694,6 +695,12 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, ops) {
       "int hidden_logical_size) -> ()");
   ops.impl("awq_moe_single_token_sm70_out", torch::kCUDA,
            &awq_moe_single_token_sm70_out);
+
+  ops.def(
+      "awq_moe_qpn_m1_sm70_out(Tensor(a!) out, Tensor(b!) intermediate, "
+      "Tensor input, Tensor w13, Tensor s13, Tensor w2, Tensor s2, "
+      "Tensor ids, Tensor topk) -> ()");
+  ops.impl("awq_moe_qpn_m1_sm70_out", torch::kCUDA, &awq_moe_qpn_m1_sm70_out);
 
   ops.def(
       "fp8_moe_gemm_sm70_out(Tensor(a!) out, Tensor sorted_input, "
