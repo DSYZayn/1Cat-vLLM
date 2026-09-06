@@ -45877,7 +45877,8 @@ Interpretation:
   Norm prefetch was pushed after that PR's merge point and needs a new Draft
   PR. Continue in owned branch `codex/v100-qwen38-hc-15ms-20260905-1702`, same
   artifact-preserving worktree. Merge main only AFTER the frozen trace ended
-  (`4b6c2daa1f`); this trace is not a speed claim for the integrated source.
+  (`4b6c2daa1fe5a0a6b8ca14212b92c79736e22bb5`); this trace is not a speed claim
+  for the integrated source.
 - Next bounded hypothesis: fused-up H8/512-thread scheduling provides eight
   row pairs and two serial groups, unlike the rejected H8/256-thread schedule
   with four serial groups. Keep the same FMA/reduction/rounding and packet

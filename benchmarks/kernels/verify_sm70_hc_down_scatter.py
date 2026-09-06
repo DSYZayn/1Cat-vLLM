@@ -24,7 +24,7 @@ def main() -> None:
     parser.add_argument("--out", type=Path, required=True)
     args = parser.parse_args()
     rank, local = int(os.environ["RANK"]), int(os.environ["LOCAL_RANK"])
-    torch.cuda.set_device(local)
+    torch.accelerator.set_device_index(local)
     if int(os.environ["WORLD_SIZE"]) != 4 or torch.cuda.get_device_capability() != (
         7,
         0,
@@ -69,7 +69,7 @@ def main() -> None:
             buffer = storage[offset]
             for _ in range(16):
                 graphs[offset].replay()
-            torch.cuda.synchronize()
+            torch.accelerator.synchronize()
             mismatches += int(
                 torch.count_nonzero(buffer[offset : offset + 336] != expected)
             )

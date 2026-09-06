@@ -16,7 +16,7 @@ from vllm.model_executor.layers.fused_moe.router.fused_topk_router import (
 
 def capture(fn):
     fn()
-    torch.cuda.synchronize()
+    torch.accelerator.synchronize()
     graph = torch.cuda.CUDAGraph()
     with torch.cuda.graph(graph):
         fn()
@@ -43,7 +43,7 @@ def paired_timing(control, candidate):
     for _ in range(3000):
         control.replay()
         candidate.replay()
-    torch.cuda.synchronize()
+    torch.accelerator.synchronize()
     samples = {"control": [], "candidate": []}
     for repeat in range(8):
         pairs = [("control", control), ("candidate", candidate)]
@@ -247,7 +247,7 @@ if __name__ == "__main__":
     parser.add_argument("--qsa-library", required=True)
     parser.add_argument("--out", type=Path, required=True)
     args = parser.parse_args()
-    torch.cuda.set_device(0)
+    torch.accelerator.set_device_index(0)
     assert torch.cuda.get_device_capability() == (7, 0)
     torch.manual_seed(20260905)
     torch.ops.load_library(args.qsa_library)

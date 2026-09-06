@@ -192,3 +192,25 @@ quality gates. Existing GDN gate-reduction and W13 split-order differences still
 need independent actual-input references and propagated-ranking evidence;
 this repair does not certify all kernels or arbitrary inputs as error-free.
 Human review and wider quality acceptance remain required before promotion.
+
+## Main integration, 2026-09-06
+
+The user requested merging this PR after the bounded results and remaining
+numerical-audit scope were reported. PR #494 is already on public main.
+PR #525 now targets main directly and retains the tested #506/#507 ancestor
+commits, avoiding a merge that would stop in an intermediate feature branch.
+The synchronized main base is `4366d9d5fe80eeaf79575b51ec36a6a032673df0`.
+
+The merge preserves the tested QSA, HC and router Python source, Flash-V100
+kernel source and page400/page784 regressions unchanged. It retains main's
+independently merged AWQ/PP and model-load allocator cleanup changes. CI fixes
+only format C++/Markdown, spell out an existing commit SHA to avoid a typo
+false positive, and use `torch.accelerator` device/synchronization/cache APIs
+in three standalone verification scripts. No runtime arithmetic is modified.
+
+The synchronized source passes27 CPU dispatch tests covering HC norm prefetch,
+QSA resolved-address admission/fallback, and router packed-key admission.
+Targeted pre-commit checks pass. No model was restarted for this integration;
+the97.90513tokens/s result remains attributed to the earlier tested source and
+binary contract, not a fresh benchmark of the updated main tree. The broader
+GDN/W13 numerical-reference work remains open after merge.

@@ -166,8 +166,8 @@ __global__ void __launch_bounds__(128, 1)
     // stores for every source rank. Only the last pack needs injection/padding
     // scatter. Preserve support for a weak-contiguous unaligned output view.
     static_assert(kQwen38HcDownLocalLoraElements % kElementsPerPack == 0);
-    static_assert(kQwen38HcDownLocalElements -
-                      kQwen38HcDownLocalLoraElements == kElementsPerPack);
+    static_assert(kQwen38HcDownLocalElements - kQwen38HcDownLocalLoraElements ==
+                  kElementsPerPack);
   #pragma unroll
     for (int source_rank = 0; source_rank < ngpus; ++source_rank) {
       if (offset < kQwen38HcDownLocalLoraElements / kElementsPerPack) {
@@ -189,7 +189,7 @@ __global__ void __launch_bounds__(128, 1)
         for (int padding = 0; padding < kQwen38HcDownLocalPaddingElements;
              ++padding) {
           output[ngpus * (kQwen38HcDownLocalLoraElements +
-                         kQwen38HcDownLocalInjectionElements) +
+                          kQwen38HcDownLocalInjectionElements) +
                  source_rank * kQwen38HcDownLocalPaddingElements + padding] =
               peer_values[source_rank].data[1 + padding];
         }

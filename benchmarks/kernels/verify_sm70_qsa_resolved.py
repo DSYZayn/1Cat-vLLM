@@ -20,7 +20,7 @@ def paired(ga, gb):
     for _ in range(2500):
         ga.replay()
         gb.replay()
-    torch.cuda.synchronize()
+    torch.accelerator.synchronize()
     values = {"control": [], "resolved": []}
     for turn in range(8):
         pairs = [("control", ga), ("resolved", gb)]
@@ -48,7 +48,7 @@ def main():
     parser.add_argument("--interleaved-kv", action="store_true")
     parser.add_argument("--skip-timing", action="store_true")
     args = parser.parse_args()
-    torch.cuda.set_device(0)
+    torch.accelerator.set_device_index(0)
     torch.manual_seed(20260905)
     qsa._SM70_QSA_XQA_PAGE4 = False
     results = []
@@ -129,7 +129,7 @@ def main():
             b.fill_(float("nan"))
             ga.replay()
             gb.replay()
-            torch.cuda.synchronize()
+            torch.accelerator.synchronize()
             assert torch.equal(a.view(torch.int16), b.view(torch.int16)), (
                 context,
                 scenario,
@@ -159,7 +159,7 @@ def main():
         args.out.write_text(json.dumps(results, indent=2) + "\n")
         print(json.dumps(result), flush=True)
         del ga, gb, run, kv, k, v, queries, gates, indices, tables, requests, a, b
-        torch.cuda.empty_cache()
+        torch.accelerator.empty_cache()
 
 
 if __name__ == "__main__":

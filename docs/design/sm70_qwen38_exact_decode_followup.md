@@ -110,6 +110,7 @@ CUDA_HOME=/usr TORCH_CUDA_ARCH_LIST=7.0 .venv/bin/python \
 
 Raw task artifacts: `.artifacts/three_paths/operators_interleaved.json`,
 `address_production.json`, build/queue logs. All standalone GPU screens exited.
+
 ## Combined endpoint, source d2c8401c22
 
 One model initialization produced `.artifacts/endpoint/result.json`,
