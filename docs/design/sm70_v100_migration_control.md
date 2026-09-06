@@ -45801,11 +45801,17 @@ Interpretation:
 - Same-process control/pipeline/control medians: release1k 20.035 → 18.925 ms;
   MBPP28 19.642 → 18.467 ms. Full token sequences and acceptance counts match.
   The historical 18.037 / 17.588 ms peaks are still about 0.9 ms faster.
+- Independent production confirmation at `f22ac115d0`: 18.892 / 18.435 ms,
+  144.015 / 286.721 pure decode tok/s; 303 / 260 tokens and 111 / 49 rounds.
+  Both speed hashes match the preceding precision control; round cost drops
+  6.24% / 6.64%. No profiler, development mode, or diagnostic worker extension.
 - Real weights: all 64 changing-context cases and all 16 metadata cases match
   eager reference bitwise, including accepted lengths 1–8 and the 256K boundary.
   Three long code responses (3559 / 1400 / 1856 tokens) match completely; MBPP
-  Base 3/3, Plus 1/3 in both arms; structured JSON 42 passes. Independent startup
-  trajectories differ, so cross-start reproducibility is still unclosed.
+  Base 3/3, Plus 1/3 in both diagnostic arms; structured JSON 42 passes.
+  Production outputs 4939 / 5904 / 633 tokens match the preceding precision
+  configuration completely, with Base 3/3, Plus 0/3 and JSON 42. The diagnostic
+  service's different trajectories remain unexplained; no quality-score gain.
 - Focused GPU tests 32 passed; metadata/policy tests 15 passed; Ruff/mypy pass.
 - Profiling environment: use Nsight Systems 2025.3.1 for V100. 2026.4 does not
   support Volta. Start the profiler in every TP worker; a rank-zero-only CUDA

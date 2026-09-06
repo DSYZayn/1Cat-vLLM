@@ -3,7 +3,8 @@
 ## Result and acceptance boundary
 
 The E4M3 KV / FP32-logit configuration recovers complete verification-round
-latency from about 20 ms to **18.925 ms on release1k and 18.467 ms on MBPP28**.
+latency from about 20 ms to **18.892 ms on release1k and 18.435 ms on MBPP28**
+in an independent production startup without diagnostic worker extensions.
 These are unprofiled medians, with one warmup and three measured requests.
 The previous E5M2 / FP16-logit peaks were 18.037 and 17.588 ms respectively.
 **The 17.6–18 ms objective is not yet met.** The remaining gap is about 0.9 ms.
@@ -12,9 +13,10 @@ All control/candidate comparisons within each service retained the complete
 token sequence and acceptance counts. The long-output comparison also retained
 all 3,559 / 1,400 / 1,856 tokens for the three selected MBPP inputs. This is
 evidence about these optimizations, not proof that every source of model
-quality loss has been eliminated. Independent service startups still produced
-different fixed-seed trajectories; cross-start reproducibility remains an
-unresolved gate and must not be confused with the within-process comparison.
+quality loss has been eliminated. The production confirmation reproduced both
+speed-fixture hashes and all 4,939 / 5,904 / 633 quality-fixture tokens from the
+previous precision configuration. Task-only diagnostic services produced other
+fixed-seed trajectories; the cause of that difference remains unresolved.
 
 The preceding [precision repair](sm70_quasar_e4m3_fp32_logits.md) remains active:
 FP32 candidate logits, E4M3 target KV, and exact-reference fallback for ambiguous
@@ -80,6 +82,20 @@ default off; these measurements do not promote other checkpoints or hardware.
 
 ## Unprofiled comparison
 
+The independent production confirmation uses implementation commit
+`f22ac115d0ac0cc8a13bd042cf1472c33add00c4`, no profiler or development mode, and
+fresh task-owned compile caches. Against the preceding precision repair:
+
+| Workload | Precision control round ms | Optimized round ms | Control / optimized decode tok/s | Tokens / rounds |
+| --- | ---: | ---: | ---: | ---: |
+| release1k | 20.149 | 18.892 | 135.033 / 144.015 | 303 / 111 |
+| MBPP28 | 19.745 | 18.435 | 267.695 / 286.721 | 260 / 49 |
+
+The full token hashes and acceptance counts match the preceding control on all
+four requests (warmup plus three measured runs) for both fixtures. Final TTFT
+medians are 0.350 / 0.109 s. The round cost drops by 6.24% / 6.64%; the remaining
+gap against the old E5M2/FP16 peaks is 0.855 / 0.847 ms.
+
 The control below is the repeated control at the end of the same-process
 control → pipeline → control experiment. Both arms include the removal of
 identity gathers and stride copies; only the new graphs/pipeline are toggled.
@@ -117,6 +133,10 @@ different startup trajectories into an acceptance-rate comparison.
   improvement over the previous startup, which had different transcripts.
 - Structured JSON returned the requested integer 42. All quality cases ended
   naturally, without truncation or replacement characters.
+- Independent production confirmation: MBPP outputs 4,939 / 5,904 / 633 tokens,
+  bitwise identical token IDs to the preceding precision configuration; Base
+  3/3, Plus 0/3, and JSON result 42. The diagnostic service's Plus 1/3 result
+  above must not be reported as a production quality improvement.
 - Focused GPU regressions: 32 passed. Flash-V100 metadata/policy tests:
   15 passed. Ruff and local mypy passed.
 
@@ -168,6 +188,8 @@ Task bundle: `v100-quasar-quality-speed-recovery-20260906`.
 - `results/metadata-ab-{control,control-repeat,pipeline}-speed-*.json`.
 - `results/final-{control,pipeline}-quality-subset.json`,
   `results/final-pipeline-json.json`, `results/final-evalplus.json`.
+- `results/production-confirm-{speed-release1k,speed-mbpp28,quality-subset,json,evalplus}.json`,
+  `production-worker-provenance.json` (four workers, native hashes and 184 JIT cubins).
 - `results/metadata-context-real-oracle.json`, `results/metadata-real-oracle.json`.
 - `profile/final-tp4.nsys-rep`, original SQLite, explicitly aligned SQLite,
   `final-tp4.rounds.json`, and `final-gpu-breakdown.{json,csv,md}`.
