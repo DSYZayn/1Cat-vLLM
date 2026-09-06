@@ -107,6 +107,7 @@ def _is_sm70_lm_head_fastpath_eligible(layer: torch.nn.Module) -> bool:
         _sm70_env_bool("VLLM_SM70_ENABLE_LM_HEAD_FASTPATH", False)
         or _sm70_env_bool("VLLM_SM70_LM_HEAD_TOP1", _sm70_lm_head_top1_default())
         or _sm70_env_bool("VLLM_SM70_LM_HEAD_TOP1_TC", False)
+        or envs.VLLM_SM70_DFLASH2_FP32_LOGITS
         or _sm70_dflash2_qpn8_rerank_requested()
     ):
         _trace_sm70_lm_head_skip("disabled")

@@ -12,8 +12,8 @@ from benchmarks.kernels.benchmark_sm70_quasar_nvfp4_oracle import (
 )
 
 
-@pytest.mark.parametrize("rank", range(4))
-def test_gdn_qkv_shards_each_logical_projection(tmp_path, rank):
+@pytest.mark.parametrize("tp,rank", [(tp, rank) for tp in (2, 4) for rank in range(tp)])
+def test_gdn_qkv_shards_each_logical_projection(tmp_path, tp, rank):
     (tmp_path / "config.json").write_text(
         json.dumps(
             {
@@ -36,7 +36,13 @@ def test_gdn_qkv_shards_each_logical_projection(tmp_path, rank):
         prefix + ".input_global_scale": torch.tensor(3.0),
     }
     checkpoint = SimpleNamespace(model=tmp_path, tensor=tensors.__getitem__)
-    projection = _load_column_parallel(checkpoint, "gdn_qkv", (prefix,), rank, 4)
-    expected_rows = torch.tensor([rank, 4 + rank, *range(8 + 3 * rank, 11 + 3 * rank)])
+    projection = _load_column_parallel(checkpoint, "gdn_qkv", (prefix,), rank, tp)
+    expected_rows = torch.tensor(
+        [
+            *range(rank * 4 // tp, (rank + 1) * 4 // tp),
+            *range(4 + rank * 4 // tp, 4 + (rank + 1) * 4 // tp),
+            *range(8 + rank * 12 // tp, 8 + (rank + 1) * 12 // tp),
+        ]
+    )
     assert torch.equal(projection.packed, packed[expected_rows])
     assert torch.equal(projection.scales, scales[expected_rows])

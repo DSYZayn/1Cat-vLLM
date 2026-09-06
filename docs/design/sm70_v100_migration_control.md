@@ -45821,3 +45821,36 @@ Interpretation:
 - Full contract, exact tests, acceptance limits, and artifact bundle are in
   [the recovery report](sm70_quasar_dflash2_quality_speed_recovery.md). Raw bundle:
   `v100-quasar-quality-speed-recovery-20260906`.
+
+## 2026-09-06 QUASAR TP2/TP4 quality and QAT execution audit
+
+- Continue owned Draft PR #517 from `6f07be1cce`, integration `755baae1d0`.
+  Repairs at `fcb6dada58`: align TurboMind NVFP4 physical output to 32 columns
+  and independently honor explicit FP32 dense LM-head output on TP2.
+- TP2 GDN N=8240 was 16-aligned but corrupt. Eight real shards show relative
+  L2 32.68%–51.25%; padding to 8256 restores 0.0249%–0.0323%. TP4's 4128
+  physical width is unchanged. Do not describe this as ordinary rounding.
+- All 64 target layers / 256 fused projections tested on identical C2 inputs.
+  Same-family TP changes affect row projections through local FP16 rounding;
+  native captured TP2/TP4 collectives match FP32 sum then FP16 on the six
+  real-partial cases per rank. QPN2 is still a TP4 production route.
+- Fresh E4M3 services, two fixed-prefix tapes, 129 positions each: TP2/TP4
+  greedy IDs all match, maximum sampling TV 1.029% / 2.208%; 21 differing
+  target Gumbel draws across 16,512 paired seed/position tests. Final hidden
+  relative L2 is 0.958% / 0.978%. This is not full speculative sampling or
+  a free-generation score, and includes the production kernel-family change.
+- The TP2 head-only repair removes both changed nucleus supports and reduces
+  differing Gumbel draws from 10 to 0 against the same-hidden FP32 oracle.
+- QAT declares W4A4; SM70 currently executes W4A16. Same-input activation
+  quantization changes projection outputs up to 12.24% relative L2; replacing
+  only the final down projection yields up to 5.042% sampling TV. No BF16
+  teacher or end-to-end W4A4 quality comparison; do not claim either is better.
+- Tests: 19 native/adapter, 6 head admission, 6 logical shard tests passed.
+  Matrix CLI and actual target-prefix/production Gumbel probes completed.
+- Diagnostic request switching used a global file and could race in-flight
+  rounds after the API cap. Bind diagnostics to request IDs; exclude extra
+  rounds and validate exact input positions. TP4 MBPP3 used a separate startup.
+  The revised hook has no fresh multi-request endpoint validation yet.
+- No new speed claim. Full evidence, reproducible matrix command and remaining
+  gates: [TP quality audit](sm70_quasar_tp2_tp4_quality.md). Bundle:
+  `v100-quasar-tp2-tp4-quality-audit-20260906`. Owned GPU services/leases stopped.
