@@ -369,6 +369,16 @@ def maybe_prepare_sm70_lm_head_top1(layer: torch.nn.Module) -> bool:
     if not _is_sm70_lm_head_fastpath_eligible(layer):
         return False
 
+    tp_size = getattr(layer, "tp_size", 1)
+    if (
+        envs.VLLM_SM70_DFLASH2_FP32_LOGITS
+        and tp_size in (2, 4)
+        and tuple(layer.weight.shape) == (248320 // tp_size, 5120)
+    ):
+        # Dense FP32 output must not depend on the TP4-only QPN8 candidate
+        # layout being available. TP2 otherwise silently keeps FP16 logits.
+        layer._sm70_dflash2_fp32_logits = True
+
     raw_top1_requested = _sm70_env_bool(
         "VLLM_SM70_LM_HEAD_TOP1", _sm70_lm_head_top1_default()
     )

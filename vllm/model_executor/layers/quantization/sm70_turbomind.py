@@ -14,7 +14,9 @@ GPTQ_GROUP_SIZES = (128,)
 COMPRESSED_UINT4_GROUP_SIZES = (32, 128)
 MXFP4_GROUP_SIZE = 32
 NVFP4_GROUP_SIZE = 16
-NVFP4_OUTPUT_ALIGNMENT = 16
+# SM70 packed NVFP4 GEMM needs complete 32-column tiles. N=8240 (Qwen
+# GDN on TP2) is 16-aligned but corrupts the result without this padding.
+NVFP4_OUTPUT_ALIGNMENT = 32
 NVFP4_QPN4_DENSE_WORKSPACE_ELEMENTS = 5120 * 8704
 STATE_ATTR = "_sm70_turbomind_linear"
 SM70QuantBackend = Literal["auto", "marlin", "turbomind"]
